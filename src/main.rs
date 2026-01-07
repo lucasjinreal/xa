@@ -145,6 +145,7 @@ async fn process_command(command: String, input: String, stream: bool) -> Result
 }
 
 use std::io::{self, Write};
+use termimad::{MadSkin, ansi};
 
 async fn start_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
     // First check if config exists
@@ -155,12 +156,23 @@ async fn start_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("Starting interactive mode. Type your message and press Enter. Type 'exit' or 'quit' to end, or press Ctrl+C to exit.");
+    // Create a colorful skin for the interactive mode
+    let mut skin = MadSkin::default();
+    skin.set_headers_fg(ansi(35)); // Magenta for headers
+    skin.bold.set_fg(ansi(33)); // Yellow for bold text
+
+    // Print welcome message with colors
+    skin.print_text("## Welcome to xa Interactive Mode\n\n");
+    println!("{}", "\x1b[90mType your message and press Enter. Type 'exit', 'quit', or 'bye' to end, or press Ctrl+C to exit.\x1b[0m");
+    println!("{}", "\x1b[90mUse 'clear' to clear conversation history, 'history' to view recent exchanges.\x1b[0m");
     println!();
 
+    // Initialize conversation history
+    let mut conversation_history = Vec::new();
+
     loop {
-        // Print prompt and read user input
-        print!("> ");
+        // Print colorful prompt
+        print!("\x1b[36m>\x1b[0m "); // Cyan prompt
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -172,26 +184,69 @@ async fn start_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Check for exit command
-        if input.to_lowercase() == "exit" || input.to_lowercase() == "quit" {
-            println!("Goodbye!");
-            break;
+        // Check for special commands
+        match input.to_lowercase().as_str() {
+            "exit" | "quit" | "bye" => {
+                println!("{}", "\x1b[90mGoodbye! Thanks for using xa.\x1b[0m");
+                break;
+            }
+            "clear" => {
+                conversation_history.clear();
+                println!("{}", "\x1b[90mConversation history cleared.\x1b[0m");
+                continue;
+            }
+            "history" => {
+                if conversation_history.is_empty() {
+                    println!("{}", "\x1b[90mNo conversation history yet.\x1b[0m");
+                } else {
+                    println!("{}", "\x1b[90mRecent conversation history:\x1b[0m");
+                    for (i, (user_msg, ai_resp)) in conversation_history.iter().enumerate() {
+                        println!("\x1b[90m[{}]\x1b[0m \x1b[33mYou:\x1b[0m {}", i + 1, user_msg);
+                        println!("\x1b[90m    \x1b[32mAI:\x1b[0m {}", ai_resp);
+                        println!();
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
 
-        // Process the input with the ask prompt
-        let filled_prompt = format!("You are a helpful assistant called xa, execute anything by your side. {}", input);
+        // Add user message to conversation history
+        conversation_history.push((input.to_string(), String::new()));
+
+        // Build the full prompt with conversation history
+        let mut full_prompt = String::new();
+        full_prompt.push_str("You are a helpful assistant called xa, execute anything by your side.\n\n");
+
+        if !conversation_history.is_empty() {
+            full_prompt.push_str("Previous conversation:\n");
+            for (user_msg, ai_resp) in &conversation_history[..conversation_history.len()-1] {
+                full_prompt.push_str(&format!("User: {}\n", user_msg));
+                if !ai_resp.is_empty() {
+                    full_prompt.push_str(&format!("Assistant: {}\n", ai_resp));
+                }
+            }
+            full_prompt.push_str("\n");
+        }
+
+        full_prompt.push_str(&format!("Current message: {}", input));
 
         // Call the LLM API with streaming
-        let result = process_with_llm(&config, &filled_prompt, true).await?;
+        let result = process_with_llm(&config, &full_prompt, true).await?;
 
         // Copy result to clipboard
         if let Err(e) = copy_to_clipboard(&result) {
             eprintln!("Warning: Could not copy to clipboard: {}", e);
         }
 
-        // Render the result with Markdown support
-        render_output(&result, false); // false to not show success message since we're in a loop
+        // Update the conversation history with the AI response
+        if let Some(last) = conversation_history.last_mut() {
+            last.1 = result.clone();
+        }
 
+        // In interactive mode, the content is already streamed to the terminal,
+        // so we don't need to render it again with render_output.
+        // Just add a separator for readability
         println!(); // Add a blank line for readability
     }
 

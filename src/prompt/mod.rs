@@ -20,19 +20,19 @@ impl Default for PromptConfig {
     fn default() -> Self {
         let mut prompts = HashMap::new();
         prompts.insert("translate".to_string(), PromptEntry {
-            template: "You are a professional translator, please translate the following text into natural, idiomatic English:\n\n{input}".to_string(),
+            template: "You are a professional translator, please translate the following text into natural, idiomatic English:\n\n{input}. Avoid output anything else except the final result.".to_string(),
             description: Some("Translate text to English".to_string()),
         });
         prompts.insert("polish".to_string(), PromptEntry {
-            template: "You are an expert editor. Please polish the following text to make it more clear, concise, and natural:\n\n{input}".to_string(),
+            template: "You are an expert editor. Please polish the following text to make it more clear, concise, and natural:\n\n{input}. Avoid output anything else except the final result.".to_string(),
             description: Some("Polish text for clarity".to_string()),
         });
         prompts.insert("rewrite".to_string(), PromptEntry {
-            template: "You are a skilled writer. Please rewrite the following text in a different style while preserving the meaning:\n\n{input}".to_string(),
+            template: "You are a skilled writer. Please rewrite the following text in a different style while preserving the meaning:\n\n{input}. Avoid output anything else except the final result.".to_string(),
             description: Some("Rewrite text in different style".to_string()),
         });
         prompts.insert("summarize".to_string(), PromptEntry {
-            template: "You are an expert summarizer. Please provide a concise summary of the following text:\n\n{input}".to_string(),
+            template: "You are an expert summarizer. Please provide a concise summary of the following text:\n\n{input}. Avoid output anything else except the final result.".to_string(),
             description: Some("Summarize text".to_string()),
         });
         prompts.insert("ask".to_string(), PromptEntry {
@@ -201,7 +201,21 @@ pub async fn load_prompt_config() -> Result<PromptConfig, Box<dyn std::error::Er
 
     let mut config = if prompt_config_file.exists() {
         let content = fs::read_to_string(&prompt_config_file)?;
-        toml::from_str(&content)?
+        // Try to parse the existing content, if it fails, create a new one
+        match toml::from_str(&content) {
+            Ok(parsed_config) => parsed_config,
+            Err(_) => {
+                // If parsing fails, backup the corrupted file and start fresh
+                let backup_path = prompt_config_file.with_extension("toml.backup");
+                fs::rename(&prompt_config_file, &backup_path)?;
+                eprintln!("Warning: Corrupted prompts.toml file detected. Backed up to {:?} and created a new one.", backup_path);
+                let default_config = PromptConfig::default();
+                fs::create_dir_all(&config_dir)?;
+                let new_content = toml::to_string(&default_config)?;
+                fs::write(&prompt_config_file, new_content)?;
+                default_config
+            }
+        }
     } else {
         let default_config = PromptConfig::default();
         // Create the file with default prompts

@@ -48,8 +48,6 @@ Configuration is stored in `~/.config/xa/config.toml`.
 List all available commands:
 
 ```bash
-xa -ls
-# or
 xa --ls
 ```
 
@@ -58,8 +56,6 @@ xa --ls
 Add new commands with custom prompts:
 
 ```bash
-xa -add
-# or
 xa --add
 ```
 
@@ -75,8 +71,6 @@ The prompts are stored in `~/.config/xa/prompts.toml` and can be edited with you
 Remove existing commands:
 
 ```bash
-xa -rm command_name
-# or
 xa --rm command_name
 ```
 
@@ -85,8 +79,6 @@ xa --rm command_name
 Configure your LLM API settings:
 
 ```bash
-xa -set openai
-# or
 xa --set openai
 ```
 
