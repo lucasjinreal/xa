@@ -1,0 +1,31 @@
+warning: unused import: `process_template`
+ --> src/main.rs:9:48
+  |
+9 | use prompt::{load_prompt_config, find_command, process_template, process_template_with_args};
+  |                                                ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `process_command` is never used
+   --> src/main.rs:174:10
+    |
+174 | async fn process_command(command: String, input: String, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
+    |          ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `process_template` is never used
+   --> src/prompt/mod.rs:353:8
+    |
+353 | pub fn process_template(template: &str, input: &str, args: &[String]) -> String {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: `xa` (bin "xa") generated 3 warnings (run `cargo fix --bin "xa"` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/xa translate zh 'this is mouse' --debug --no-stream`
+鉴权失败，请检查天幕apikey是否正确，详情微信联系: bojuebot
+
+(Completed in 177.86ms)
+[38;5;37m鉴权失败，请检查天幕apikey是否正确，详情微信联系: bojuebot[39m
+
+[90m✓ result has been copied to clipboard · tokens: 2 · 22:52:01[0m

@@ -1,29 +1,26 @@
 use crate::config::Config;
-use reqwest;
-use serde_json::json;
-use tokio::time::Instant;
+use openai_api_rs::v1::api::OpenAIClient;
+use openai_api_rs::v1::chat_completion::{self, Content, MessageRole};
+use openai_api_rs::v1::chat_completion::chat_completion::ChatCompletionRequest;
+use openai_api_rs::v1::chat_completion::chat_completion_stream::{ChatCompletionStreamRequest, ChatCompletionStreamResponse};
 use tokio_stream::StreamExt;
 use std::io::Write;
-
-
-#[derive(serde::Deserialize)]
-struct NonStreamChoice {
-    message: Message,
-}
-
-#[derive(serde::Deserialize)]
-struct Message {
-    content: String,
-}
-
-#[derive(serde::Deserialize)]
-struct NonStreamResponse {
-    choices: Vec<NonStreamChoice>,
-}
+use tokio::time::Instant;
 
 pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let model = config.default_model.as_deref().unwrap_or("gpt-4o-mini");
+    // Determine if we're using OpenRouter or OpenAI based on the base_url
+    let api_key = config.api_key.clone();
+    let mut client = OpenAIClient::builder()
+        .with_api_key(api_key);
+
+    // Set custom base URL if needed (for OpenRouter or other OpenAI-compatible APIs)
+    if !config.base_url.is_empty() && config.base_url != "https://api.openai.com/v1" {
+        client = client.with_endpoint(&config.base_url);
+    }
+
+    let mut client = client.build()?;
+
+    let model = config.default_model.as_deref().unwrap_or("gpt-4o-mini").to_string();
 
     if stream {
         // Streaming mode
@@ -31,57 +28,38 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
 
         let start_time = Instant::now();
 
-        let response = client
-            .post(config.base_url.replace("/v1", "") + "/v1/chat/completions") // Ensure correct endpoint
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "stream": true,
-                "temperature": 0.7
-            }))
-            .send()
-            .await?;
+        let req = ChatCompletionStreamRequest::new(
+            model,
+            vec![chat_completion::ChatCompletionMessage {
+                role: MessageRole::user,
+                content: Content::Text(prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+        );
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(format!("Error calling LLM API: {}", error_text).into());
-        }
+        let mut stream = client.chat_completion_stream(req).await?;
 
-        let mut stream = response.bytes_stream();
         let mut full_response = String::new();
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-
-            // Handle the SSE format
-            for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let data = &line[6..]; // Remove "data: " prefix
-                    if data == "[DONE]" {
-                        break;
+        while let Some(result) = stream.next().await {
+            match result {
+                ChatCompletionStreamResponse::Content(content) => {
+                    // Only print if content is not empty to avoid printing artifacts like >>>>>>>>
+                    if !content.is_empty() {
+                        print!("{}", content);
+                        std::io::stdout().flush()?;
+                        full_response.push_str(&content);
                     }
-
-                    if let Ok(stream_response) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(choices) = stream_response["choices"].as_array() {
-                            for choice in choices {
-                                if let Some(delta) = choice["delta"].as_object() {
-                                    if let Some(content) = delta["content"].as_str() {
-                                        // Only print if content is not empty to avoid printing artifacts like >>>>>>>>
-                                        if !content.is_empty() {
-                                            print!("{}", content);
-                                            std::io::stdout().flush()?;
-                                            full_response.push_str(content);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                }
+                ChatCompletionStreamResponse::ToolCall(tool_calls) => {
+                    // Handle tool calls if needed
+                    eprintln!("Tool call received: {:?}", tool_calls);
+                }
+                ChatCompletionStreamResponse::Done => {
+                    // Stream completed
+                    break;
                 }
             }
         }
@@ -99,29 +77,25 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
 
         let start_time = Instant::now();
 
-        let response = client
-            .post(config.base_url.replace("/v1", "") + "/v1/chat/completions") // Ensure correct endpoint
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.7
-            }))
-            .send()
-            .await?;
+        let req = ChatCompletionRequest::new(
+            model,
+            vec![chat_completion::ChatCompletionMessage {
+                role: MessageRole::user,
+                content: Content::Text(prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+        );
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(format!("Error calling LLM API: {}", error_text).into());
-        }
+        let result = client.chat_completion(req).await?;
 
-        let openai_response: NonStreamResponse = response.json().await?;
-
-        let result = if let Some(choice) = openai_response.choices.first() {
-            choice.message.content.clone()
+        let content = if !result.choices.is_empty() {
+            if let Some(content) = &result.choices[0].message.content {
+                content.clone()
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
@@ -129,6 +103,6 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
         let duration = start_time.elapsed();
         println!("\n(Completed in {:.2?})", duration);
 
-        Ok(result)
+        Ok(content)
     }
 }

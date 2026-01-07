@@ -6,7 +6,7 @@ mod utils;
 
 use clap::{Parser, ArgAction};
 use config::load_config;
-use prompt::{load_prompt_config, find_command};
+use prompt::{load_prompt_config, find_command, process_template, process_template_with_args};
 use llm::process_with_llm;
 use output::render_output;
 use utils::copy_to_clipboard;
@@ -35,11 +35,19 @@ struct Cli {
     #[arg(long = "no-stream", action = ArgAction::SetTrue)]
     no_stream: bool,
 
+    /// Enable debug mode to print filled prompt
+    #[arg(long = "debug", action = ArgAction::SetTrue)]
+    debug: bool,
+
     /// Command name (e.g., translate, polish)
     command: Option<String>,
 
     /// Input text to process
     input: Option<String>,
+
+    /// Additional arguments for the command
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
 }
 
 #[tokio::main]
@@ -47,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Handle built-in commands first
-    if let Some(config_type) = cli.set {
+    if let Some(ref config_type) = cli.set {
         if config_type == "openai" {
             config::configure_openai().await?;
             return Ok(());
@@ -64,19 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(command_to_remove) = cli.rm {
-        prompt::remove_command(&command_to_remove).await?;
+    if let Some(ref command_to_remove) = cli.rm {
+        prompt::remove_command(command_to_remove).await?;
         return Ok(());
     }
 
     // Process command if provided
-    if let Some(command) = cli.command {
+    if let Some(command) = &cli.command {
         if command == "ask" {
             // Special handling for the 'ask' command to enable interactive mode
             if cli.no_stream {
                 // If no-stream is specified, just process the input normally
-                if let Some(input) = cli.input {
-                    process_command(command, input, false).await?;
+                if cli.input.is_some() {
+                    process_command_with_args(&cli).await?;
                 } else {
                     eprintln!("Error: No input provided for command '{}'", command);
                     std::process::exit(1);
@@ -86,8 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_interactive_mode().await?;
             }
         } else {
-            if let Some(input) = cli.input {
-                process_command(command, input, !cli.no_stream).await?;
+            if cli.input.is_some() {
+                process_command_with_args(&cli).await?;
             } else {
                 eprintln!("Error: No input provided for command '{}'", command);
                 std::process::exit(1);
@@ -104,12 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn process_command(command: String, input: String, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_command_with_args(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let command = cli.command.as_ref().unwrap();
+    let input = cli.input.as_ref().unwrap();
+
     // First check if config exists
     let config = load_config().await?;
 
     if config.api_key.is_empty() {
-        eprintln!("Error: API key not configured. Please run 'xa -set openai' first.");
+        eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
         std::process::exit(1);
     }
 
@@ -117,15 +128,50 @@ async fn process_command(command: String, input: String, stream: bool) -> Result
     let prompt_config = load_prompt_config().await?;
 
     // Find the command in prompts (with fuzzy matching)
-    let matched_command = find_command(&command, &prompt_config.prompts);
+    let matched_command = find_command(command, &prompt_config.prompts);
 
     match matched_command {
         Some(cmd) => {
             let prompt_entry = &prompt_config.prompts[&cmd];
-            let filled_prompt = prompt_entry.template.replace("{input}", &input);
+
+            // Special handling for commands that have specific argument patterns
+            let (processed_input, processed_args) = if cmd == "translate" {
+                // For translate command: if input looks like a language code and we have args, swap them
+                // If input is 2-3 letters and first arg is longer text, assume input is target language
+                if input.chars().all(|c| c.is_ascii_alphabetic()) && input.len() >= 2 && input.len() <= 3
+                   && !cli.args.is_empty() {
+                    // Input looks like a language code, first arg is the text to translate
+                    let text_to_translate = &cli.args[0];
+                    (text_to_translate.clone(), vec![input.to_string()])
+                } else {
+                    // Normal case: input is the text, args are additional parameters
+                    (input.to_string(), cli.args.clone())
+                }
+            } else {
+                // For other commands, use the original logic
+                (input.to_string(), cli.args.clone())
+            };
+
+            // Process the template with input and arguments using the new configurable system
+            let filled_prompt = process_template_with_args(
+                &prompt_entry.template,
+                &processed_input,
+                &processed_args,
+                prompt_entry.args.as_ref()
+            );
+
+            // Print the filled prompt if debug mode is enabled
+            if cli.debug {
+                eprintln!("[DEBUG] Debug mode is ON");
+                eprintln!("[DEBUG] Filled prompt:");
+                eprintln!("---");
+                eprintln!("{}", filled_prompt);
+                eprintln!("---");
+                eprintln!("[DEBUG] End of filled prompt\n");
+            }
 
             // Call the LLM API with streaming option
-            let result = process_with_llm(&config, &filled_prompt, stream).await?;
+            let result = process_with_llm(&config, &filled_prompt, !cli.no_stream).await?;
 
             // Copy result to clipboard
             if let Err(e) = copy_to_clipboard(&result) {
@@ -144,6 +190,23 @@ async fn process_command(command: String, input: String, stream: bool) -> Result
     }
 }
 
+async fn process_command(command: String, input: String, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Create a temporary CLI struct to pass to the new function
+    let temp_cli = Cli {
+        set: None,
+        list: false,
+        add: false,
+        rm: None,
+        no_stream: !stream,
+        debug: false,
+        command: Some(command),
+        input: Some(input),
+        args: vec![],
+    };
+
+    process_command_with_args(&temp_cli).await
+}
+
 use std::io::{self, Write};
 use termimad::{MadSkin, ansi};
 
@@ -152,7 +215,7 @@ async fn start_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config().await?;
 
     if config.api_key.is_empty() {
-        eprintln!("Error: API key not configured. Please run 'xa -set openai' first.");
+        eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
         std::process::exit(1);
     }
 
@@ -260,11 +323,12 @@ USAGE:
     xa [OPTIONS] [COMMAND] [INPUT]
 
 OPTIONS:
-    -s, --set <CONFIG_TYPE>     Configure API settings (e.g., xa -set openai)
+    -s, --set <CONFIG_TYPE>     Configure API settings (e.g., xa --set openai)
     -l, --ls                    List all available commands
     -a, --add                   Add a new command/prompt
     -r, --rm <COMMAND_NAME>     Remove a command/prompt
     --no-stream                 Disable streaming mode
+    --debug                     Enable debug mode to print filled prompt
 
 EXAMPLES:
     xa --set openai              # Configure OpenAI-compatible API
@@ -274,6 +338,7 @@ EXAMPLES:
     xa translate "Hello"        # Translate text
     xa trans "Hello"            # Translate using fuzzy matching
     xa polish "This is a draft text" --no-stream  # Polish text without streaming
+    xa --debug trans zh "Hello"  # Translate with debug mode enabled (debug flag before command)
 
 For more information, visit the project repository."#.to_string()
 }
