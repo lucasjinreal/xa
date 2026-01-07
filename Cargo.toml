@@ -3,7 +3,7 @@ name = "xa"
 version = "0.1.0"
 edition = "2021"
 description = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["jinfagang19@163.com"]
 license = "MIT"
 
 [dependencies]
