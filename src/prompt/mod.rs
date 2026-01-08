@@ -184,13 +184,66 @@ pub async fn add_command() -> Result<(), Box<dyn std::error::Error>> {
         Some(description)
     };
 
+    // Ask if user wants to add arguments
+    print!("Do you want to add arguments to this command? (y/N): ");
+    io::stdout().flush()?;
+    let mut add_args_input = String::new();
+    io::stdin().read_line(&mut add_args_input)?;
+    let add_args = add_args_input.trim().to_lowercase() == "y" || add_args_input.trim().to_lowercase() == "yes";
+
+    let mut args: Option<Vec<PromptArg>> = None;
+    if add_args {
+        let mut prompt_args = Vec::new();
+
+        loop {
+            print!("Enter argument name (or press Enter to finish): ");
+            io::stdout().flush()?;
+            let mut arg_name = String::new();
+            io::stdin().read_line(&mut arg_name)?;
+            let arg_name = arg_name.trim().to_string();
+
+            if arg_name.is_empty() {
+                break;
+            }
+
+            print!("Enter default value for '{}': ", arg_name);
+            io::stdout().flush()?;
+            let mut default_value = String::new();
+            io::stdin().read_line(&mut default_value)?;
+            let default_value = default_value.trim().to_string();
+
+            print!("Enter description for '{}' (optional): ", arg_name);
+            io::stdout().flush()?;
+            let mut arg_description = String::new();
+            io::stdin().read_line(&mut arg_description)?;
+            let arg_description = arg_description.trim().to_string();
+            let arg_description = if arg_description.is_empty() {
+                None
+            } else {
+                Some(arg_description)
+            };
+
+            prompt_args.push(PromptArg {
+                name: arg_name,
+                default_value,
+                description: arg_description,
+            });
+
+            println!("Added argument: {}", prompt_args.last().unwrap().name);
+        }
+
+        if !prompt_args.is_empty() {
+            args = Some(prompt_args);
+        }
+    }
+
     // Add the new command
     prompt_config.prompts.insert(
         name.clone(),
         PromptEntry {
             template,
             description,
-            args: None,
+            args,
         },
     );
 
@@ -369,6 +422,34 @@ pub fn process_template(template: &str, input: &str, args: &[String]) -> String 
     }
 
     result
+}
+
+pub fn reset_default_prompts() -> Result<(), Box<dyn std::error::Error>> {
+    use dirs::config_dir;
+    use std::fs;
+
+    // Get config directory
+    let config_dir = config_dir()
+        .ok_or("Could not determine config directory")?
+        .join("xa");
+
+    let prompt_config_file = config_dir.join("prompts.toml");
+
+    // Create default prompt config
+    let default_config = PromptConfig::default();
+
+    // Create the directory if it doesn't exist
+    fs::create_dir_all(&config_dir)?;
+
+    // Save the default prompts, overwriting any existing file
+    let content = toml::to_string(&default_config)?;
+    fs::write(&prompt_config_file, content)?;
+
+    println!("Default prompts have been reset successfully!");
+    println!("Prompt file location: {:?}", prompt_config_file);
+    println!("Default commands restored: translate, polish, rewrite, summarize, ask");
+
+    Ok(())
 }
 
 pub fn process_template_with_args(template: &str, input: &str, args: &[String], prompt_args: Option<&Vec<PromptArg>>) -> String {

@@ -6,7 +6,7 @@ mod utils;
 
 use clap::{Parser, ArgAction};
 use config::load_config;
-use prompt::{load_prompt_config, find_command, process_template, process_template_with_args};
+use prompt::{load_prompt_config, find_command, process_template_with_args};
 use llm::process_with_llm;
 use output::render_output;
 use utils::copy_to_clipboard;
@@ -30,6 +30,10 @@ struct Cli {
     /// Remove a command/prompt (xa -rm)
     #[arg(short = 'r', long = "rm", value_name = "COMMAND_NAME", conflicts_with_all = &["set", "list", "add"])]
     rm: Option<String>,
+
+    /// Reset to default prompts (xa --reset-defaults)
+    #[arg(long = "reset-defaults", action = ArgAction::SetTrue, conflicts_with_all = &["set", "list", "add", "rm"])]
+    reset_defaults: bool,
 
     /// Disable streaming mode
     #[arg(long = "no-stream", action = ArgAction::SetTrue)]
@@ -74,6 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref command_to_remove) = cli.rm {
         prompt::remove_command(command_to_remove).await?;
+        return Ok(());
+    }
+
+    if cli.reset_defaults {
+        prompt::reset_default_prompts()?;
         return Ok(());
     }
 
@@ -197,6 +206,7 @@ async fn process_command(command: String, input: String, stream: bool) -> Result
         list: false,
         add: false,
         rm: None,
+        reset_defaults: false,
         no_stream: !stream,
         debug: false,
         command: Some(command),
@@ -327,6 +337,7 @@ OPTIONS:
     -l, --ls                    List all available commands
     -a, --add                   Add a new command/prompt
     -r, --rm <COMMAND_NAME>     Remove a command/prompt
+    --reset-defaults            Reset to default prompts
     --no-stream                 Disable streaming mode
     --debug                     Enable debug mode to print filled prompt
 
@@ -335,6 +346,7 @@ EXAMPLES:
     xa --ls                      # List all commands
     xa --add                     # Add a new command
     xa --rm summarize            # Remove the 'summarize' command
+    xa --reset-defaults          # Reset to default prompts
     xa translate "Hello"        # Translate text
     xa trans "Hello"            # Translate using fuzzy matching
     xa polish "This is a draft text" --no-stream  # Polish text without streaming
