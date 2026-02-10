@@ -3,6 +3,7 @@ mod prompt;
 mod llm;
 mod output;
 mod utils;
+mod store;
 
 use clap::{Parser, ArgAction};
 use config::load_config;
@@ -10,6 +11,7 @@ use prompt::{load_prompt_config, find_command, process_template_with_args};
 use llm::process_with_llm;
 use output::render_output;
 use utils::copy_to_clipboard;
+use store::{add_secret_with_tag, search_secret};
 
 #[derive(Parser)]
 #[command(name = "xa")]
@@ -88,6 +90,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process command if provided
     if let Some(command) = &cli.command {
+        if command == "add" {
+            let secret = cli.input.as_deref().unwrap_or("");
+            let note = if cli.args.is_empty() {
+                String::new()
+            } else {
+                cli.args.join(" ")
+            };
+
+            if secret.is_empty() || note.is_empty() {
+                eprintln!("Error: Usage: xa add <secret> <note>");
+                std::process::exit(1);
+            }
+
+            let config = load_config().await?;
+            if config.api_key.is_empty() {
+                eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
+                std::process::exit(1);
+            }
+
+            add_secret_with_tag(&config, secret, &note).await?;
+            return Ok(());
+        }
+
+        if command == "search" {
+            let mut parts = Vec::new();
+            if let Some(input) = &cli.input {
+                parts.push(input.clone());
+            }
+            if !cli.args.is_empty() {
+                parts.extend(cli.args.clone());
+            }
+
+            if parts.is_empty() {
+                eprintln!("Error: Usage: xa search <query>");
+                std::process::exit(1);
+            }
+
+            let query = parts.join(" ");
+
+            let config = load_config().await?;
+            if config.api_key.is_empty() {
+                eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
+                std::process::exit(1);
+            }
+
+            search_secret(&config, &query).await?;
+            return Ok(());
+        }
+
         if command == "ask" {
             // Special handling for the 'ask' command to enable interactive mode
             if cli.no_stream {
@@ -347,6 +398,8 @@ EXAMPLES:
     xa --add                     # Add a new command
     xa --rm summarize            # Remove the 'summarize' command
     xa --reset-defaults          # Reset to default prompts
+    xa add mysecret "this is a gitcode apikey"  # Add a secret with auto tag
+    xa search "my gitcode token" # Search secrets
     xa translate "Hello"        # Translate text
     xa trans "Hello"            # Translate using fuzzy matching
     xa polish "This is a draft text" --no-stream  # Polish text without streaming

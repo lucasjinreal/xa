@@ -105,6 +105,8 @@ pub async fn list_commands() -> Result<(), Box<dyn std::error::Error>> {
     println!("  --set: Configure API settings (use: xa --set openai)");
     println!("  --ls: List all commands (this command)");
     println!("  --add: Add a new command/prompt (use: xa --add)");
+    println!("  add: Add a secret with auto tag (use: xa add <secret> <note>)");
+    println!("  search: Search secrets by natural language (use: xa search <query>)");
     println!();
     println!("User-defined commands:");
 
