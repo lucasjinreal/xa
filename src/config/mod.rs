@@ -34,7 +34,6 @@ struct ModelData {
 
 pub async fn configure_openai() -> Result<(), Box<dyn std::error::Error>> {
     println!("Setting up OpenAI-compatible configuration...");
-    println!("This will create a config file at ~/.config/xa/config.toml");
 
     // Get config directory
     let config_dir = config_dir()
@@ -46,6 +45,8 @@ pub async fn configure_openai() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get config file path
     let config_file = config_dir.join("config.toml");
+    
+    println!("Configuration files will be stored at: {:?}", config_dir);
 
     // Check if config already exists
     let config = if config_file.exists() {

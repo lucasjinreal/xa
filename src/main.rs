@@ -5,7 +5,7 @@ mod output;
 mod utils;
 mod store;
 
-use clap::{Parser, ArgAction};
+use clap::{Parser, Subcommand};
 use config::load_config;
 use prompt::{load_prompt_config, find_command, process_template_with_args};
 use llm::process_with_llm;
@@ -15,38 +15,19 @@ use store::{add_secret_with_tag, search_secret};
 
 #[derive(Parser)]
 #[command(name = "xa")]
-#[command(about = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs", long_about = None)]
+#[command(about = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs")]
+#[command(after_help = "Short aliases: as (add-secret), se (search)\nExamples: xa as mysecret \"token\", xa se \"query\", xa ls prompts")]
 struct Cli {
-    /// Set configuration (e.g., xa -set openai)
-    #[arg(short = 's', long = "set", value_name = "CONFIG_TYPE", conflicts_with_all = &["list", "add", "rm"])]
-    set: Option<String>,
-
-    /// List all commands (xa -ls)
-    #[arg(short = 'l', long = "ls", action = ArgAction::SetTrue, conflicts_with_all = &["set", "add", "rm"])]
-    list: bool,
-
-    /// Add a new command/prompt (xa -add)
-    #[arg(short = 'a', long = "add", action = ArgAction::SetTrue, conflicts_with_all = &["set", "list", "rm"])]
-    add: bool,
-
-    /// Remove a command/prompt (xa -rm)
-    #[arg(short = 'r', long = "rm", value_name = "COMMAND_NAME", conflicts_with_all = &["set", "list", "add"])]
-    rm: Option<String>,
-
-    /// Reset to default prompts (xa --reset-defaults)
-    #[arg(long = "reset-defaults", action = ArgAction::SetTrue, conflicts_with_all = &["set", "list", "add", "rm"])]
-    reset_defaults: bool,
+    #[command(subcommand)]
+    command: Option<Commands>,
 
     /// Disable streaming mode
-    #[arg(long = "no-stream", action = ArgAction::SetTrue)]
+    #[arg(long = "no-stream", global = true)]
     no_stream: bool,
 
     /// Enable debug mode to print filled prompt
-    #[arg(long = "debug", action = ArgAction::SetTrue)]
+    #[arg(long = "debug", global = true)]
     debug: bool,
-
-    /// Command name (e.g., translate, polish)
-    command: Option<String>,
 
     /// Input text to process
     input: Option<String>,
@@ -56,131 +37,158 @@ struct Cli {
     args: Vec<String>,
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Set configuration (e.g., xa set openai)
+    #[command(short_flag = 's')]
+    Set {
+        /// Configuration type
+        config_type: String,
+    },
+
+    /// List all commands or specific items
+    #[command(short_flag = 'l', alias = "list")]
+    Ls {
+        /// Type of items to list (prompts, stores)
+        #[arg(value_name = "TYPE")]
+        list_type: Option<String>,
+    },
+
+    /// Add a new command/prompt
+    #[command(short_flag = 'a')]
+    Add,
+
+    /// Remove a command/prompt
+    #[command(short_flag = 'r')]
+    Rm {
+        /// Command name to remove
+        command_name: String,
+    },
+
+    /// Reset to default prompts
+    #[command(alias = "reset")]
+    ResetDefaults,
+
+    /// Add a secret with auto tag
+    #[command(short_flag = 'A', visible_alias = "as")]
+    AddSecret {
+        /// The secret value
+        secret: String,
+        /// Note/description for the secret
+        note: String,
+    },
+
+    /// Search secrets by natural language
+    #[command(visible_alias = "se")]
+    Search {
+        /// Search query
+        query: String,
+    },
+
+    /// Interactive conversation mode
+    Ask,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Handle built-in commands first
-    if let Some(ref config_type) = cli.set {
-        if config_type == "openai" {
-            config::configure_openai().await?;
-            return Ok(());
-        }
-    }
-
-    if cli.list {
-        prompt::list_commands().await?;
-        return Ok(());
-    }
-
-    if cli.add {
-        prompt::add_command().await?;
-        return Ok(());
-    }
-
-    if let Some(ref command_to_remove) = cli.rm {
-        prompt::remove_command(command_to_remove).await?;
-        return Ok(());
-    }
-
-    if cli.reset_defaults {
-        prompt::reset_default_prompts()?;
-        return Ok(());
-    }
-
-    // Process command if provided
-    if let Some(command) = &cli.command {
-        if command == "add" {
-            let secret = cli.input.as_deref().unwrap_or("");
-            let note = if cli.args.is_empty() {
-                String::new()
+    // Handle commands via subcommand matching
+    match cli.command {
+        Some(Commands::Set { config_type }) => {
+            if config_type == "openai" {
+                config::configure_openai().await?;
+                return Ok(());
             } else {
-                cli.args.join(" ")
-            };
-
-            if secret.is_empty() || note.is_empty() {
-                eprintln!("Error: Usage: xa add <secret> <note>");
+                eprintln!("Unknown configuration type: {}", config_type);
+                eprintln!("Available configuration types: openai");
                 std::process::exit(1);
             }
-
-            let config = load_config().await?;
-            if config.api_key.is_empty() {
-                eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
-                std::process::exit(1);
+        }
+        Some(Commands::Ls { list_type }) => {
+            match list_type.as_deref() {
+                Some("prompts") => {
+                    prompt::list_prompts().await?;
+                    return Ok(());
+                }
+                Some("stores") => {
+                    store::list_stores().await?;
+                    return Ok(());
+                }
+                Some(other) => {
+                    eprintln!("Unknown list type: {}", other);
+                    eprintln!("Available list types: prompts, stores");
+                    eprintln!("Usage: xa ls prompts  or  xa ls stores");
+                    std::process::exit(1);
+                }
+                None => {
+                    prompt::list_commands().await?;
+                    return Ok(());
+                }
             }
-
-            add_secret_with_tag(&config, secret, &note).await?;
+        }
+        Some(Commands::Add) => {
+            prompt::add_command().await?;
             return Ok(());
         }
-
-        if command == "search" {
-            let mut parts = Vec::new();
-            if let Some(input) = &cli.input {
-                parts.push(input.clone());
-            }
-            if !cli.args.is_empty() {
-                parts.extend(cli.args.clone());
-            }
-
-            if parts.is_empty() {
-                eprintln!("Error: Usage: xa search <query>");
-                std::process::exit(1);
-            }
-
-            let query = parts.join(" ");
-
+        Some(Commands::Rm { command_name }) => {
+            prompt::remove_command(&command_name).await?;
+            return Ok(());
+        }
+        Some(Commands::ResetDefaults) => {
+            prompt::reset_default_prompts()?;
+            return Ok(());
+        }
+        Some(Commands::AddSecret { secret, note }) => {
             let config = load_config().await?;
             if config.api_key.is_empty() {
-                eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
+                eprintln!("Error: API key not configured. Please run 'xa set openai' first.");
                 std::process::exit(1);
             }
-
+            add_secret_with_tag(&config, &secret, &note).await?;
+            return Ok(());
+        }
+        Some(Commands::Search { query }) => {
+            let config = load_config().await?;
+            if config.api_key.is_empty() {
+                eprintln!("Error: API key not configured. Please run 'xa set openai' first.");
+                std::process::exit(1);
+            }
             search_secret(&config, &query).await?;
             return Ok(());
         }
-
-        if command == "ask" {
-            // Special handling for the 'ask' command to enable interactive mode
-            if cli.no_stream {
-                // If no-stream is specified, just process the input normally
-                if cli.input.is_some() {
-                    process_command_with_args(&cli).await?;
-                } else {
-                    eprintln!("Error: No input provided for command '{}'", command);
-                    std::process::exit(1);
-                }
+        Some(Commands::Ask) => {
+            if cli.input.is_some() {
+                // Process with ask command if input provided
+                process_command_with_args(&cli, "ask").await?;
             } else {
                 // Start interactive conversation mode
                 start_interactive_mode().await?;
             }
-        } else {
-            if cli.input.is_some() {
-                process_command_with_args(&cli).await?;
-            } else {
-                eprintln!("Error: No input provided for command '{}'", command);
-                std::process::exit(1);
-            }
+            return Ok(());
         }
-    } else if cli.input.is_some() {
-        eprintln!("Error: No command provided");
-        std::process::exit(1);
-    } else {
-        // If no command or input, show help
-        println!("{}", get_help_text());
+        None => {
+            // No subcommand provided
+            if cli.input.is_some() {
+                eprintln!("Error: No command provided");
+                std::process::exit(1);
+            } else {
+                // Show help
+                println!("{}", get_help_text());
+            }
+            return Ok(());
+        }
     }
-
-    Ok(())
 }
 
-async fn process_command_with_args(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let command = cli.command.as_ref().unwrap();
+async fn process_command_with_args(cli: &Cli, command_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let input = cli.input.as_ref().unwrap();
 
     // First check if config exists
     let config = load_config().await?;
 
     if config.api_key.is_empty() {
-        eprintln!("Error: API key not configured. Please run 'xa --set openai' first.");
+        eprintln!("Error: API key not configured. Please run 'xa set openai' first.");
         std::process::exit(1);
     }
 
@@ -188,7 +196,7 @@ async fn process_command_with_args(cli: &Cli) -> Result<(), Box<dyn std::error::
     let prompt_config = load_prompt_config().await?;
 
     // Find the command in prompts (with fuzzy matching)
-    let matched_command = find_command(command, &prompt_config.prompts);
+    let matched_command = find_command(command_name, &prompt_config.prompts);
 
     match matched_command {
         Some(cmd) => {
@@ -244,28 +252,10 @@ async fn process_command_with_args(cli: &Cli) -> Result<(), Box<dyn std::error::
             Ok(())
         }
         None => {
-            eprintln!("Error: Command '{}' not found. Use 'xa -ls' to see available commands.", command);
+            eprintln!("Error: Command '{}' not found. Use 'xa ls' to see available commands.", command_name);
             std::process::exit(1);
         }
     }
-}
-
-async fn process_command(command: String, input: String, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a temporary CLI struct to pass to the new function
-    let temp_cli = Cli {
-        set: None,
-        list: false,
-        add: false,
-        rm: None,
-        reset_defaults: false,
-        no_stream: !stream,
-        debug: false,
-        command: Some(command),
-        input: Some(input),
-        args: vec![],
-    };
-
-    process_command_with_args(&temp_cli).await
 }
 
 use std::io::{self, Write};
@@ -381,29 +371,33 @@ fn get_help_text() -> String {
     r#"xa - Execute Anything via LLM
 
 USAGE:
-    xa [OPTIONS] [COMMAND] [INPUT]
+    xa [OPTIONS] [COMMAND] [INPUT] [ARGS]...
+
+COMMANDS:
+    set, -s <CONFIG_TYPE>     Configure API settings (e.g., xa set openai)
+    ls, -l [TYPE]             List commands (TYPE: prompts, stores, or omit for all)
+    add, -a                   Add a new command/prompt interactively
+    rm, -r <COMMAND_NAME>     Remove a command/prompt
+    reset-defaults            Reset to default prompts
+    add-secret, -A, as        Add a secret: xa as <secret> <note>
+    search, se                Search secrets: xa se <query>
+    ask                       Interactive conversation mode
 
 OPTIONS:
-    -s, --set <CONFIG_TYPE>     Configure API settings (e.g., xa --set openai)
-    -l, --ls                    List all available commands
-    -a, --add                   Add a new command/prompt
-    -r, --rm <COMMAND_NAME>     Remove a command/prompt
-    --reset-defaults            Reset to default prompts
-    --no-stream                 Disable streaming mode
-    --debug                     Enable debug mode to print filled prompt
+    --no-stream               Disable streaming mode
+    --debug                   Enable debug mode to print filled prompt
+    -h, --help                Print help
 
 EXAMPLES:
-    xa --set openai              # Configure OpenAI-compatible API
-    xa --ls                      # List all commands
-    xa --add                     # Add a new command
-    xa --rm summarize            # Remove the 'summarize' command
-    xa --reset-defaults          # Reset to default prompts
-    xa add mysecret "this is a gitcode apikey"  # Add a secret with auto tag
-    xa search "my gitcode token" # Search secrets
-    xa translate "Hello"        # Translate text
-    xa trans "Hello"            # Translate using fuzzy matching
-    xa polish "This is a draft text" --no-stream  # Polish text without streaming
-    xa --debug trans zh "Hello"  # Translate with debug mode enabled (debug flag before command)
+    xa set openai                         # Configure API
+    xa ls                                 # List all commands
+    xa ls prompts                         # List prompt templates
+    xa ls stores                          # List stored secrets
+    xa as mysecret "gitcode token"        # Add secret (short alias)
+    xa se "my token"                      # Search secrets (short alias)
+    xa translate "Hello"                  # Translate text
+    xa polish "draft" --no-stream         # Polish without streaming
+    xa --debug trans zh "Hello"           # Translate with debug
 
 For more information, visit the project repository."#.to_string()
 }

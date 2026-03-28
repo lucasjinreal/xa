@@ -20,6 +20,40 @@ pub struct StoreEntry {
     pub created_at: String,
 }
 
+pub async fn list_stores() -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = config_dir()
+        .ok_or("Could not determine config directory")?
+        .join("xa");
+    
+    let store_file = config_dir.join("stores.toml");
+    
+    let store = load_store()?;
+    
+    println!("Stored secrets:");
+    println!("Config directory: {:?}", config_dir);
+    println!("Store file: {:?}", store_file);
+    println!();
+    
+    if store.entries.is_empty() {
+        println!("No secrets stored yet.");
+        println!("Use 'xa add <secret> <note>' to add a secret.");
+        return Ok(());
+    }
+    
+    println!("Total entries: {}", store.entries.len());
+    println!();
+    
+    for entry in &store.entries {
+        println!("[{}]", entry.tag);
+        println!("  Note: {}", entry.note);
+        println!("  Created: {}", entry.created_at);
+        println!("  Secret: ***hidden***");
+        println!();
+    }
+    
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct TagResponse {
     tag: String,

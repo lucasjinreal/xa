@@ -102,11 +102,13 @@ pub async fn list_commands() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("Built-in commands:");
-    println!("  --set: Configure API settings (use: xa --set openai)");
-    println!("  --ls: List all commands (this command)");
-    println!("  --add: Add a new command/prompt (use: xa --add)");
-    println!("  add: Add a secret with auto tag (use: xa add <secret> <note>)");
-    println!("  search: Search secrets by natural language (use: xa search <query>)");
+    println!("  set: Configure API settings (use: xa set openai)");
+    println!("  ls: List all commands (this command)");
+    println!("  ls prompts: List all prompt templates");
+    println!("  ls stores: List all stored secrets");
+    println!("  add: Add a new command/prompt (use: xa add)");
+    println!("  add <secret> <note>: Add a secret with auto tag");
+    println!("  search <query>: Search secrets by natural language");
     println!();
     println!("User-defined commands:");
 
@@ -116,6 +118,44 @@ pub async fn list_commands() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .unwrap_or("Custom prompt command");
         println!("  {}: {}", name, description);
+    }
+
+    Ok(())
+}
+
+pub async fn list_prompts() -> Result<(), Box<dyn std::error::Error>> {
+    // Get config directory
+    let config_dir = config_dir()
+        .ok_or("Could not determine config directory")?
+        .join("xa");
+
+    let prompt_config_file = config_dir.join("prompts.toml");
+
+    let prompt_config = if prompt_config_file.exists() {
+        let content = fs::read_to_string(&prompt_config_file)?;
+        toml::from_str(&content)?
+    } else {
+        PromptConfig::default()
+    };
+
+    println!("Available prompt templates:");
+    println!("Config directory: {:?}", config_dir);
+    println!();
+
+    for (name, entry) in &prompt_config.prompts {
+        println!("[{}]", name);
+        if let Some(desc) = &entry.description {
+            println!("  Description: {}", desc);
+        }
+        if let Some(args) = &entry.args {
+            println!("  Arguments:");
+            for arg in args {
+                let default_info = format!(" (default: {})", arg.default_value);
+                println!("    -- {}: {}{}", arg.name, arg.description.as_deref().unwrap_or("No description"), default_info);
+            }
+        }
+        println!("  Template: {}", entry.template.replace('\n', "\\n"));
+        println!();
     }
 
     Ok(())
