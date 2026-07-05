@@ -1,3 +1,10 @@
+
+Bigger plan: we are converting xa into a general purpose coding agent cli.
+
+`xa` would support just like a light-weigthed codex or claudecode.
+
+
+
 some features need to do:
 
 - [ ] fix the time issues in request;
