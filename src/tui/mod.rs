@@ -192,76 +192,6 @@ impl HistoryCell for UserCell {
     }
 }
 
-// ---- Assistant (markdown, streaming) cell ----------------------------------
-
-struct AssistantCell {
-    content: String,
-    streaming: bool,
-}
-
-impl AssistantCell {
-    fn rendered_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let renderer = MarkdownRenderer::new(width.saturating_sub(4) as usize);
-        let blocks = renderer.parse(&self.content);
-        renderer.render(&blocks, &ThemeConfig::default())
-    }
-}
-
-impl HistoryCell for AssistantCell {
-    fn desired_height(&self, width: u16) -> u16 {
-        let lines = self.rendered_lines(width);
-        let h = lines.len() as u16 + 2; // header + trailing blank
-        if self.streaming {
-            h.max(3)
-        } else {
-            h.max(2)
-        }
-    }
-    fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, ctx: &RenderContext) {
-        let label = if self.streaming {
-            Line::from(shimmer_spans(
-                "Assistant ▍thinking…",
-                Color::Green,
-                ctx.shimmer_phase,
-            ))
-        } else {
-            Line::from(Span::styled(
-                "Assistant",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ))
-        };
-        buf.set_line(area.left(), area.top(), &label, area.width);
-        let lines = self.rendered_lines(area.width);
-        let mut y = area.top() + 1;
-        for line in lines {
-            if y >= area.bottom() {
-                break;
-            }
-            buf.set_line(area.left() + 2, y, &line, area.width - 2);
-            y += 1;
-        }
-        if self.streaming {
-            if y < area.bottom() {
-                buf.set_line(
-                    area.left() + 2,
-                    y,
-                    &Line::from(Span::styled(
-                        "▍",
-                        Style::default().fg(Color::Green),
-                    )),
-                    area.width - 2,
-                );
-            }
-        }
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-}
-
 // ---- Tool call card (DESIGN.md §7) -----------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -277,7 +207,6 @@ struct ToolCallCell {
     status: ToolStatus,
     output: Option<String>,
     expanded: bool,
-    is_group: bool,
 }
 
 impl ToolCallCell {
@@ -291,11 +220,7 @@ impl ToolCallCell {
             format!(" {icon} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )];
-        let summary = if self.is_group {
-            self.tool_name.clone()
-        } else {
-            format!("{}  {}", self.tool_name, self.args_preview)
-        };
+        let summary = format!("{}  {}", self.tool_name, self.args_preview);
         if self.status == ToolStatus::Running {
             let mut s = shimmer_spans(&summary, color, ctx.shimmer_phase);
             spans.append(&mut s);
@@ -317,7 +242,7 @@ impl ToolCallCell {
         if !toggle.is_empty() {
             spans.push(Span::styled(
                 toggle.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(150, 150, 150)),
             ));
         }
         Line::from(spans)
@@ -352,7 +277,7 @@ impl HistoryCell for ToolCallCell {
                 let color = if self.status == ToolStatus::Failed {
                     Color::Rgb(220, 120, 120)
                 } else {
-                    Color::DarkGray
+                    Color::Rgb(150, 150, 150)
                 };
                 buf.set_line(
                     area.left() + 4,
@@ -362,6 +287,116 @@ impl HistoryCell for ToolCallCell {
                 );
                 y += 1;
             }
+        }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// ---- Thinking (one block: phrase header + tool calls + answer) ------------
+
+const THINK_PHRASES: &[&str] = &[
+    "Thinking",
+    "Mulling it over",
+    "Reasoning",
+    "Working",
+    "Pondering",
+    "Figuring it out",
+];
+
+struct ThinkingCell {
+    phrase: String,
+    tools: Vec<ToolCallCell>,
+    answer: String,
+    streaming: bool,
+}
+
+impl ThinkingCell {
+    fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        let phrase = THINK_PHRASES[n % THINK_PHRASES.len()].to_string();
+        ThinkingCell {
+            phrase,
+            tools: Vec::new(),
+            answer: String::new(),
+            streaming: true,
+        }
+    }
+    fn rendered_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let renderer = MarkdownRenderer::new(width.saturating_sub(4) as usize);
+        let blocks = renderer.parse(&self.answer);
+        renderer.render(&blocks, &ThemeConfig::default())
+    }
+}
+
+impl HistoryCell for ThinkingCell {
+    fn desired_height(&self, width: u16) -> u16 {
+        let mut h = 1u16; // phrase header
+        for t in &self.tools {
+            h += t.desired_height(width);
+        }
+        let ans = self.rendered_lines(width).len() as u16;
+        h += ans;
+        if self.streaming || ans == 0 {
+            h = h.max(3);
+        } else {
+            h = h.max(2);
+        }
+        h
+    }
+    fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, ctx: &RenderContext) {
+        // Single phrase header (no per-tool "Thinking", no "Assistant" title).
+        let label = if self.streaming && self.answer.is_empty() && self.tools.is_empty() {
+            Line::from(shimmer_spans(
+                &format!("{}…", self.phrase),
+                Color::White,
+                ctx.shimmer_phase,
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("{}", self.phrase),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ))
+        };
+        buf.set_line(area.left(), area.top(), &label, area.width);
+        let mut y: i32 = area.top() as i32 + 1;
+        let bottom = area.bottom() as i32;
+        for t in &self.tools {
+            let th = t.desired_height(area.width) as i32;
+            if y < bottom {
+                let vis = (bottom - y).min(th).max(1) as u16;
+                let cell_area = Rect {
+                    x: area.left() + 2,
+                    y: y as u16,
+                    width: area.width.saturating_sub(2),
+                    height: vis,
+                };
+                t.render(cell_area, buf, ctx);
+            }
+            y += th;
+        }
+        // Answer rendered directly, no title.
+        if !self.answer.is_empty() {
+            let lines = self.rendered_lines(area.width);
+            for line in lines {
+                if y >= bottom {
+                    break;
+                }
+                buf.set_line(area.left() + 2, y as u16, &line, area.width - 2);
+                y += 1;
+            }
+        } else if self.streaming && y < bottom {
+            buf.set_line(
+                area.left() + 2,
+                y as u16,
+                &Line::from(Span::styled("▍", Style::default().fg(Color::White))),
+                area.width - 2,
+            );
         }
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -445,7 +480,9 @@ struct App {
     shimmer_start: Instant,
     dirty: bool,
     /// Active tool-call card index (during a streaming tool run) for grouping.
-    active_tool_card: Option<usize>,
+    active_think: Option<usize>,
+    /// Timestamp of the last Ctrl-C press (for double-press-to-quit).
+    last_ctrl_c: Option<Instant>,
     slash_mode: bool,
     slash_query: String,
     slash_selected: usize,
@@ -477,7 +514,8 @@ impl App {
             agent_history: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shimmer_start: Instant::now(),
             dirty: true,
-            active_tool_card: None,
+            active_think: None,
+            last_ctrl_c: None,
             slash_mode: false,
             slash_query: String::new(),
             slash_selected: 0,
@@ -512,11 +550,11 @@ impl App {
                     role: "user".into(),
                     content: u.content.clone(),
                 });
-            } else if let Some(a) = c.as_any().downcast_ref::<AssistantCell>() {
-                if !a.content.trim().is_empty() {
+            } else if let Some(tc) = c.as_any().downcast_ref::<ThinkingCell>() {
+                if !tc.answer.trim().is_empty() {
                     msgs.push(session::StoredMessage {
                         role: "assistant".into(),
-                        content: a.content.clone(),
+                        content: tc.answer.clone(),
                     });
                 }
             }
@@ -547,12 +585,9 @@ impl App {
             });
         }
 
-        let assistant_idx = self.cells.len();
-        self.push_cell(Box::new(AssistantCell {
-            content: String::new(),
-            streaming: true,
-        }));
-        self.active_tool_card = None;
+        let think_idx = self.cells.len();
+        self.push_cell(Box::new(ThinkingCell::new()));
+        self.active_think = Some(think_idx);
         self.sync_session();
         self.streaming = true;
         self.status = format!("streaming · {}", self.provider.model);
@@ -561,7 +596,7 @@ impl App {
         let provider = self.provider.clone();
         let event_tx = self.event_tx.clone();
         let agent_hist = self.agent_history.clone();
-        let assistant_idx = assistant_idx as u32;
+        let assistant_idx = think_idx as u32;
         tokio::spawn(async move {
             let (stx, mut srx) = mpsc::channel::<StreamEvent>(64);
             let fwd = event_tx.clone();
@@ -582,22 +617,18 @@ impl App {
     fn handle_stream(&mut self, se: StreamEvent) {
         match se {
             StreamEvent::Delta(s) => {
-                // Append to the last assistant cell if it exists, else create.
-                if let Some(last) = self.cells.last_mut() {
-                    if let Some(a) = last.as_any_mut().downcast_mut::<AssistantCell>() {
-                        a.content.push_str(&s);
-                        a.streaming = true;
-                    } else {
-                        self.push_cell(Box::new(AssistantCell {
-                            content: s,
-                            streaming: true,
-                        }));
+                // Append to the active thinking cell's answer.
+                if let Some(i) = self.active_think {
+                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
+                        tc.answer.push_str(&s);
+                        tc.streaming = true;
                     }
                 } else {
-                    self.push_cell(Box::new(AssistantCell {
-                        content: s,
-                        streaming: true,
-                    }));
+                    let mut tc = ThinkingCell::new();
+                    tc.answer.push_str(&s);
+                    tc.streaming = true;
+                    self.cells.push(Box::new(tc));
+                    self.active_think = Some(self.cells.len() - 1);
                 }
                 self.status = format!("streaming · {}", self.provider.model);
                 self.dirty = true;
@@ -605,15 +636,12 @@ impl App {
             StreamEvent::Done => {
                 self.streaming = false;
                 self.status = "ready".into();
-                self.active_tool_card = None;
-                // Mark any still-streaming assistant cells as finished.
-                for c in self.cells.iter_mut() {
-                    if let Some(a) = c.as_any_mut().downcast_mut::<AssistantCell>() {
-                        if a.streaming {
-                            a.streaming = false;
-                        }
+                if let Some(i) = self.active_think {
+                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
+                        tc.streaming = false;
                     }
                 }
+                self.active_think = None;
                 self.sync_session();
                 // flush queued inputs
                 if let Some(next) = self.queued_inputs.pop_front() {
@@ -624,40 +652,35 @@ impl App {
             StreamEvent::Error(e) => {
                 self.streaming = false;
                 self.status = "error".into();
-                self.push_cell(Box::new(SystemCell {
-                    content: format!("**error:** {e}"),
-                }));
-                self.active_tool_card = None;
+                if let Some(i) = self.active_think {
+                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
+                        tc.answer
+                            .push_str(&format!("\n\n**error:** {e}"));
+                        tc.streaming = false;
+                    }
+                }
+                self.active_think = None;
                 self.dirty = true;
             }
             StreamEvent::ToolCall { name, arguments } => {
                 let preview = args_preview(&arguments);
-                // Group consecutive tool calls into one card.
-                let use_group = match self.cells.last_mut() {
-                    Some(c) => {
-                        if let Some(t) = c.as_any_mut().downcast_mut::<ToolCallCell>() {
-                            if t.status == ToolStatus::Running && !t.is_group {
-                                t.is_group = true;
-                                t.tool_name = format!("{} , {}", t.tool_name, name);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    None => false,
+                // Ensure an active thinking cell exists, then add the tool.
+                let idx = if let Some(i) = self.active_think {
+                    i
+                } else {
+                    self.cells.push(Box::new(ThinkingCell::new()));
+                    let i = self.cells.len() - 1;
+                    self.active_think = Some(i);
+                    i
                 };
-                if !use_group {
-                    self.push_cell(Box::new(ToolCallCell {
+                if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
+                    tc.tools.push(ToolCallCell {
                         tool_name: name.clone(),
                         args_preview: preview,
                         status: ToolStatus::Running,
                         output: None,
                         expanded: false,
-                        is_group: false,
-                    }));
+                    });
                 }
                 self.dirty = true;
             }
@@ -666,28 +689,28 @@ impl App {
                 output,
                 is_error,
             } => {
-                // Update the most recent running tool card.
-                let mut target: Option<usize> = None;
-                for (i, c) in self.cells.iter().enumerate().rev() {
-                    if let Some(t) = c.as_any().downcast_ref::<ToolCallCell>() {
-                        if t.status == ToolStatus::Running {
-                            target = Some(i);
-                            break;
+                // Update the most recent running tool card inside the active thinking cell.
+                let mut updated = false;
+                if let Some(i) = self.active_think {
+                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
+                        for t in tc.tools.iter_mut().rev() {
+                            if t.status == ToolStatus::Running {
+                                t.status = if is_error {
+                                    ToolStatus::Failed
+                                } else {
+                                    ToolStatus::Success
+                                };
+                                t.output = Some(output.clone());
+                                t.expanded = is_error; // auto-expand on failure
+                                updated = true;
+                                break;
+                            }
                         }
                     }
                 }
-                if let Some(i) = target {
-                    if let Some(t) = self.cells[i].as_any_mut().downcast_mut::<ToolCallCell>() {
-                        t.status = if is_error {
-                            ToolStatus::Failed
-                        } else {
-                            ToolStatus::Success
-                        };
-                        t.output = Some(output.clone());
-                        t.expanded = is_error; // auto-expand on failure
-                    }
-                } else {
-                    self.push_cell(Box::new(ToolCallCell {
+                if !updated {
+                    let mut tc = ThinkingCell::new();
+                    tc.tools.push(ToolCallCell {
                         tool_name: name,
                         args_preview: String::new(),
                         status: if is_error {
@@ -697,15 +720,16 @@ impl App {
                         },
                         output: Some(output),
                         expanded: is_error,
-                        is_group: false,
-                    }));
+                    });
+                    self.cells.push(Box::new(tc));
+                    self.active_think = Some(self.cells.len() - 1);
                 }
                 self.dirty = true;
             }
             StreamEvent::InternalAssistIdx(idx) => {
                 if let Some(c) = self.cells.get_mut(idx as usize) {
-                    if let Some(a) = c.as_any_mut().downcast_mut::<AssistantCell>() {
-                        a.streaming = false;
+                    if let Some(tc) = c.as_any_mut().downcast_mut::<ThinkingCell>() {
+                        tc.streaming = false;
                     }
                 }
                 self.dirty = true;
@@ -746,7 +770,20 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
-            return Ok(true);
+            // Ctrl-C once: clear the input. Twice within 1s: quit.
+            let now = Instant::now();
+            let double = self
+                .last_ctrl_c
+                .map(|t| now.duration_since(t).as_secs_f32() < 1.0)
+                .unwrap_or(false);
+            if double {
+                return Ok(true);
+            }
+            self.last_ctrl_c = Some(now);
+            self.input = TextArea::default();
+            self.status = "ready".into();
+            self.dirty = true;
+            return Ok(false);
         }
         if self.slash_mode {
             return self.handle_slash_key(key);
@@ -1127,18 +1164,18 @@ impl App {
                 } else if self.status == "error" {
                     Color::Red
                 } else {
-                    Color::DarkGray
+                    Color::Rgb(150, 150, 150)
                 }),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(150, 150, 150))),
             Span::styled(
                 format!(" {}", self.provider.model),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(150, 150, 150))),
             Span::styled(
                 format!(" {}", self.provider.name),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(150, 150, 150)),
             ),
             Span::styled(queued, Style::default().fg(Color::Yellow)),
         ]);
@@ -1173,7 +1210,7 @@ impl App {
                 let style = if sel {
                     Style::default().fg(Color::Black).bg(Color::Magenta)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(Color::Rgb(190, 190, 190))
                 };
                 let line = Line::from(vec![
                     Span::styled(format!(" {:<10}", cmd.name), style),
@@ -1308,10 +1345,12 @@ pub async fn run(
         for m in &resumed {
             match m.role.as_str() {
                 "user" => app.push_cell(Box::new(UserCell { content: m.content.clone() })),
-                "assistant" => app.push_cell(Box::new(AssistantCell {
-                    content: m.content.clone(),
-                    streaming: false,
-                })),
+                "assistant" => {
+                    let mut tc = ThinkingCell::new();
+                    tc.answer = m.content.clone();
+                    tc.streaming = false;
+                    app.push_cell(Box::new(tc));
+                }
                 _ => {}
             }
         }
