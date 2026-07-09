@@ -4,6 +4,10 @@ mod llm;
 mod output;
 mod utils;
 mod store;
+mod agent;
+mod session;
+mod tools;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use config::load_config;
@@ -12,11 +16,12 @@ use llm::process_with_llm;
 use output::render_output;
 use utils::copy_to_clipboard;
 use store::{add_secret_with_tag, search_secret};
+use session::Session;
 
 #[derive(Parser)]
 #[command(name = "xa")]
-#[command(about = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs")]
-#[command(after_help = "Short aliases: as (add-secret), se (search)\nExamples: xa as mysecret \"token\", xa se \"query\", xa ls prompts")]
+#[command(about = "xa - a lightweight coding-agent CLI (like codex / claude-code)")]
+#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa chat --session <id>")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -31,6 +36,10 @@ struct Cli {
 
     /// Input text to process
     input: Option<String>,
+
+    /// Resume an interactive session by id (e.g. `xa chat --session <id>`)
+    #[arg(long = "session", global = true)]
+    session: Option<String>,
 
     /// Additional arguments for the command
     #[arg(trailing_var_arg = true)]
@@ -87,6 +96,43 @@ enum Commands {
 
     /// Interactive conversation mode
     Ask,
+
+    /// Launch the codex-like interactive coding TUI
+    Chat,
+
+    /// Configure a provider (custom endpoint + key + model) and save it
+    Login {
+        /// Provider name (prompted if omitted)
+        name: Option<String>,
+    },
+
+    /// Manage saved sessions (ls, show, rm)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List all saved sessions
+    Ls,
+    /// Show a session's conversation
+    Show {
+        /// Session id
+        id: String,
+    },
+    /// Remove a saved session
+    Rm {
+        /// Session id
+        id: String,
+    },
+    /// Resume a session in the interactive TUI
+    #[command(alias = "r")]
+    Resume {
+        /// Session id
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -167,14 +213,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
+        Some(Commands::Chat) => {
+            let provider = agent::load_active_provider().await;
+            let session = resolve_session(&cli, &provider);
+            tui::run(provider, session).await?;
+            return Ok(());
+        }
+        Some(Commands::Login { name }) => {
+            run_login(name).await?;
+            return Ok(());
+        }
+        Some(Commands::Session { action }) => {
+            handle_session(action).await?;
+            return Ok(());
+        }
         None => {
-            // No subcommand provided
+            // No subcommand provided -> launch the interactive agent TUI directly.
             if cli.input.is_some() {
                 eprintln!("Error: No command provided");
                 std::process::exit(1);
             } else {
-                // Show help
-                println!("{}", get_help_text());
+                let provider = agent::load_active_provider().await;
+                let session = resolve_session(&cli, &provider);
+                tui::run(provider, session).await?;
             }
             return Ok(());
         }
@@ -368,36 +429,116 @@ async fn start_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn get_help_text() -> String {
-    r#"xa - Execute Anything via LLM
+    r#"xa - a lightweight coding-agent CLI (like codex / claude-code)
 
 USAGE:
-    xa [OPTIONS] [COMMAND] [INPUT] [ARGS]...
+    xa [OPTIONS]                 Launch the interactive agent TUI
+    xa chat [--session <id>]    Launch the interactive agent TUI
+    xa <SUBCOMMAND> ...         Legacy prompt commands (translate, polish, ...)
 
-COMMANDS:
-    set, -s <CONFIG_TYPE>     Configure API settings (e.g., xa set openai)
-    ls, -l [TYPE]             List commands (TYPE: prompts, stores, or omit for all)
-    add, -a                   Add a new command/prompt interactively
-    rm, -r <COMMAND_NAME>     Remove a command/prompt
-    reset-defaults            Reset to default prompts
-    add-secret, -A, as        Add a secret: xa as <secret> <note>
-    search, se                Search secrets: xa se <query>
-    ask                       Interactive conversation mode
+COMMANDS (agent):
+    chat [--session <id>]       Start the interactive coding-agent TUI
+    login [name]                Configure a provider (endpoint + key + model)
+    session ls                  List saved sessions
+    session show <id>           Show a saved session's conversation
+    session rm   <id>           Delete a saved session
+
+IN-TUI SLASH COMMANDS:
+    /login [name]               Set a provider (custom endpoint + key + model)
+    /models [name|model]        Switch active provider, or set the model
+    /sessions                   List saved sessions
+    /save [title]              Save the current conversation as a session
+    /new                        Start a fresh session
+    /clear /help /exit          Clear / help / quit
 
 OPTIONS:
-    --no-stream               Disable streaming mode
-    --debug                   Enable debug mode to print filled prompt
-    -h, --help                Print help
+    --session <id>              Resume a saved session in the TUI
+    --no-stream                 Disable streaming (legacy prompt mode)
+    --debug                     Print the filled prompt (legacy prompt mode)
+    -h, --help                 Print help
 
 EXAMPLES:
-    xa set openai                         # Configure API
-    xa ls                                 # List all commands
-    xa ls prompts                         # List prompt templates
-    xa ls stores                          # List stored secrets
-    xa as mysecret "gitcode token"        # Add secret (short alias)
-    xa se "my token"                      # Search secrets (short alias)
-    xa translate "Hello"                  # Translate text
-    xa polish "draft" --no-stream         # Polish without streaming
-    xa --debug trans zh "Hello"           # Translate with debug
+    xa                                  # launch the agent TUI
+    xa chat                            # launch the agent TUI
+    xa chat --session ab12             # resume a saved session
+    xa session ls                     # list saved sessions
+    /login mygateway                  # inside TUI: point at any OpenAI-compatible endpoint
+    /models gpt-4o                   # inside TUI: switch model
 
 For more information, visit the project repository."#.to_string()
+}
+
+/// Build the session to launch the TUI with: resume an existing one if
+/// `--session <id>` was given, otherwise start a fresh session.
+fn resolve_session(cli: &Cli, provider: &agent::Provider) -> Session {
+    match &cli.session {
+        Some(id) => session::load(id).unwrap_or_else(|| Session::new(&provider.name, &provider.model)),
+        None => Session::new(&provider.name, &provider.model),
+    }
+}
+
+/// `xa login [name]` — show a provider selector (built-ins + custom), then
+/// configure the chosen one and persist it as the active provider.
+async fn run_login(_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = agent::interactive_configure(|q| {
+        print!("{q}");
+        let _ = io::stdout().flush();
+        let mut s = String::new();
+        let _ = io::stdin().read_line(&mut s);
+        s.trim().to_string()
+    })
+    .await;
+
+    let mut pc = agent::ProvidersConfig::load();
+    pc.upsert(provider.clone());
+    pc.save()?;
+    println!("logged in as provider `{}`", provider.name);
+    Ok(())
+}
+
+/// Handle the `xa session <action>` subcommand.
+async fn handle_session(action: SessionAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SessionAction::Ls => {
+            let sessions = session::list();
+            if sessions.is_empty() {
+                println!("No saved sessions.");
+                return Ok(());
+            }
+            for s in &sessions {
+                println!(
+                    "{}\t{}\tmodel:{}\tmsgs:{}",
+                    s.id,
+                    s.title,
+                    s.model,
+                    s.messages.len()
+                );
+            }
+        }
+        SessionAction::Show { id } => {
+            match session::load(&id) {
+                Some(s) => {
+                    for m in &s.messages {
+                        let who = if m.role == "user" { "You" } else { "Assistant" };
+                        println!("### {who}\n{}\n", m.content);
+                    }
+                }
+                None => {
+                    eprintln!("Session not found: {id}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        SessionAction::Rm { id } => {
+            session::remove(&id)?;
+            println!("Removed session: {id}");
+        }
+        SessionAction::Resume { id } => {
+            let session = session::load(&id)
+                .unwrap_or_else(|| Session::new("default", "gpt-4o-mini"));
+            let provider = agent::load_active_provider().await;
+            tui::run(provider, session).await?;
+        }
+    }
+    Ok(())
 }
