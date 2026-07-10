@@ -70,24 +70,27 @@ pub struct UserCell {
 impl HistoryCell for UserCell {
     fn desired_height(&self, width: u16) -> u16 {
         let w = (width.saturating_sub(4)).max(1) as usize;
-        let mut lines = 2u16; // header + blank
+        let mut lines = 0u16;
         for l in self.content.lines() {
             lines += (l.chars().count() / w.max(1) + 1) as u16;
         }
-        lines
+        lines.max(1) + 2 // one blank row of padding top and bottom
     }
     fn render(&self, area: Rect, buf: &mut Buffer, _ctx: &RenderContext) {
-        let header = Line::from(Span::styled(
-            "✦ You",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-        buf.set_line(area.left(), area.top(), &header, area.width);
-        let mut y = area.top() + 2;
+        let bg = Color::Rgb(45, 45, 52);
+        // Grey block spanning the full width to distinguish user turns.
+        buf.set_style(area, Style::default().bg(bg));
+        let mut y = area.top() + 1; // top padding row
         for l in self.content.lines() {
             if y >= area.bottom() {
                 break;
             }
-            buf.set_line(area.left() + 2, y, &Line::from(l.to_string()), area.width - 2);
+            buf.set_line(
+                area.left() + 2,
+                y,
+                &Line::from(Span::styled(l.to_string(), Style::default().bg(bg))),
+                area.width.saturating_sub(2),
+            );
             y += 1;
         }
     }
@@ -235,43 +238,56 @@ impl ThinkingCell {
         }
     }
     fn rendered_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let renderer = MarkdownRenderer::new(width.saturating_sub(4) as usize);
+        // Wrap to the exact column budget used at render time (text is drawn at
+        // a +2 left offset with a width of `width - 2`). Wrapping any narrower
+        // pushes trailing tokens (e.g. a lone "?") onto their own line.
+        let renderer = MarkdownRenderer::new(width.saturating_sub(2) as usize);
         let blocks = renderer.parse(&self.answer);
-        renderer.render(&blocks, &ThemeConfig::default())
+        let mut lines = renderer.render(&blocks, &ThemeConfig::default());
+        let is_blank = |l: &Line<'static>| {
+            l.spans.iter().all(|s| s.content.trim().is_empty())
+        };
+        while lines.first().map(&is_blank).unwrap_or(false) {
+            lines.remove(0);
+        }
+        while lines.last().map(&is_blank).unwrap_or(false) {
+            lines.pop();
+        }
+        lines
     }
 }
 
 impl HistoryCell for ThinkingCell {
     fn desired_height(&self, width: u16) -> u16 {
-        let mut h = 1u16; // phrase header
+        // The "Thinking…" phrase is a transient indicator: it only occupies a
+        // row while we're still waiting (no answer, no tools yet). Once content
+        // starts arriving it disappears and doesn't persist in the transcript.
+        let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
+        if indicator {
+            return 1;
+        }
+        let mut h = 0u16;
         for t in &self.tools {
             h += t.desired_height(width);
         }
-        let ans = self.rendered_lines(width).len() as u16;
-        h += ans;
-        if self.streaming || ans == 0 {
-            h = h.max(3);
-        } else {
-            h = h.max(2);
-        }
-        h
+        h += self.rendered_lines(width).len() as u16;
+        // One blank padding row above and below the content.
+        h + 2
     }
     fn render(&self, area: Rect, buf: &mut Buffer, ctx: &RenderContext) {
-        // Single phrase header (no per-tool "Thinking", no "Assistant" title).
-        let label = if self.streaming && self.answer.is_empty() && self.tools.is_empty() {
-            Line::from(shimmer_spans(
+        let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
+        // Transient shimmer indicator, shown only while waiting for the first
+        // token. It is not persisted once the answer or tools appear.
+        if indicator {
+            let label = Line::from(shimmer_spans(
                 &format!("{}…", self.phrase),
                 Color::White,
                 ctx.shimmer_phase,
-            ))
-        } else {
-            Line::from(Span::styled(
-                format!("{}", self.phrase),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ))
-        };
-        buf.set_line(area.left(), area.top(), &label, area.width);
-        let mut y: i32 = area.top() as i32 + 1;
+            ));
+            buf.set_line(area.left(), area.top(), &label, area.width);
+            return;
+        }
+        let mut y: i32 = area.top() as i32 + 1; // top padding row
         let bottom = area.bottom() as i32;
         for t in &self.tools {
             let th = t.desired_height(area.width) as i32;

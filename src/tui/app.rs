@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
 };
 use tui_textarea::{Input, Key, TextArea};
@@ -367,11 +367,20 @@ impl App {
         }
     }
 
+    fn input_is_empty(&self) -> bool {
+        self.input.lines().iter().all(|l| l.is_empty())
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
-            // Ctrl-C once: clear the input. Twice within 1s: quit.
+            // If the composer is empty, Ctrl-C quits immediately. Otherwise the
+            // first press clears the input and a second within 1s quits.
+            let has_text = self.input.lines().iter().any(|l| !l.trim().is_empty());
+            if !has_text {
+                return Ok(true);
+            }
             let now = Instant::now();
             let double = self
                 .last_ctrl_c
@@ -382,7 +391,7 @@ impl App {
             }
             self.last_ctrl_c = Some(now);
             self.input = TextArea::default();
-            self.status = "ready".into();
+            self.status = "press Ctrl-C again to exit".into();
             self.dirty = true;
             return Ok(false);
         }
@@ -397,6 +406,15 @@ impl App {
             }
             KeyCode::PageDown => {
                 self.scroll = self.scroll.saturating_add(5);
+                self.dirty = true;
+            }
+            KeyCode::Up if self.input_is_empty() => {
+                self.auto_scroll = false;
+                self.scroll = self.scroll.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down if self.input_is_empty() => {
+                self.scroll = self.scroll.saturating_add(1);
                 self.dirty = true;
             }
             KeyCode::Up if self.input.lines().len() <= 1 => self.recall_history(-1),
@@ -750,7 +768,8 @@ impl App {
         self.dirty = false;
         let area = f.area();
         let input_lines = self.input.lines().len().max(1) as u16;
-        let input_h = (input_lines + 2).clamp(3, 12);
+        // One blank padding row above and below the text; grows with content.
+        let input_h = (input_lines + 2).clamp(3, 14);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -803,7 +822,7 @@ impl App {
                 if bottom > top {
                     let cell_area = Rect {
                         x: transcript.left(),
-                        y: top,
+                        y: transcript.top() + top,
                         width: transcript.width,
                         height: bottom - top,
                     };
@@ -816,11 +835,19 @@ impl App {
             }
         }
 
-        // Input composer: borderless, pure grey background (DESIGN §4).
+        // Input composer: borderless, pure grey background (DESIGN §4), with a
+        // one-row pad top/bottom and left/right so the text sits vertically
+        // centred inside the grey block.
         let input_block = Block::default()
             .borders(Borders::NONE)
+            .padding(Padding::new(1, 1, 1, 1))
             .style(Style::default().bg(Color::Rgb(40, 40, 46)));
         self.input.set_block(input_block);
+        // Visible block cursor.
+        self.input
+            .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        self.input
+            .set_cursor_line_style(Style::default().bg(Color::Rgb(40, 40, 46)));
         // Placeholder hint when empty and not streaming.
         if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) && !self.streaming {
             self.input
