@@ -311,6 +311,49 @@ impl Tool for GrepTool {
     }
 }
 
+/// Produce a colorful-free unified `git diff` for `path` so the TUI can render
+/// exactly what an `edit`/`write` tool changed.
+///
+/// - Inside a git work tree we use `git diff` (working tree vs index) so edits
+///   to tracked files show context.
+/// - New / untracked files fall back to `git diff --no-index /dev/null <path>`
+///   so additions still render as a diff.
+///
+/// Returns `None` when there is nothing to show (e.g. not under git, or the
+/// file is unchanged).
+pub fn git_diff_of(path: &str) -> Option<String> {
+    let in_repo = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let run = |args: &[&str]| -> Option<String> {
+        Command::new("git")
+            .args(["-c", "core.pager=cat"])
+            .args(args)
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).to_string();
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+    };
+
+    if in_repo {
+        if let Some(d) = run(&["diff", "--no-color", "--", path]) {
+            return Some(d);
+        }
+    }
+    // Untracked / new file: diff against the empty file.
+    let devnull = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    run(&["diff", "--no-color", "--no-index", "--", devnull, path])
+}
+
 /// All built-in tools.
 pub fn all_tools() -> Vec<Arc<dyn Tool>> {
     vec![

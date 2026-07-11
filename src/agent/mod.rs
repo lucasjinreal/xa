@@ -131,7 +131,13 @@ pub enum StreamEvent {
     /// A tool call is about to be executed (for rendering in the TUI).
     ToolCall { name: String, arguments: String },
     /// A tool call finished (for rendering in the TUI).
-    ToolResult { name: String, output: String, is_error: bool },
+    ToolResult {
+        name: String,
+        output: String,
+        is_error: bool,
+        /// A colorful-free unified `git diff` when the tool edited/added a file.
+        diff: Option<String>,
+    },
     Done,
     Error(String),
     /// Internal: marks the assistant cell at `0` as no longer streaming.
@@ -398,15 +404,27 @@ pub async fn run_conversation(
                         .await;
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let (output, is_error) = match crate::tools::call_tool(&tc.name, args, tools).await {
                         Ok(o) => (o, false),
                         Err(e) => (e, true),
+                    };
+                    // For file-mutating tools, capture a diff so the user sees
+                    // exactly what changed.
+                    let diff = if (tc.name == "edit" || tc.name == "write") && !is_error {
+                        path.as_deref().and_then(crate::tools::git_diff_of)
+                    } else {
+                        None
                     };
                     let _ = tx
                         .send(StreamEvent::ToolResult {
                             name: tc.name.clone(),
                             output: output.clone(),
                             is_error,
+                            diff,
                         })
                         .await;
                     history.lock().unwrap().push(ChatMessage {

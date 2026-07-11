@@ -161,10 +161,11 @@ impl App {
                     content: u.content.clone(),
                 });
             } else if let Some(tc) = c.as_any().downcast_ref::<ThinkingCell>() {
-                if !tc.answer.trim().is_empty() {
+                let answer = tc.answer_text();
+                if !answer.trim().is_empty() {
                     msgs.push(session::StoredMessage {
                         role: "assistant".into(),
-                        content: tc.answer.clone(),
+                        content: answer,
                     });
                 }
             }
@@ -230,12 +231,12 @@ impl App {
                 // Append to the active thinking cell's answer.
                 if let Some(i) = self.active_think {
                     if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
-                        tc.answer.push_str(&s);
+                        tc.add_text(&s);
                         tc.streaming = true;
                     }
                 } else {
                     let mut tc = ThinkingCell::new();
-                    tc.answer.push_str(&s);
+                    tc.add_text(&s);
                     tc.streaming = true;
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
@@ -273,7 +274,7 @@ impl App {
                     i
                 };
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
-                    tc.answer.push_str(&format!("\n\n**error:** {e}"));
+                    tc.add_text(&format!("\n\n**error:** {e}"));
                     tc.streaming = false;
                 }
                 self.active_think = None;
@@ -291,13 +292,7 @@ impl App {
                     i
                 };
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
-                    tc.tools.push(ToolCallCell {
-                        tool_name: name.clone(),
-                        args_preview: preview,
-                        status: ToolStatus::Running,
-                        output: None,
-                        expanded: false,
-                    });
+                    tc.add_tool(&name, &preview);
                 }
                 self.dirty = true;
             }
@@ -305,39 +300,21 @@ impl App {
                 name,
                 output,
                 is_error,
+                diff,
             } => {
-                // Update the most recent running tool card inside the active thinking cell.
+                // Update the most recent running tool card inside the active
+                // thinking cell.
                 let mut updated = false;
                 if let Some(i) = self.active_think {
                     if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
-                        for t in tc.tools.iter_mut().rev() {
-                            if t.status == ToolStatus::Running {
-                                t.status = if is_error {
-                                    ToolStatus::Failed
-                                } else {
-                                    ToolStatus::Success
-                                };
-                                t.output = Some(output.clone());
-                                t.expanded = is_error; // auto-expand on failure
-                                updated = true;
-                                break;
-                            }
-                        }
+                        tc.finish_tool(Some(output.clone()), is_error, diff.clone());
+                        updated = true;
                     }
                 }
                 if !updated {
                     let mut tc = ThinkingCell::new();
-                    tc.tools.push(ToolCallCell {
-                        tool_name: name,
-                        args_preview: String::new(),
-                        status: if is_error {
-                            ToolStatus::Failed
-                        } else {
-                            ToolStatus::Success
-                        },
-                        output: Some(output),
-                        expanded: is_error,
-                    });
+                    tc.add_tool(&name, "");
+                    tc.finish_tool(Some(output), is_error, diff);
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
                 }
@@ -1256,7 +1233,7 @@ pub async fn run(
                 "user" => app.push_cell(Box::new(UserCell { content: m.content.clone() })),
                 "assistant" => {
                     let mut tc = ThinkingCell::new();
-                    tc.answer = m.content.clone();
+                    tc.add_text(&m.content);
                     tc.streaming = false;
                     app.push_cell(Box::new(tc));
                 }

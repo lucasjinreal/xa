@@ -73,6 +73,25 @@ fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
 
+/// Color a single unified-diff line (no terminal color codes — we add our own).
+/// `+` additions green, `-` deletions red, hunk/`diff` metadata dimmed.
+fn diff_line_style(line: &str) -> Style {
+    let s = match line.chars().next() {
+        Some('+') if !line.starts_with("+++") => {
+            Style::default().fg(Color::Rgb(90, 210, 130))
+        }
+        Some('-') if !line.starts_with("---") => {
+            Style::default().fg(Color::Rgb(225, 110, 110))
+        }
+        Some('@') => Style::default().fg(Color::Rgb(120, 170, 255)),
+        Some('d') if line.starts_with("diff ") => {
+            Style::default().fg(Color::Rgb(150, 150, 170))
+        }
+        _ => Style::default().fg(Color::Rgb(150, 150, 150)),
+    };
+    s
+}
+
 /// One self-contained transcript entry.
 pub trait HistoryCell {
     /// Height in rows this cell needs at `width`.
@@ -202,6 +221,8 @@ pub struct ToolCallCell {
     pub args_preview: String,
     pub status: ToolStatus,
     pub output: Option<String>,
+    /// A unified `git diff` (no color codes) for file-mutating tools.
+    pub diff: Option<String>,
     pub expanded: bool,
 }
 
@@ -224,7 +245,7 @@ impl ToolCallCell {
             }
             _ => spans.push(Span::styled(summary, Style::default().fg(color))),
         }
-        let toggle = if self.output.is_some() {
+        let toggle = if self.output.is_some() || self.diff.is_some() {
             if self.expanded {
                 "  ▾"
             } else {
@@ -249,32 +270,61 @@ impl ToolCallCell {
             line: self.header_line(ctx),
         }];
         if self.expanded {
-            let out = self.output.as_deref().unwrap_or("");
-            let shown: String = if out.lines().count() > 20 {
-                out.lines().take(20).collect::<Vec<_>>().join("\n") + "\n…(truncated)"
-            } else {
-                out.to_string()
-            };
-            let color = if self.status == ToolStatus::Failed {
-                Color::Rgb(220, 120, 120)
-            } else {
-                Color::Rgb(150, 150, 150)
-            };
             let x = 4u16;
             let w = width.saturating_sub(4);
-            for l in shown.lines() {
-                rows.push(Row {
-                    x,
-                    w,
-                    line: Line::from(Span::styled(l.to_string(), Style::default().fg(color))),
-                });
+            // Prefer a colorful git diff for file-mutating tools; it shows the
+            // user exactly what changed (DESIGN.md: "each edit/add prints git
+            // diff colorful").
+            if let Some(diff) = self.diff.as_deref() {
+                let limit = 60;
+                let all: Vec<&str> = diff.lines().collect();
+                let (lines, truncated) = if all.len() > limit {
+                    (all[..limit].to_vec(), true)
+                } else {
+                    (all, false)
+                };
+                for l in lines {
+                    rows.push(Row {
+                        x,
+                        w,
+                        line: Line::from(Span::styled(l.to_string(), diff_line_style(l))),
+                    });
+                }
+                if truncated {
+                    rows.push(Row {
+                        x,
+                        w,
+                        line: Line::from(Span::styled(
+                            "…(truncated)".to_string(),
+                            Style::default().fg(Color::Rgb(150, 150, 150)),
+                        )),
+                    });
+                }
+            } else if let Some(out) = self.output.as_deref() {
+                let shown: String = if out.lines().count() > 20 {
+                    out.lines().take(20).collect::<Vec<_>>().join("\n") + "\n…(truncated)"
+                } else {
+                    out.to_string()
+                };
+                let color = if self.status == ToolStatus::Failed {
+                    Color::Rgb(220, 120, 120)
+                } else {
+                    Color::Rgb(150, 150, 150)
+                };
+                for l in shown.lines() {
+                    rows.push(Row {
+                        x,
+                        w,
+                        line: Line::from(Span::styled(l.to_string(), Style::default().fg(color))),
+                    });
+                }
             }
         }
         rows
     }
 }
 
-// ---- Thinking (one block: phrase header + tool calls + answer) ------------
+// ---- Thinking (interleaved: assistant text + tool-call cards) -------------
 
 const THINK_PHRASES: &[&str] = &[
     "Thinking",
@@ -285,10 +335,26 @@ const THINK_PHRASES: &[&str] = &[
     "Figuring it out",
 ];
 
+/// One ordered entry in a thinking block. Interleaving mirrors the real model
+/// turn — text, then a tool call, then more text, then another tool call — so
+/// the transcript reads naturally instead of putting every tool at the top.
+pub enum ThinkBlock {
+    Text(String),
+    Tool(ToolCallCell),
+}
+
+impl ThinkBlock {
+    fn as_tool_mut(&mut self) -> Option<&mut ToolCallCell> {
+        match self {
+            ThinkBlock::Tool(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 pub struct ThinkingCell {
     pub phrase: String,
-    pub tools: Vec<ToolCallCell>,
-    pub answer: String,
+    pub blocks: Vec<ThinkBlock>,
     pub streaming: bool,
 }
 
@@ -299,35 +365,69 @@ impl ThinkingCell {
         let phrase = THINK_PHRASES[n % THINK_PHRASES.len()].to_string();
         ThinkingCell {
             phrase,
-            tools: Vec::new(),
-            answer: String::new(),
+            blocks: Vec::new(),
             streaming: true,
         }
     }
-    fn rendered_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // Wrap to the exact column budget used at render time (text is drawn at
-        // a +2 left offset with a width of `width - 2`). Wrapping any narrower
-        // pushes trailing tokens (e.g. a lone "?") onto their own line.
-        let renderer = MarkdownRenderer::new(width.saturating_sub(2) as usize);
-        let blocks = renderer.parse(&self.answer);
-        let mut lines = renderer.render(&blocks, &ThemeConfig::default());
-        let is_blank = |l: &Line<'static>| {
-            l.spans.iter().all(|s| s.content.trim().is_empty())
-        };
-        while lines.first().map(&is_blank).unwrap_or(false) {
-            lines.remove(0);
+
+    /// Append streamed text, merging into the previous text block when the
+    /// model is still emitting the same paragraph.
+    pub fn add_text(&mut self, s: &str) {
+        if let Some(ThinkBlock::Text(last)) = self.blocks.last_mut() {
+            last.push_str(s);
+        } else {
+            self.blocks.push(ThinkBlock::Text(s.to_string()));
         }
-        while lines.last().map(&is_blank).unwrap_or(false) {
-            lines.pop();
+    }
+
+    /// Add a freshly-started tool-call card.
+    pub fn add_tool(&mut self, name: &str, preview: &str) {
+        self.blocks.push(ThinkBlock::Tool(ToolCallCell {
+            tool_name: name.to_string(),
+            args_preview: preview.to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            diff: None,
+            expanded: false,
+        }));
+    }
+
+    /// Mark the most recent still-running tool card as finished.
+    pub fn finish_tool(&mut self, output: Option<String>, is_error: bool, diff: Option<String>) {
+        for b in self.blocks.iter_mut().rev() {
+            if let Some(t) = b.as_tool_mut() {
+                if t.status == ToolStatus::Running {
+                    t.status = if is_error {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Success
+                    };
+                    t.output = output;
+                    t.diff = diff;
+                    // Auto-expand on failure, or whenever we have a diff to show.
+                    t.expanded = is_error || t.diff.is_some();
+                    return;
+                }
+            }
         }
-        lines
+    }
+
+    /// Concatenated assistant text (for session persistence).
+    pub fn answer_text(&self) -> String {
+        let mut s = String::new();
+        for b in &self.blocks {
+            if let ThinkBlock::Text(t) = b {
+                s.push_str(t);
+            }
+        }
+        s
     }
 
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
         // The "Thinking…" phrase is a transient indicator: it only occupies a
-        // row while we're still waiting (no answer, no tools yet). Once content
-        // starts arriving it disappears and doesn't persist in the transcript.
-        let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
+        // row while we're still waiting (no content yet). Once anything arrives
+        // it disappears and doesn't persist in the transcript.
+        let indicator = self.streaming && self.blocks.is_empty();
         if indicator {
             let line = match ctx {
                 Some(c) => Line::from(shimmer_spans(
@@ -348,24 +448,40 @@ impl ThinkingCell {
         }
 
         let mut rows = vec![Row::blank(width)]; // top padding
-        for t in &self.tools {
-            rows.extend(t.build(width, ctx));
+        for b in &self.blocks {
+            match b {
+                ThinkBlock::Tool(t) => rows.extend(t.build(width, ctx)),
+                ThinkBlock::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // Render this text block, but only its non-blank content.
+                    let renderer = MarkdownRenderer::new(width.saturating_sub(2) as usize);
+                    let blocks = renderer.parse(text);
+                    let lines = renderer.render(&blocks, &ThemeConfig::default());
+                    let is_blank = |l: &Line<'static>| {
+                        l.spans.iter().all(|s| s.content.trim().is_empty())
+                    };
+                    for line in lines.into_iter().filter(|l| !is_blank(l)) {
+                        rows.push(Row {
+                            x: 2,
+                            w: width.saturating_sub(2),
+                            line,
+                        });
+                    }
+                }
+            }
         }
-        // Answer rendered directly, no title.
-        if !self.answer.is_empty() {
-            for line in self.rendered_lines(width) {
+        // Cursor while still streaming and no trailing tool card is open.
+        if self.streaming {
+            let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)));
+            if !tail_is_tool {
                 rows.push(Row {
                     x: 2,
                     w: width.saturating_sub(2),
-                    line,
+                    line: Line::from(Span::styled("▍", Style::default().fg(Color::White))),
                 });
             }
-        } else if self.streaming {
-            rows.push(Row {
-                x: 2,
-                w: width.saturating_sub(2),
-                line: Line::from(Span::styled("▍", Style::default().fg(Color::White))),
-            });
         }
         rows.push(Row::blank(width)); // bottom padding
         rows
