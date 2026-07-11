@@ -493,7 +493,6 @@ impl App {
 
         let mut ta = TextArea::new(display);
         ta.move_cursor(CursorMove::Jump(target_row as u16, target_col as u16));
-        ta.move_cursor(CursorMove::InViewport);
         ta
     }
 
@@ -1009,21 +1008,20 @@ impl App {
 
         // Input composer: borderless, pure grey background (DESIGN §4), with a
         // one-row pad top/bottom and left/right so the text sits vertically
-        // centred inside the grey block.
+        // centred inside the grey block. All styling is applied to the
+        // soft-wrapped *display* copy so it matches the editable buffer.
         let input_block = Block::default()
             .borders(Borders::NONE)
             .padding(Padding::new(1, 1, 1, 1))
             .style(Style::default().bg(Color::Rgb(40, 40, 46)));
-        self.input.set_block(input_block);
+        let mut wrapped = wrapped;
+        wrapped.set_block(input_block);
         // Visible block cursor.
-        self.input
-            .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-        self.input
-            .set_cursor_line_style(Style::default().bg(Color::Rgb(40, 40, 46)));
+        wrapped.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        wrapped.set_cursor_line_style(Style::default().bg(Color::Rgb(40, 40, 46)));
         // Placeholder hint when empty and not streaming.
         if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) && !self.streaming {
-            self.input
-                .set_placeholder_text("Type a message, or / for commands…");
+            wrapped.set_placeholder_text("Type a message, or / for commands…");
         }
         // Render the soft-wrapped copy (already built above) so long input
         // grows vertically instead of overflowing; the editable buffer itself

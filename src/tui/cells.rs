@@ -8,7 +8,41 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 use ratatui_markdown::{markdown::MarkdownRenderer, theme::ThemeConfig};
+
+/// Soft-wrap `text` to `max_w` display columns, preserving every character
+/// (wrapping only inserts line breaks). Wide/CJK glyphs count as 2 columns.
+fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
+    let max_w = max_w.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for logical in text.lines() {
+        let chars: Vec<char> = logical.chars().collect();
+        if chars.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut i = 0;
+        while i < chars.len() {
+            let mut col = 0usize;
+            let mut j = i;
+            while j < chars.len() {
+                let w = UnicodeWidthStr::width(chars[j].encode_utf8(&mut [0; 4]));
+                if col + w > max_w && j > i {
+                    break;
+                }
+                col += w;
+                j += 1;
+            }
+            if j == i {
+                j = i + 1; // a single glyph wider than the box
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+        }
+    }
+    out
+}
 
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
@@ -70,26 +104,26 @@ pub struct UserCell {
 impl HistoryCell for UserCell {
     fn desired_height(&self, width: u16) -> u16 {
         let w = (width.saturating_sub(4)).max(1) as usize;
-        let mut lines = 0u16;
-        for l in self.content.lines() {
-            lines += (l.chars().count() / w.max(1) + 1) as u16;
-        }
-        lines.max(1) + 2 // one blank row of padding top and bottom
+        let wrapped = wrap_text(&self.content, w);
+        wrapped.len().max(1) as u16 + 2 // one blank row of padding top and bottom
     }
     fn render(&self, area: Rect, buf: &mut Buffer, _ctx: &RenderContext) {
         let bg = Color::Rgb(45, 45, 52);
         // Grey block spanning the full width to distinguish user turns.
         buf.set_style(area, Style::default().bg(bg));
+        let avail = area.width.saturating_sub(4) as usize;
+        let x = area.left() + 2;
+        let wrapped = wrap_text(&self.content, avail);
         let mut y = area.top() + 1; // top padding row
-        for l in self.content.lines() {
+        for l in wrapped {
             if y >= area.bottom() {
                 break;
             }
             buf.set_line(
-                area.left() + 2,
+                x,
                 y,
-                &Line::from(Span::styled(l.to_string(), Style::default().bg(bg))),
-                area.width.saturating_sub(2),
+                &Line::from(Span::styled(l, Style::default().bg(bg))),
+                avail as u16,
             );
             y += 1;
         }
