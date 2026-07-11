@@ -974,13 +974,20 @@ impl App {
         let total = total_cells;
         let view_h = transcript.height;
         let max_scroll = total.saturating_sub(view_h);
+        // One blank row of breathing room between the last line (thinking
+        // indicator, streaming output, …) and the input composer, so content
+        // never butts right up against the input bar at the bottom (DESIGN §4).
+        const BOTTOM_PAD: u16 = 1;
+        // When the transcript actually scrolls, allow scrolling one extra row
+        // past the end so that blank row is always reserved at the bottom.
+        let pad = if max_scroll > 0 { BOTTOM_PAD } else { 0 };
         // Auto-scroll keeps the newest content pinned to the bottom, so the
         // streaming output stays visible as it grows. Any manual scroll turns
         // it off (below) and we then respect the explicit offset.
         let scroll = if self.auto_scroll {
-            max_scroll
+            max_scroll + pad
         } else {
-            self.scroll.min(max_scroll)
+            self.scroll.min(max_scroll + pad)
         };
         self.scroll = scroll; // reconcile
 
@@ -997,7 +1004,15 @@ impl App {
                         width: transcript.width,
                         height: bottom - top,
                     };
-                    c.render(cell_area, f.buffer_mut(), &ctx);
+                    // How many of this cell's own leading rows sit above the
+                    // viewport. Passing `skip` keeps scrolling unified: the
+                    // visible slice continues seamlessly from the cell above
+                    // instead of each cell restarting at its own first row.
+                    let skip = (-y).max(0) as u16;
+                    if let Some(bg) = c.bg() {
+                        f.buffer_mut().set_style(cell_area, Style::default().bg(bg));
+                    }
+                    c.render(cell_area, skip, f.buffer_mut(), &ctx);
                 }
             }
             y += h;

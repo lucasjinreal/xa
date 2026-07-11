@@ -3,6 +3,13 @@
 //! One self-contained transcript entry. Each cell knows its own height at a
 //! given width and how to render itself into a clipped rectangle, following the
 //! DESIGN.md "HistoryCell" pattern rather than one giant scrollable paragraph.
+//!
+//! Scrolling is *unified*: the transcript is one continuous column of rows and
+//! every cell is flattened into a list of rows. When the viewport is scrolled
+//! into the middle of a cell, `render` receives a `skip` count telling it how
+//! many of that cell's own leading rows are above the viewport, so the visible
+//! slice continues seamlessly from the cell above instead of restarting at the
+//! cell's first row.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -10,6 +17,25 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 use ratatui_markdown::{markdown::MarkdownRenderer, theme::ThemeConfig};
+
+/// A single drawable row inside a cell. `x`/`w` are offsets relative to the
+/// cell's left edge (which is always the transcript's left edge), so the same
+/// row can be drawn no matter where the cell is positioned in the viewport.
+pub struct Row {
+    pub x: u16,
+    pub w: u16,
+    pub line: Line<'static>,
+}
+
+impl Row {
+    fn blank(width: u16) -> Self {
+        Row {
+            x: 0,
+            w: width,
+            line: Line::default(),
+        }
+    }
+}
 
 /// Soft-wrap `text` to `max_w` display columns, preserving every character
 /// (wrapping only inserts line breaks). Wide/CJK glyphs count as 2 columns.
@@ -51,12 +77,32 @@ use crate::tui::shimmer::shimmer_spans;
 pub trait HistoryCell {
     /// Height in rows this cell needs at `width`.
     fn desired_height(&self, width: u16) -> u16;
-    /// Render into `area` (caller guarantees height >= desired_height).
-    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &RenderContext);
+    /// Render into `area` (the visible slice of this cell). `skip` is the
+    /// number of this cell's own leading rows that are above the viewport and
+    /// therefore must not be drawn — they belong to the scroll, not the cell.
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext);
     /// For downcasting concrete cell types (needed for in-place mutation).
     fn as_any(&self) -> &dyn std::any::Any;
     /// Mutable downcast accessor.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    /// Optional full-width background fill for the cell's visible slice.
+    fn bg(&self) -> Option<Color> {
+        None
+    }
+}
+
+/// Draw a flat list of rows into `area`, honouring `skip` and clipping to the
+/// bottom of the area. Shared by every cell so unified scrolling behaves
+/// identically everywhere.
+fn paint_rows(rows: &[Row], area: Rect, skip: u16, buf: &mut Buffer) {
+    let mut y = area.top();
+    for row in rows.iter().skip(skip as usize) {
+        if y >= area.bottom() {
+            break;
+        }
+        buf.set_line(area.left() + row.x, y, &row.line, row.w);
+        y += 1;
+    }
 }
 
 // ---- System / Note cell ----------------------------------------------------
@@ -65,27 +111,31 @@ pub struct SystemCell {
     pub content: String,
 }
 
-impl HistoryCell for SystemCell {
-    fn desired_height(&self, width: u16) -> u16 {
-        let w = (width.saturating_sub(4)).max(1) as usize;
-        let mut lines = 1u16;
-        for l in self.content.lines() {
-            lines += (l.chars().count() / w.max(1) + 1) as u16;
-        }
-        lines + 1
-    }
-    fn render(&self, area: Rect, buf: &mut Buffer, _ctx: &RenderContext) {
-        let renderer = MarkdownRenderer::new(area.width as usize);
+impl SystemCell {
+    fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
+        let renderer = MarkdownRenderer::new(width as usize);
         let blocks = renderer.parse(&self.content);
         let styled = renderer.render(&blocks, &ThemeConfig::default());
-        let mut y = area.top();
-        for line in styled {
-            if y >= area.bottom() {
-                break;
-            }
-            buf.set_line(area.left(), y, &line, area.width);
-            y += 1;
-        }
+        let mut rows: Vec<Row> = styled
+            .into_iter()
+            .map(|line| Row {
+                x: 0,
+                w: width,
+                line,
+            })
+            .collect();
+        rows.push(Row::blank(width)); // trailing separator
+        rows
+    }
+}
+
+impl HistoryCell for SystemCell {
+    fn desired_height(&self, width: u16) -> u16 {
+        self.build(width, None).len() as u16
+    }
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
+        let rows = self.build(area.width, Some(ctx));
+        paint_rows(&rows, area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -101,38 +151,40 @@ pub struct UserCell {
     pub content: String,
 }
 
+impl UserCell {
+    fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
+        let avail = (width.saturating_sub(4)).max(1);
+        let x = 2u16;
+        let wrapped = wrap_text(&self.content, avail as usize);
+        let mut rows = vec![Row::blank(width)]; // top padding
+        for l in wrapped {
+            rows.push(Row {
+                x,
+                w: avail,
+                line: Line::from(l),
+            });
+        }
+        rows.push(Row::blank(width)); // bottom padding
+        rows
+    }
+}
+
 impl HistoryCell for UserCell {
     fn desired_height(&self, width: u16) -> u16 {
-        let w = (width.saturating_sub(4)).max(1) as usize;
-        let wrapped = wrap_text(&self.content, w);
-        wrapped.len().max(1) as u16 + 2 // one blank row of padding top and bottom
+        self.build(width, None).len() as u16
     }
-    fn render(&self, area: Rect, buf: &mut Buffer, _ctx: &RenderContext) {
-        let bg = Color::Rgb(45, 45, 52);
-        // Grey block spanning the full width to distinguish user turns.
-        buf.set_style(area, Style::default().bg(bg));
-        let avail = area.width.saturating_sub(4) as usize;
-        let x = area.left() + 2;
-        let wrapped = wrap_text(&self.content, avail);
-        let mut y = area.top() + 1; // top padding row
-        for l in wrapped {
-            if y >= area.bottom() {
-                break;
-            }
-            buf.set_line(
-                x,
-                y,
-                &Line::from(Span::styled(l, Style::default().bg(bg))),
-                avail as u16,
-            );
-            y += 1;
-        }
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
+        let rows = self.build(area.width, Some(ctx));
+        paint_rows(&rows, area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+    fn bg(&self) -> Option<Color> {
+        Some(Color::Rgb(45, 45, 52))
     }
 }
 
@@ -154,7 +206,7 @@ pub struct ToolCallCell {
 }
 
 impl ToolCallCell {
-    pub fn header_line(&self, ctx: &RenderContext) -> Line<'static> {
+    pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
             ToolStatus::Running => ("▸", Color::Cyan),
             ToolStatus::Success => ("✓", Color::Green),
@@ -165,14 +217,12 @@ impl ToolCallCell {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )];
         let summary = format!("{}  {}", self.tool_name, self.args_preview);
-        if self.status == ToolStatus::Running {
-            let mut s = shimmer_spans(&summary, color, ctx.shimmer_phase);
-            spans.append(&mut s);
-        } else {
-            spans.push(Span::styled(
-                summary,
-                Style::default().fg(color),
-            ));
+        match ctx {
+            Some(c) if self.status == ToolStatus::Running => {
+                let mut s = shimmer_spans(&summary, color, c.shimmer_phase);
+                spans.append(&mut s);
+            }
+            _ => spans.push(Span::styled(summary, Style::default().fg(color))),
         }
         let toggle = if self.output.is_some() {
             if self.expanded {
@@ -191,21 +241,13 @@ impl ToolCallCell {
         }
         Line::from(spans)
     }
-}
 
-impl HistoryCell for ToolCallCell {
-    fn desired_height(&self, _width: u16) -> u16 {
-        1 + if self.expanded {
-            let out = self.output.as_deref().unwrap_or("");
-            let capped = out.len();
-            let rows = capped / 200 + out.lines().count().min(20) as usize + 1;
-            rows as u16
-        } else {
-            0
-        }
-    }
-    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &RenderContext) {
-        buf.set_line(area.left(), area.top(), &self.header_line(ctx), area.width);
+    fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
+        let mut rows = vec![Row {
+            x: 0,
+            w: width,
+            line: self.header_line(ctx),
+        }];
         if self.expanded {
             let out = self.output.as_deref().unwrap_or("");
             let shown: String = if out.lines().count() > 20 {
@@ -213,31 +255,22 @@ impl HistoryCell for ToolCallCell {
             } else {
                 out.to_string()
             };
-            let mut y = area.top() + 1;
+            let color = if self.status == ToolStatus::Failed {
+                Color::Rgb(220, 120, 120)
+            } else {
+                Color::Rgb(150, 150, 150)
+            };
+            let x = 4u16;
+            let w = width.saturating_sub(4);
             for l in shown.lines() {
-                if y >= area.bottom() {
-                    break;
-                }
-                let color = if self.status == ToolStatus::Failed {
-                    Color::Rgb(220, 120, 120)
-                } else {
-                    Color::Rgb(150, 150, 150)
-                };
-                buf.set_line(
-                    area.left() + 4,
-                    y,
-                    &Line::from(Span::styled(l.to_string(), Style::default().fg(color))),
-                    area.width - 4,
-                );
-                y += 1;
+                rows.push(Row {
+                    x,
+                    w,
+                    line: Line::from(Span::styled(l.to_string(), Style::default().fg(color))),
+                });
             }
         }
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+        rows
     }
 }
 
@@ -289,74 +322,63 @@ impl ThinkingCell {
         }
         lines
     }
-}
 
-impl HistoryCell for ThinkingCell {
-    fn desired_height(&self, width: u16) -> u16 {
+    fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
         // The "Thinking…" phrase is a transient indicator: it only occupies a
         // row while we're still waiting (no answer, no tools yet). Once content
         // starts arriving it disappears and doesn't persist in the transcript.
         let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
         if indicator {
-            // One blank padding row (matching text) + the shimmer line.
-            return 2;
+            let line = match ctx {
+                Some(c) => Line::from(shimmer_spans(
+                    &format!("{}…", self.phrase),
+                    Color::Rgb(150, 150, 160),
+                    c.shimmer_phase,
+                )),
+                None => Line::from(self.phrase.clone() + "…"),
+            };
+            return vec![
+                Row::blank(width),
+                Row {
+                    x: 2,
+                    w: width.saturating_sub(2),
+                    line,
+                },
+            ];
         }
-        let mut h = 0u16;
+
+        let mut rows = vec![Row::blank(width)]; // top padding
         for t in &self.tools {
-            h += t.desired_height(width);
-        }
-        h += self.rendered_lines(width).len() as u16;
-        // One blank padding row above and below the content.
-        h + 2
-    }
-    fn render(&self, area: Rect, buf: &mut Buffer, ctx: &RenderContext) {
-        let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
-        // Transient shimmer indicator, shown only while waiting for the first
-        // token. It is not persisted once the answer or tools appear.
-        if indicator {
-            // Same left offset and top padding as the rendered answer text.
-            let label = Line::from(shimmer_spans(
-                &format!("{}…", self.phrase),
-                Color::Rgb(150, 150, 160),
-                ctx.shimmer_phase,
-            ));
-            buf.set_line(area.left() + 2, area.top() + 1, &label, area.width - 2);
-            return;
-        }
-        let mut y: i32 = area.top() as i32 + 1; // top padding row
-        let bottom = area.bottom() as i32;
-        for t in &self.tools {
-            let th = t.desired_height(area.width) as i32;
-            if y < bottom {
-                let vis = (bottom - y).min(th).max(1) as u16;
-                let cell_area = Rect {
-                    x: area.left() + 2,
-                    y: y as u16,
-                    width: area.width.saturating_sub(2),
-                    height: vis,
-                };
-                t.render(cell_area, buf, ctx);
-            }
-            y += th;
+            rows.extend(t.build(width, ctx));
         }
         // Answer rendered directly, no title.
         if !self.answer.is_empty() {
-            let lines = self.rendered_lines(area.width);
-            for line in lines {
-                if y >= bottom {
-                    break;
-                }
-                buf.set_line(area.left() + 2, y as u16, &line, area.width - 2);
-                y += 1;
+            for line in self.rendered_lines(width) {
+                rows.push(Row {
+                    x: 2,
+                    w: width.saturating_sub(2),
+                    line,
+                });
             }
-        } else if self.streaming && y < bottom {
-            buf.set_line(
-                area.left() + 2,
-                y as u16,
-                &Line::from(Span::styled("▍", Style::default().fg(Color::White))),
-                area.width - 2,
-            );
+        } else if self.streaming {
+            rows.push(Row {
+                x: 2,
+                w: width.saturating_sub(2),
+                line: Line::from(Span::styled("▍", Style::default().fg(Color::White))),
+            });
         }
+        rows.push(Row::blank(width)); // bottom padding
+        rows
+    }
+}
+
+impl HistoryCell for ThinkingCell {
+    fn desired_height(&self, width: u16) -> u16 {
+        self.build(width, None).len() as u16
+    }
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
+        let rows = self.build(area.width, Some(ctx));
+        paint_rows(&rows, area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
