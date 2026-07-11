@@ -1,6 +1,5 @@
 //! The interactive TUI application state and event loop logic.
 
-#[allow(unused_imports)]
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +18,9 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
 };
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::{CursorMove, Input, Key, TextArea};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthChar;
 
 use crate::agent::{self, Provider, StreamEvent};
 use crate::session::{self, Session};
@@ -29,6 +29,7 @@ use crate::tui::cells::{SystemCell, ThinkingCell, ToolCallCell, ToolStatus, User
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_phase;
 use crate::tui::slash::{fuzzy_subseq, SlashCommand, SLASH_COMMANDS};
+use crate::tui::wizard::{Wizard, WizardAction};
 
 /// Verbose command reference, shown only on `/help`.
 pub const HELP_TEXT: &str = r#"
@@ -52,8 +53,6 @@ Tip: type `/` for the command menu, or just start chatting.
 
 enum Pending {
     None,
-    Login(String),
-    Model(String),
     Save,
 }
 
@@ -61,6 +60,8 @@ enum Pending {
 enum AppEvent {
     Terminal(crossterm::event::Event),
     Stream(StreamEvent),
+    /// Result of an async model-list fetch kicked off by the setup wizard.
+    Wizard(Result<Vec<String>, String>),
 }
 
 pub struct App {
@@ -89,6 +90,12 @@ pub struct App {
     slash_query: String,
     slash_selected: usize,
     queued_inputs: std::collections::VecDeque<String>,
+    /// Width (columns) of the input composer area from the last frame, used to
+    /// soft-wrap the typed text so it never overflows the box.
+    input_area_width: u16,
+    /// Active provider/model setup wizard (codex-style modal). While set,
+    /// all keys are routed to it and it is drawn as a centered overlay.
+    wizard: Option<Wizard>,
 }
 
 impl App {
@@ -122,6 +129,8 @@ impl App {
             slash_query: String::new(),
             slash_selected: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            input_area_width: 80,
+            wizard: None,
         };
         app
     }
@@ -253,12 +262,19 @@ impl App {
             StreamEvent::Error(e) => {
                 self.streaming = false;
                 self.status = "error".into();
-                if let Some(i) = self.active_think {
-                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
-                        tc.answer
-                            .push_str(&format!("\n\n**error:** {e}"));
-                        tc.streaming = false;
-                    }
+                // Surface the error directly inside the AI response cell so the
+                // user can see what went wrong, rather than only the status bar.
+                let idx = if let Some(i) = self.active_think {
+                    i
+                } else {
+                    self.cells.push(Box::new(ThinkingCell::new()));
+                    let i = self.cells.len() - 1;
+                    self.active_think = Some(i);
+                    i
+                };
+                if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
+                    tc.answer.push_str(&format!("\n\n**error:** {e}"));
+                    tc.streaming = false;
                 }
                 self.active_think = None;
                 self.dirty = true;
@@ -349,8 +365,16 @@ impl App {
                 self.system_msg(WELCOME_TEXT);
             }
             "/help" | "/?" => self.system_msg(HELP_TEXT),
-            "/login" => self.pending = Pending::Login(arg.to_string()),
-            "/models" => self.pending = Pending::Model(arg.to_string()),
+            "/login" => {
+                let arg = if arg.is_empty() { None } else { Some(arg.to_string()) };
+                self.wizard = Some(Wizard::new_login(arg.as_deref()));
+                self.dirty = true;
+            }
+            "/models" => {
+                let arg = if arg.is_empty() { None } else { Some(arg.to_string()) };
+                self.wizard = Some(Wizard::new_models(arg.as_deref()));
+                self.dirty = true;
+            }
             "/sessions" | "/sess" | "/history" => self.list_sessions(),
             "/tools" => self.list_tools(),
             "/save" => {
@@ -371,7 +395,128 @@ impl App {
         self.input.lines().iter().all(|l| l.is_empty())
     }
 
+    /// Recover the logical input text. Soft-wrap line breaks inserted by
+    /// [`Self::reflow_input`] carry no characters, so concatenating the lines
+    /// losslessly reproduces what the user typed (paste newlines are folded).
+    fn input_text(&self) -> String {
+        self.input.lines().concat().trim().to_string()
+    }
+
+    /// Display width of a single character, treating wide/CJK glyphs as 2 cols.
+    fn cw(c: char) -> usize {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    /// Build a display-only, soft-wrapped copy of the input composer.
+    ///
+    /// `self.input` always holds the *logical* text (real newlines only, from
+    /// Shift-Enter); wrapping is applied purely for rendering so the editable
+    /// buffer is never mutated and never compounds broken line breaks across
+    /// frames. The cursor is mapped onto the wrapped layout so it tracks the
+    /// logical position correctly even across real-newline boundaries.
+    fn wrapped_input(&self) -> TextArea<'static> {
+        let max_w = (self.input_area_width.saturating_sub(2)).max(1) as usize;
+        let (cur_row, cur_col) = self.input.cursor();
+        let lines: Vec<String> = self.input.lines().iter().map(|s| s.to_string()).collect();
+
+        // Linear cursor index over the logical text (real newlines count as 1).
+        let mut cursor_idx: usize = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if i < cur_row {
+                cursor_idx += l.chars().count() + 1; // +1 for the real newline
+            } else {
+                cursor_idx += cur_col;
+                break;
+            }
+        }
+
+        let mut display: Vec<String> = Vec::new();
+        let mut disp_start: Vec<usize> = Vec::new();
+        let mut disp_len: Vec<usize> = Vec::new();
+        let mut global: usize = 0;
+
+        for line in &lines {
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            let mut produced = false;
+            while i < chars.len() {
+                let mut col = 0usize;
+                let mut j = i;
+                while j < chars.len() {
+                    let w = Self::cw(chars[j]);
+                    if col + w > max_w && j > i {
+                        break;
+                    }
+                    col += w;
+                    j += 1;
+                }
+                if j == i {
+                    // A single glyph wider than the box: keep it on its own line.
+                    j = i + 1;
+                }
+                let seg: String = chars[i..j].iter().collect();
+                disp_start.push(global);
+                disp_len.push(seg.chars().count());
+                display.push(seg);
+                global += j - i;
+                i = j;
+                produced = true;
+            }
+            if !produced {
+                // Preserve an empty logical line as one empty display line.
+                disp_start.push(global);
+                disp_len.push(0);
+                display.push(String::new());
+            }
+            global += 1; // the real newline boundary between logical lines
+        }
+
+        // Map the linear cursor index onto a (row, col) in the wrapped output.
+        let (mut target_row, mut target_col) = (0usize, 0usize);
+        let mut found = false;
+        for idx in 0..display.len() {
+            let start = disp_start[idx];
+            let len = disp_len[idx];
+            if cursor_idx <= start + len {
+                target_row = idx;
+                target_col = cursor_idx.saturating_sub(start);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if let Some(last) = display.len().checked_sub(1) {
+                target_row = last;
+                target_col = disp_len[last];
+            }
+        }
+
+        let mut ta = TextArea::new(display);
+        ta.move_cursor(CursorMove::Jump(target_row as u16, target_col as u16));
+        ta.move_cursor(CursorMove::InViewport);
+        ta
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        // While the setup wizard is open it owns the keyboard entirely.
+        if let Some(w) = &mut self.wizard {
+            let action = w.handle_key(key);
+            match action {
+                WizardAction::None => {}
+                WizardAction::Cancel => {
+                    self.wizard = None;
+                    self.system_msg("provider setup cancelled");
+                }
+                WizardAction::StartFetch { endpoint, api_key } => {
+                    self.start_wizard_fetch(endpoint, api_key);
+                }
+                WizardAction::Done(provider) => {
+                    self.finish_wizard(provider);
+                }
+            }
+            self.dirty = true;
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
@@ -405,6 +550,7 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::PageDown => {
+                self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_add(5);
                 self.dirty = true;
             }
@@ -414,6 +560,7 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Down if self.input_is_empty() => {
+                self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_add(1);
                 self.dirty = true;
             }
@@ -430,7 +577,7 @@ impl App {
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if self.streaming {
                     // Tab-queue: buffer the input for the next turn (DESIGN §4).
-                    let text = self.input.lines().join("\n").trim().to_string();
+                    let text = self.input_text();
                     if !text.is_empty() {
                         self.queued_inputs.push_back(text);
                         self.input = TextArea::default();
@@ -439,7 +586,7 @@ impl App {
                     }
                     return Ok(false);
                 }
-                let text = self.input.lines().join("\n").trim().to_string();
+                let text = self.input_text();
                 if !text.is_empty() {
                     self.history.push(text.clone());
                     self.history_idx = None;
@@ -447,7 +594,7 @@ impl App {
                 }
             }
             KeyCode::Tab if self.streaming => {
-                let text = self.input.lines().join("\n").trim().to_string();
+                let text = self.input_text();
                 if !text.is_empty() {
                     self.queued_inputs.push_back(text);
                     self.input = TextArea::default();
@@ -563,6 +710,7 @@ impl App {
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
+                self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_add(3);
                 self.dirty = true;
             }
@@ -577,8 +725,6 @@ impl App {
         self.reader_paused.store(true, Ordering::SeqCst);
         let result = match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => Ok(()),
-            Pending::Login(name) => self.login(terminal, name).await,
-            Pending::Model(arg) => self.switch_model(terminal, arg),
             Pending::Save => {
                 let title = read_line_paused(terminal, "session title:")?;
                 if !title.is_empty() {
@@ -597,58 +743,30 @@ impl App {
         result
     }
 
-    async fn login(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-        _name_arg: String,
-    ) -> io::Result<()> {
-        let provider = agent::interactive_configure(|q| {
-            read_line_paused(terminal, q).unwrap_or_default()
-        })
-        .await;
+    /// Kick off the async model-list fetch requested by the setup wizard.
+    /// The result comes back through [`AppEvent::Wizard`] in the main loop.
+    fn start_wizard_fetch(&mut self, endpoint: String, api_key: String) {
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = agent::fetch_models(&endpoint, &api_key).await;
+            let _ = tx.send(AppEvent::Wizard(res)).await;
+        });
+    }
 
+    /// Persist the provider the wizard produced and make it active.
+    fn finish_wizard(&mut self, provider: agent::Provider) {
         let mut pc = agent::ProvidersConfig::load();
         pc.upsert(provider.clone());
         match pc.save() {
-            Ok(_) => self.system_msg(format!("logged in as provider `{}`", provider.name)),
+            Ok(_) => self.system_msg(format!(
+                "provider `{}` ready · model `{}`",
+                provider.name, provider.model
+            )),
             Err(e) => self.system_msg(format!("save failed: {e}")),
         }
         self.provider = provider;
+        self.wizard = None;
         self.dirty = true;
-        Ok(())
-    }
-
-    fn switch_model(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-        arg: String,
-    ) -> io::Result<()> {
-        let mut pc = agent::ProvidersConfig::load();
-        if arg.is_empty() {
-            let names: Vec<String> = pc.list().iter().map(|p| p.name.clone()).collect();
-            self.system_msg(format!("providers: {}", names.join(", ")));
-            let choice = read_line_paused(terminal, "switch to provider:")?;
-            if let Some(p) = pc.providers.get(&choice) {
-                pc.active = choice.clone();
-                pc.save().ok();
-                self.provider = p.clone();
-                self.system_msg(format!("active provider: {}", choice));
-            } else {
-                self.system_msg("unknown provider".to_string());
-            }
-        } else if let Some(p) = pc.providers.get(&arg) {
-            pc.active = arg.clone();
-            pc.save().ok();
-            self.provider = p.clone();
-            self.system_msg(format!("active provider: {}", arg));
-        } else {
-            self.provider.model = arg.clone();
-            pc.upsert(self.provider.clone());
-            pc.save().ok();
-            self.system_msg(format!("model set to `{}`", arg));
-        }
-        self.dirty = true;
-        Ok(())
     }
 
     fn list_sessions(&mut self) {
@@ -767,7 +885,23 @@ impl App {
     fn draw(&mut self, f: &mut ratatui::Frame) {
         self.dirty = false;
         let area = f.area();
-        let input_lines = self.input.lines().len().max(1) as u16;
+
+        // Pre-compute the layout with a provisional height so we know the input
+        // width available for soft-wrapping.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        self.input_area_width = chunks[1].width;
+
+        // Build the soft-wrapped composer copy now that we know the width, so
+        // the input block can grow vertically with the wrapped line count.
+        let wrapped = self.wrapped_input();
+        let input_lines = wrapped.lines().len().max(1) as u16;
         // One blank padding row above and below the text; grows with content.
         let input_h = (input_lines + 2).clamp(3, 14);
 
@@ -779,39 +913,77 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(area);
+        self.input_area_width = chunks[1].width;
 
         let view = chunks[0];
         let ctx = RenderContext {
             shimmer_phase: shimmer_phase(self.shimmer_start, 1.8),
         };
 
-        // Fixed codex-style header: a bordered box (banner + model + directory)
-        // on top, a one-line tip beneath it, then the scrollable transcript.
-        // Everything is laid out with real Layout splits and rendered via
-        // widgets, so regions can never overlap or bleed into each other.
-        let view_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5), // bordered header box (3 lines + borders)
-                Constraint::Length(2), // tip line (text + spacing)
-                Constraint::Min(0),    // scrollable transcript
-            ])
-            .split(view);
-        let header_area = view_chunks[0];
-        let tip_area = view_chunks[1];
-        let transcript = view_chunks[2];
-        self.draw_header(f, header_area);
-        self.draw_tip(f, tip_area);
+        // The header banner + tip are part of the scroll, not pinned above it:
+        // while the view is pinned to the very top they are shown, but once the
+        // user scrolls down into the transcript they scroll away and the full
+        // height is handed to the conversation.
+        const HEADER_H: u16 = 5;
+        const TIP_H: u16 = 2;
+        const PRE: u16 = HEADER_H + TIP_H;
+
+        let total_cells = self.total_height(view.width);
+
+        // First pass assumes the banner is shown to decide whether we're at the
+        // top, then recompute the true scroll range for the chosen layout.
+        let usable_with_header = view.height.saturating_sub(PRE);
+        let max_with_header = total_cells.saturating_sub(usable_with_header);
+        let scroll_candidate = if self.auto_scroll {
+            max_with_header
+        } else {
+            self.scroll.min(max_with_header)
+        };
+        let show_header = scroll_candidate == 0;
+
+        let (transcript, header_area, tip_area) = if show_header {
+            (
+                Rect {
+                    x: view.left(),
+                    y: view.top() + PRE,
+                    width: view.width,
+                    height: usable_with_header,
+                },
+                Rect {
+                    x: view.left(),
+                    y: view.top(),
+                    width: view.width,
+                    height: HEADER_H,
+                },
+                Rect {
+                    x: view.left(),
+                    y: view.top() + HEADER_H,
+                    width: view.width,
+                    height: TIP_H,
+                },
+            )
+        } else {
+            (view, Rect::default(), Rect::default())
+        };
+
+        if show_header {
+            self.draw_header(f, header_area);
+            self.draw_tip(f, tip_area);
+        }
 
         // Virtual scroll: compute per-cell heights, clip to viewport.
-        let total = self.total_height(transcript.width);
+        let total = total_cells;
         let view_h = transcript.height;
-        let scroll = if self.scroll == u16::MAX {
-            total.saturating_sub(view_h)
+        let max_scroll = total.saturating_sub(view_h);
+        // Auto-scroll keeps the newest content pinned to the bottom, so the
+        // streaming output stays visible as it grows. Any manual scroll turns
+        // it off (below) and we then respect the explicit offset.
+        let scroll = if self.auto_scroll {
+            max_scroll
         } else {
-            self.scroll.min(total.saturating_sub(1))
+            self.scroll.min(max_scroll)
         };
-        self.scroll = scroll; // reconcile sentinel
+        self.scroll = scroll; // reconcile
 
         let mut y: i32 = -(scroll as i32);
         for c in self.cells.iter() {
@@ -853,7 +1025,10 @@ impl App {
             self.input
                 .set_placeholder_text("Type a message, or / for commands…");
         }
-        f.render_widget(&self.input, chunks[1]);
+        // Render the soft-wrapped copy (already built above) so long input
+        // grows vertically instead of overflowing; the editable buffer itself
+        // is never mutated.
+        f.render_widget(&wrapped, chunks[1]);
 
         // Status line + model hint (DESIGN §6).
         let queued = if self.queued_inputs.is_empty() {
@@ -929,6 +1104,12 @@ impl App {
                 });
                 y += 1;
             }
+        }
+
+        // Setup wizard overlay (codex-style provider/model selection modal).
+        // Drawn last so it sits on top of everything.
+        if let Some(wizard) = &self.wizard {
+            wizard.draw(f, area);
         }
     }
 }
@@ -1103,11 +1284,17 @@ pub async fn run(
                     AppEvent::Terminal(crossterm::event::Event::Mouse(m)) => app.handle_mouse(m),
                     AppEvent::Terminal(_) => {}
                     AppEvent::Stream(se) => app.handle_stream(se),
+                    AppEvent::Wizard(res) => {
+                        if let Some(w) = &mut app.wizard {
+                            w.on_fetch_result(res);
+                        }
+                        app.dirty = true;
+                    }
                 }
             }
             _ = tick.tick() => {
                 // Only redraw when something is animating.
-                if app.streaming || app.slash_mode {
+                if app.streaming || app.slash_mode || app.wizard.is_some() {
                     app.dirty = true;
                 }
             }

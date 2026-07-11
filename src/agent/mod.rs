@@ -165,6 +165,7 @@ pub async fn load_active_provider() -> Provider {
 
 /// A built-in provider preset. Built-ins only need an API key; the base URL
 /// is fixed. Pick `custom` to supply your own endpoint.
+#[derive(Clone)]
 pub struct ProviderPreset {
     pub name: &'static str,
     pub base_url: &'static str,

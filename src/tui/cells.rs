@@ -264,7 +264,8 @@ impl HistoryCell for ThinkingCell {
         // starts arriving it disappears and doesn't persist in the transcript.
         let indicator = self.streaming && self.answer.is_empty() && self.tools.is_empty();
         if indicator {
-            return 1;
+            // One blank padding row (matching text) + the shimmer line.
+            return 2;
         }
         let mut h = 0u16;
         for t in &self.tools {
@@ -279,12 +280,13 @@ impl HistoryCell for ThinkingCell {
         // Transient shimmer indicator, shown only while waiting for the first
         // token. It is not persisted once the answer or tools appear.
         if indicator {
+            // Same left offset and top padding as the rendered answer text.
             let label = Line::from(shimmer_spans(
                 &format!("{}…", self.phrase),
-                Color::White,
+                Color::Rgb(150, 150, 160),
                 ctx.shimmer_phase,
             ));
-            buf.set_line(area.left(), area.top(), &label, area.width);
+            buf.set_line(area.left() + 2, area.top() + 1, &label, area.width - 2);
             return;
         }
         let mut y: i32 = area.top() as i32 + 1; // top padding row

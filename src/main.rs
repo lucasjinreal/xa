@@ -477,22 +477,15 @@ fn resolve_session(cli: &Cli, provider: &agent::Provider) -> Session {
     }
 }
 
-/// `xa login [name]` — show a provider selector (built-ins + custom), then
-/// configure the chosen one and persist it as the active provider.
-async fn run_login(_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = agent::interactive_configure(|q| {
-        print!("{q}");
-        let _ = io::stdout().flush();
-        let mut s = String::new();
-        let _ = io::stdin().read_line(&mut s);
-        s.trim().to_string()
-    })
-    .await;
-
-    let mut pc = agent::ProvidersConfig::load();
-    pc.upsert(provider.clone());
-    pc.save()?;
-    println!("logged in as provider `{}`", provider.name);
+/// `xa login [name]` — launch the codex-style interactive provider setup
+/// (select provider → optional API key → auto-query models → pick a model),
+/// rendered in its own alternate-screen terminal. The chosen provider is
+/// persisted as the active one.
+async fn run_login(name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    match tui::wizard::Wizard::run_standalone(tui::wizard::WizardMode::Login, name.as_deref()).await? {
+        Some(p) => println!("logged in as provider `{}` (model `{}`)", p.name, p.model),
+        None => println!("login cancelled"),
+    }
     Ok(())
 }
 
