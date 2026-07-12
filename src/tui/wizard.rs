@@ -22,13 +22,14 @@ use ratatui::{
 };
 
 use crate::agent::{builtin_presets, Provider, ProviderPreset, ProvidersConfig};
+use crate::tui::theme;
 
-/// Accent + dim palette, kept in sync with `app.rs`.
-const ACCENT: Color = Color::Rgb(120, 180, 255);
-const DIM: Color = Color::Rgb(150, 150, 170);
-const PLAIN: Color = Color::Rgb(200, 200, 210);
-const SELECT_BG: Color = Color::Rgb(60, 80, 130);
-const BORDER: Color = Color::Rgb(70, 70, 90);
+/// Accent + dim palette — gray + orange (shared with the rest of the TUI).
+const ACCENT: Color = theme::ACCENT;
+const DIM: Color = theme::TEXT_DIM;
+const PLAIN: Color = theme::TEXT;
+const SELECT_BG: Color = theme::SELECT_BG;
+const BORDER: Color = theme::BORDER;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 

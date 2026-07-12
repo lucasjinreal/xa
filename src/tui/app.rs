@@ -13,7 +13,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
@@ -25,10 +25,12 @@ use unicode_width::UnicodeWidthChar;
 use crate::agent::{self, Provider, StreamEvent};
 use crate::session::{self, Session};
 
-use crate::tui::cells::{SystemCell, ThinkingCell, ToolCallCell, ToolStatus, UserCell};
+use crate::tui::cells::{SystemCell, ThinkingCell, UserCell, USER_LEAD_COLS, USER_PROMPT};
 use crate::tui::render::RenderContext;
-use crate::tui::shimmer::shimmer_phase;
+use crate::tui::shimmer::{shimmer_phase, shimmer_spans_to};
 use crate::tui::slash::{fuzzy_subseq, SlashCommand, SLASH_COMMANDS};
+use crate::tui::theme;
+use crate::tui::think::{StreamPhase, ThinkFilter};
 use crate::tui::wizard::{Wizard, WizardAction};
 
 /// Verbose command reference, shown only on `/help`.
@@ -72,7 +74,15 @@ pub struct App {
     auto_scroll: bool,
     streaming: bool,
     should_quit: bool,
+    /// Footer / transient messages (queue, ctrl-c hint). Activity labels live
+    /// in [`stream_phase`] above the input bar.
     status: String,
+    /// Claude-Code-style activity above the input (Waiting / Thinking / …).
+    stream_phase: StreamPhase,
+    /// When the current [`stream_phase`] began (timer restarts on phase change).
+    phase_started: Instant,
+    /// Strips `<think>`…`</think>` from streamed text and drives Thinking phase.
+    think_filter: ThinkFilter,
     pending: Pending,
     event_tx: mpsc::Sender<AppEvent>,
     reader_paused: Arc<AtomicBool>,
@@ -105,7 +115,7 @@ impl App {
         reader_paused: Arc<AtomicBool>,
         session: Session,
     ) -> Self {
-        let mut app = App {
+        App {
             provider,
             cells: Vec::new(),
             input: TextArea::default(),
@@ -113,7 +123,10 @@ impl App {
             auto_scroll: true,
             streaming: false,
             should_quit: false,
-            status: "ready".into(),
+            status: String::new(),
+            stream_phase: StreamPhase::Idle,
+            phase_started: Instant::now(),
+            think_filter: ThinkFilter::new(),
             pending: Pending::None,
             event_tx,
             reader_paused,
@@ -131,8 +144,7 @@ impl App {
             queued_inputs: std::collections::VecDeque::new(),
             input_area_width: 80,
             wizard: None,
-        };
-        app
+        }
     }
 
     fn push_cell(&mut self, cell: Box<dyn crate::tui::cells::HistoryCell>) {
@@ -140,6 +152,27 @@ impl App {
         self.dirty = true;
         if self.auto_scroll {
             self.scroll = u16::MAX; // sentinel: follow bottom
+        }
+    }
+
+    /// Update activity phase; restarts the elapsed timer only when it changes.
+    fn set_stream_phase(&mut self, phase: StreamPhase) {
+        if self.stream_phase != phase {
+            self.stream_phase = phase;
+            self.phase_started = Instant::now();
+            self.dirty = true;
+        }
+    }
+
+    /// Elapsed time in the current status, e.g. `0.4s` / `12.3s` / `1m05s`.
+    fn phase_elapsed_label(&self) -> String {
+        let secs = self.phase_started.elapsed().as_secs_f32();
+        if secs < 60.0 {
+            format!("{secs:.1}s")
+        } else {
+            let m = (secs as u32) / 60;
+            let s = (secs as u32) % 60;
+            format!("{m}m{s:02}s")
         }
     }
 
@@ -201,7 +234,9 @@ impl App {
         self.active_think = Some(think_idx);
         self.sync_session();
         self.streaming = true;
-        self.status = "streaming".into();
+        self.think_filter.reset();
+        self.set_stream_phase(StreamPhase::Waiting);
+        self.status.clear();
         self.dirty = true;
 
         let provider = self.provider.clone();
@@ -228,25 +263,50 @@ impl App {
     fn handle_stream(&mut self, se: StreamEvent) {
         match se {
             StreamEvent::Delta(s) => {
-                // Append to the active thinking cell's answer.
-                if let Some(i) = self.active_think {
-                    if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
-                        tc.add_text(&s);
-                        tc.streaming = true;
-                    }
+                // Strip `<think>`…`</think>` from the transcript; drive phase.
+                let (visible, inside_think) = self.think_filter.feed(&s);
+                let next = if inside_think {
+                    StreamPhase::Thinking
+                } else if self.think_filter.saw_visible || !visible.is_empty() {
+                    StreamPhase::Responding
                 } else {
-                    let mut tc = ThinkingCell::new();
-                    tc.add_text(&s);
-                    tc.streaming = true;
-                    self.cells.push(Box::new(tc));
-                    self.active_think = Some(self.cells.len() - 1);
+                    StreamPhase::Waiting
+                };
+                self.set_stream_phase(next);
+
+                if !visible.is_empty() {
+                    if let Some(i) = self.active_think {
+                        if let Some(tc) =
+                            self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>()
+                        {
+                            tc.add_text(&visible);
+                            tc.streaming = true;
+                        }
+                    } else {
+                        let mut tc = ThinkingCell::new();
+                        tc.add_text(&visible);
+                        tc.streaming = true;
+                        self.cells.push(Box::new(tc));
+                        self.active_think = Some(self.cells.len() - 1);
+                    }
                 }
-                self.status = "streaming".into();
                 self.dirty = true;
             }
             StreamEvent::Done => {
+                // Flush any held partial tag text outside a think block.
+                let tail = self.think_filter.finish();
+                if !tail.is_empty() {
+                    if let Some(i) = self.active_think {
+                        if let Some(tc) =
+                            self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>()
+                        {
+                            tc.add_text(&tail);
+                        }
+                    }
+                }
                 self.streaming = false;
-                self.status = "ready".into();
+                self.set_stream_phase(StreamPhase::Idle);
+                self.status.clear();
                 if let Some(i) = self.active_think {
                     if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
                         tc.streaming = false;
@@ -262,7 +322,8 @@ impl App {
             }
             StreamEvent::Error(e) => {
                 self.streaming = false;
-                self.status = "error".into();
+                self.set_stream_phase(StreamPhase::Error);
+                self.status.clear();
                 // Surface the error directly inside the AI response cell so the
                 // user can see what went wrong, rather than only the status bar.
                 let idx = if let Some(i) = self.active_think {
@@ -297,6 +358,7 @@ impl App {
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
                     tc.add_tool(&name, &preview, path, read_offset, read_limit);
                 }
+                self.set_stream_phase(StreamPhase::RunningTool);
                 self.dirty = true;
             }
             StreamEvent::ToolResult {
@@ -320,6 +382,17 @@ impl App {
                     tc.finish_tool(Some(output), is_error, diff);
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
+                }
+                // After a tool, wait for the next model tokens.
+                if self.streaming {
+                    let next = if self.think_filter.inside_think() {
+                        StreamPhase::Thinking
+                    } else if self.think_filter.saw_visible {
+                        StreamPhase::Responding
+                    } else {
+                        StreamPhase::Waiting
+                    };
+                    self.set_stream_phase(next);
                 }
                 self.dirty = true;
             }
@@ -395,7 +468,9 @@ impl App {
     /// frames. The cursor is mapped onto the wrapped layout so it tracks the
     /// logical position correctly even across real-newline boundaries.
     fn wrapped_input(&self) -> TextArea<'static> {
-        let max_w = (self.input_area_width.saturating_sub(2)).max(1) as usize;
+        // Horizontal pad: left margin (1) + ❯ lead + right pad (1).
+        let h_pad = 1u16 + USER_LEAD_COLS + 1;
+        let max_w = (self.input_area_width.saturating_sub(h_pad)).max(1) as usize;
         let (cur_row, cur_col) = self.input.cursor();
         let lines: Vec<String> = self.input.lines().iter().map(|s| s.to_string()).collect();
 
@@ -477,6 +552,11 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        // Dismiss a sticky error activity line on the next keystroke.
+        if self.stream_phase == StreamPhase::Error && !self.streaming {
+            self.set_stream_phase(StreamPhase::Idle);
+        }
+
         // While the setup wizard is open it owns the keyboard entirely.
         if let Some(w) = &mut self.wizard {
             let action = w.handle_key(key);
@@ -787,9 +867,6 @@ impl App {
 
     /// Render the codex-style banner box pinned at the top of the view.
     fn draw_header(&self, f: &mut ratatui::Frame, area: Rect) {
-        let accent = Color::Rgb(120, 180, 255);
-        let dim = Color::Rgb(150, 150, 170);
-        let hint = Color::Rgb(90, 90, 110);
         let cwd = std::env::current_dir()
             .map(|p| {
                 let s = p.display().to_string();
@@ -814,28 +891,38 @@ impl App {
         // neighbouring rows.
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(70, 70, 90)));
+            .border_style(Style::default().fg(theme::BORDER));
 
         let lines = vec![
             Line::from(vec![
-                Span::styled(">_ ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::styled("xa", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "❯ ",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "xa",
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     format!(" (v{version})"),
-                    Style::default().fg(Color::Rgb(150, 150, 170)),
+                    Style::default().fg(theme::TEXT_DIM),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" model:    ", Style::default().fg(dim)),
-                Span::styled(model, Style::default().fg(Color::Cyan)),
-                Span::styled("     /models to change", Style::default().fg(hint)),
-            ]),
-            Line::from(vec![
-                Span::styled(" directory:", Style::default().fg(dim)),
+                Span::styled(" model:    ", Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(model, Style::default().fg(theme::ACCENT)),
                 Span::styled(
-                    format!("  {cwd}"),
-                    Style::default().fg(Color::Rgb(190, 190, 190)),
+                    "     /models to change",
+                    Style::default().fg(theme::TEXT_HINT),
                 ),
+            ]),
+            Line::from(vec![
+                Span::styled(" directory:", Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(format!("  {cwd}"), Style::default().fg(theme::TEXT)),
             ]),
         ];
 
@@ -848,13 +935,63 @@ impl App {
     /// Render the short codex-style tip line beneath the header box.
     fn draw_tip(&self, f: &mut ratatui::Frame, area: Rect) {
         let tip = Line::from(vec![
-            Span::styled("Tip: ", Style::default().fg(Color::Rgb(150, 150, 170))),
+            Span::styled("Tip: ", Style::default().fg(theme::TEXT_DIM)),
             Span::styled(
                 "type `/` for the command menu, or just start chatting.",
-                Style::default().fg(Color::Rgb(190, 190, 190)),
+                Style::default().fg(theme::TEXT),
             ),
         ]);
         f.render_widget(Paragraph::new(tip), area);
+    }
+
+    /// Claude-Code-style activity row above the input: Waiting / Thinking / …
+    /// with an elapsed timer that restarts whenever the status changes.
+    fn draw_activity(&self, f: &mut ratatui::Frame, area: Rect, phase: f32) {
+        if area.height == 0 {
+            return;
+        }
+        let label = if let Some(l) = self.stream_phase.label() {
+            l.to_string()
+        } else if !self.status.is_empty() {
+            self.status.clone()
+        } else {
+            return;
+        };
+
+        let base = match self.stream_phase {
+            StreamPhase::Error => theme::ERROR,
+            StreamPhase::Thinking => theme::ACCENT,
+            StreamPhase::Responding => theme::ACCENT_DIM,
+            StreamPhase::RunningTool => theme::WARNING,
+            StreamPhase::Waiting => theme::TEXT_DIM,
+            StreamPhase::Idle => theme::TEXT_DIM,
+        };
+
+        let mut spans = vec![Span::styled("  ", Style::default().fg(theme::TEXT_DIM))];
+        if self.stream_phase.is_active() && self.stream_phase != StreamPhase::Error {
+            spans.extend(shimmer_spans_to(
+                &label,
+                base,
+                theme::ACCENT_BRIGHT,
+                phase,
+            ));
+        } else {
+            spans.push(Span::styled(label, Style::default().fg(base)));
+        }
+        // Per-status elapsed timer (restarts on phase change).
+        if self.stream_phase.is_active() {
+            spans.push(Span::styled(
+                format!("  {}", self.phase_elapsed_label()),
+                Style::default().fg(theme::TEXT_DIM),
+            ));
+        }
+        if self.streaming {
+            spans.push(Span::styled(
+                "  · esc to interrupt",
+                Style::default().fg(theme::TEXT_HINT),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn total_height(&self, width: u16) -> u16 {
@@ -865,17 +1002,23 @@ impl App {
         self.dirty = false;
         let area = f.area();
 
+        // Activity strip sits *above* the input (Claude Code): Waiting /
+        // Thinking / Responding. Footer under the input keeps model meta.
+        let show_activity = self.stream_phase.is_active() || !self.status.is_empty();
+        let activity_h: u16 = if show_activity { 1 } else { 0 };
+
         // Pre-compute the layout with a provisional height so we know the input
         // width available for soft-wrapping.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
+                Constraint::Length(activity_h),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(area);
-        self.input_area_width = chunks[1].width;
+        self.input_area_width = chunks[2].width;
 
         // Build the soft-wrapped composer copy now that we know the width, so
         // the input block can grow vertically with the wrapped line count.
@@ -888,13 +1031,17 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
+                Constraint::Length(activity_h),
                 Constraint::Length(input_h),
                 Constraint::Length(1),
             ])
             .split(area);
-        self.input_area_width = chunks[1].width;
+        self.input_area_width = chunks[2].width;
 
         let view = chunks[0];
+        let activity_area = chunks[1];
+        let input_area = chunks[2];
+        let footer_area = chunks[3];
         let ctx = RenderContext {
             shimmer_phase: shimmer_phase(self.shimmer_start, 1.8),
         };
@@ -1001,19 +1148,27 @@ impl App {
             }
         }
 
-        // Input composer: borderless, pure grey background (DESIGN §4), with a
-        // one-row pad top/bottom and left/right so the text sits vertically
-        // centred inside the grey block. All styling is applied to the
-        // soft-wrapped *display* copy so it matches the editable buffer.
+        // Activity strip directly above the input (Claude Code style).
+        self.draw_activity(f, activity_area, ctx.shimmer_phase);
+
+        // Input composer: borderless grey block (DESIGN §4) with a `❯ ` lead
+        // matching UserCell. Pad left enough for the icon so typed text lines
+        // up under (and with) the transcript user messages.
+        let input_bg = theme::INPUT_BG;
         let input_block = Block::default()
             .borders(Borders::NONE)
-            .padding(Padding::new(1, 1, 1, 1))
-            .style(Style::default().bg(Color::Rgb(40, 40, 46)));
+            .padding(Padding::new(1 + USER_LEAD_COLS, 1, 1, 1))
+            .style(Style::default().bg(input_bg));
         let mut wrapped = wrapped;
         wrapped.set_block(input_block);
         // Visible block cursor.
-        wrapped.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-        wrapped.set_cursor_line_style(Style::default().bg(Color::Rgb(40, 40, 46)));
+        wrapped.set_cursor_style(
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+        wrapped.set_cursor_line_style(Style::default().bg(input_bg));
         // Placeholder hint when empty and not streaming.
         if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) && !self.streaming {
             wrapped.set_placeholder_text("Type a message, or / for commands…");
@@ -1021,56 +1176,62 @@ impl App {
         // Render the soft-wrapped copy (already built above) so long input
         // grows vertically instead of overflowing; the editable buffer itself
         // is never mutated.
-        f.render_widget(&wrapped, chunks[1]);
+        f.render_widget(&wrapped, input_area);
 
-        // Status line + model hint (DESIGN §6).
-        let queued = if self.queued_inputs.is_empty() {
-            String::new()
-        } else {
-            format!(" · {} queued", self.queued_inputs.len())
-        };
-        let status_line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", self.status),
-                Style::default().fg(if self.streaming {
-                    Color::Cyan
-                } else if self.status == "error" {
-                    Color::Red
-                } else {
-                    Color::Rgb(150, 150, 150)
-                }),
-            ),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(150, 150, 150))),
+        // Paint the shared `❯` lead in the left pad of the first content row
+        // (same glyph + style family as UserCell).
+        if input_area.height > 2 && input_area.width > 1 + USER_LEAD_COLS {
+            let lead_style = Style::default()
+                .fg(theme::INPUT_LEAD)
+                .bg(input_bg)
+                .add_modifier(Modifier::BOLD);
+            f.buffer_mut().set_stringn(
+                input_area.left() + 1,
+                input_area.top() + 1,
+                USER_PROMPT,
+                USER_PROMPT.chars().count(),
+                lead_style,
+            );
+        }
+
+        // Footer: dim grey throughout, segments split with • .
+        let mut footer_spans = vec![
             Span::styled(
                 format!(" {}", self.provider.model),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(theme::FOOTER),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(150, 150, 150))),
+            Span::styled(" • ", Style::default().fg(theme::FOOTER)),
             Span::styled(
-                format!(" {}", self.provider.name),
-                Style::default().fg(Color::Rgb(150, 150, 150)),
+                self.provider.name.clone(),
+                Style::default().fg(theme::FOOTER),
             ),
-            Span::styled(queued, Style::default().fg(Color::Yellow)),
-        ]);
-        f.render_widget(Paragraph::new(status_line), chunks[2]);
+        ];
+        if !self.queued_inputs.is_empty() {
+            footer_spans.push(Span::styled(" • ", Style::default().fg(theme::FOOTER)));
+            footer_spans.push(Span::styled(
+                format!("{} queued", self.queued_inputs.len()),
+                Style::default().fg(theme::FOOTER),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
 
         // Slash popup overlay (DESIGN §5).
         if self.slash_mode {
             let filtered = self.filtered_slash();
             let popup_h = (filtered.len() as u16 + 2).clamp(3, 12);
-            let popup_w = 46.min(chunks[1].width);
+            let popup_w = 46.min(input_area.width);
             let popup_area = Rect {
-                x: chunks[1].left(),
-                y: (chunks[1].top().saturating_sub(popup_h)).max(0),
+                x: input_area.left(),
+                y: (input_area.top().saturating_sub(popup_h)).max(0),
                 width: popup_w,
                 height: popup_h,
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
+                .border_style(Style::default().fg(theme::ACCENT))
                 .title(Span::styled(
                     format!(" /{:<1$} ", self.slash_query, 10),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(theme::ACCENT),
                 ));
             let inner = block.inner(popup_area);
             f.render_widget(block, popup_area);
@@ -1081,20 +1242,26 @@ impl App {
                 }
                 let sel = i == self.slash_selected;
                 let style = if sel {
-                    Style::default().fg(Color::Black).bg(Color::Magenta)
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .bg(theme::SELECT_BG)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(190, 190, 190))
+                    Style::default().fg(theme::TEXT_DIM)
                 };
                 let line = Line::from(vec![
                     Span::styled(format!(" {:<10}", cmd.name), style),
                     Span::styled(format!(" {:<28}", cmd.desc), style),
                 ]);
-                f.render_widget(Paragraph::new(line), Rect {
-                    x: inner.left(),
-                    y,
-                    width: inner.width,
-                    height: 1,
-                });
+                f.render_widget(
+                    Paragraph::new(line),
+                    Rect {
+                        x: inner.left(),
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
                 y += 1;
             }
         }
@@ -1254,8 +1421,16 @@ pub async fn run(
             match m.role.as_str() {
                 "user" => app.push_cell(Box::new(UserCell { content: m.content.clone() })),
                 "assistant" => {
+                    // Strip any persisted think tags so resume matches live turns.
+                    let mut filter = ThinkFilter::new();
+                    let (visible, _) = filter.feed(&m.content);
+                    let tail = filter.finish();
+                    let mut text = visible;
+                    text.push_str(&tail);
                     let mut tc = ThinkingCell::new();
-                    tc.add_text(&m.content);
+                    if !text.is_empty() {
+                        tc.add_text(&text);
+                    }
                     tc.streaming = false;
                     app.push_cell(Box::new(tc));
                 }

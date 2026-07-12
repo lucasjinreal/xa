@@ -48,13 +48,18 @@ fn ansi_approx(c: Color) -> (u8, u8, u8) {
 /// Render `text` as a moving shimmer highlight. `phase` is in [0,1); the
 /// highlight band sweeps left→right once per `period`.
 pub fn shimmer_spans(text: &str, base: Color, phase: f32) -> Vec<Span<'static>> {
+    shimmer_spans_to(text, base, Color::White, phase)
+}
+
+/// Shimmer toward a specific peak color (e.g. bright orange).
+pub fn shimmer_spans_to(text: &str, base: Color, peak: Color, phase: f32) -> Vec<Span<'static>> {
     let len = text.chars().count().max(1) as f32;
     let mut out = Vec::with_capacity(text.chars().count());
     for (i, ch) in text.chars().enumerate() {
         let pos = i as f32 / len;
         let dist = (pos - phase).abs().min(1.0 - (pos - phase).abs());
         let highlight = (1.0 - dist * 4.0).clamp(0.0, 1.0);
-        let color = blend(base, Color::White, highlight);
+        let color = blend(base, peak, highlight);
         out.push(Span::styled(ch.to_string(), Style::default().fg(color)));
     }
     out

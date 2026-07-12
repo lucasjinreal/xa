@@ -72,6 +72,7 @@ fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
 
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
+use crate::tui::theme;
 
 /// One self-contained transcript entry.
 pub trait HistoryCell {
@@ -147,22 +148,57 @@ impl HistoryCell for SystemCell {
 
 // ---- User cell -------------------------------------------------------------
 
+/// Leading prompt for user messages and the input bar (U+276F HEAVY
+/// RIGHT-POINTING ANGLE). Display width is 1; with a trailing space the
+/// full lead occupies [`USER_LEAD_COLS`] columns.
+pub const USER_PROMPT: &str = "❯";
+/// Columns reserved for `❯ ` before user text (glyph + space).
+pub const USER_LEAD_COLS: u16 = 2;
+
 pub struct UserCell {
     pub content: String,
 }
 
 impl UserCell {
     fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
-        let avail = (width.saturating_sub(4)).max(1);
-        let x = 2u16;
-        let wrapped = wrap_text(&self.content, avail as usize);
+        // Layout: [1 col margin][❯ ][text…][1 col margin]
+        let left_margin = 1u16;
+        let right_margin = 1u16;
+        let text_x = left_margin + USER_LEAD_COLS;
+        let avail = (width
+            .saturating_sub(left_margin + USER_LEAD_COLS + right_margin))
+        .max(1);
+        let mut wrapped = wrap_text(&self.content, avail as usize);
+        if wrapped.is_empty() {
+            wrapped.push(String::new());
+        }
+
+        // Grey lead on dim gray cell fill; text stays readable white-grey.
+        let prompt_style = Style::default()
+            .fg(theme::USER_LEAD)
+            .bg(theme::USER_BG)
+            .add_modifier(Modifier::BOLD);
+        let text_style = Style::default().fg(theme::TEXT).bg(theme::USER_BG);
+
         let mut rows = vec![Row::blank(width)]; // top padding
-        for l in wrapped {
-            rows.push(Row {
-                x,
-                w: avail,
-                line: Line::from(l),
-            });
+        for (i, l) in wrapped.into_iter().enumerate() {
+            if i == 0 {
+                // First line carries the ❯ lead; wrapped lines hang under the text.
+                rows.push(Row {
+                    x: left_margin,
+                    w: USER_LEAD_COLS + avail,
+                    line: Line::from(vec![
+                        Span::styled(format!("{USER_PROMPT} "), prompt_style),
+                        Span::styled(l, text_style),
+                    ]),
+                });
+            } else {
+                rows.push(Row {
+                    x: text_x,
+                    w: avail,
+                    line: Line::from(Span::styled(l, text_style)),
+                });
+            }
         }
         rows.push(Row::blank(width)); // bottom padding
         rows
@@ -184,7 +220,8 @@ impl HistoryCell for UserCell {
         self
     }
     fn bg(&self) -> Option<Color> {
-        Some(Color::Rgb(45, 45, 52))
+        // True neutral gray (R=G=B) — previous slate had a blue cast.
+        Some(theme::USER_BG)
     }
 }
 
@@ -222,9 +259,9 @@ pub struct ToolCallCell {
 impl ToolCallCell {
     pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
-            ToolStatus::Running => ("▸", Color::Cyan),
-            ToolStatus::Success => ("✓", Color::Green),
-            ToolStatus::Failed => ("✗", Color::Red),
+            ToolStatus::Running => ("▸", theme::ACCENT),
+            ToolStatus::Success => ("✓", theme::SUCCESS),
+            ToolStatus::Failed => ("✗", theme::ERROR),
         };
         let mut spans = vec![Span::styled(
             format!(" {icon} "),
@@ -268,7 +305,7 @@ impl ToolCallCell {
         if !toggle.is_empty() {
             spans.push(Span::styled(
                 toggle.to_string(),
-                Style::default().fg(Color::Rgb(150, 150, 150)),
+                Style::default().fg(theme::TEXT_DIM),
             ));
         }
         Line::from(spans)
@@ -294,7 +331,7 @@ impl ToolCallCell {
                             line: Line::from(Span::styled(
                                 format!("→ Read {}", p),
                                 Style::default()
-                                    .fg(Color::Cyan)
+                                    .fg(theme::ACCENT)
                                     .add_modifier(Modifier::BOLD),
                             )),
                         });
@@ -307,7 +344,7 @@ impl ToolCallCell {
                             w,
                             line: Line::from(Span::styled(
                                 format!("  [offset={}, limit={}]", off, lim),
-                                Style::default().fg(Color::Rgb(150, 150, 170)),
+                                Style::default().fg(theme::TEXT_DIM),
                             )),
                         });
                     }
@@ -331,7 +368,7 @@ impl ToolCallCell {
                                 w,
                                 line: Line::from(Span::styled(
                                     "…(truncated)".to_string(),
-                                    Style::default().fg(Color::Rgb(150, 150, 150)),
+                                    Style::default().fg(theme::TEXT_DIM),
                                 )),
                             });
                         }
@@ -348,9 +385,9 @@ impl ToolCallCell {
                             out.to_string()
                         };
                         let color = if self.status == ToolStatus::Failed {
-                            Color::Rgb(220, 120, 120)
+                            theme::ERROR
                         } else {
-                            Color::Rgb(150, 150, 150)
+                            theme::TEXT_DIM
                         };
                         for l in shown.lines() {
                             rows.push(Row {
@@ -400,7 +437,7 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
                 line: Line::from(Span::styled(
                     format!("{} {}", header_label, p),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme::WARNING)
                         .add_modifier(Modifier::BOLD),
                 )),
             });
@@ -429,9 +466,9 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
             _ => {}
         }
         let color = match sign {
-            "-" => Color::Rgb(225, 110, 110),
-            "+" => Color::Rgb(90, 210, 130),
-            _ => Color::Rgb(150, 150, 150),
+            "-" => theme::DIFF_DEL,
+            "+" => theme::DIFF_ADD,
+            _ => theme::DIFF_META,
         };
         rows.push(Row {
             x,
@@ -439,7 +476,7 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
             line: Line::from(vec![
                 Span::styled(
                     format!("{:>4} ", ln),
-                    Style::default().fg(Color::Rgb(110, 110, 130)),
+                    Style::default().fg(theme::TEXT_HINT),
                 ),
                 Span::styled(format!("{} ", sign), Style::default().fg(color)),
                 Span::styled(content.to_string(), Style::default().fg(color)),
@@ -496,15 +533,6 @@ fn diff_change_summary(diff: &str) -> String {
 
 // ---- Thinking (interleaved: assistant text + tool-call cards) -------------
 
-const THINK_PHRASES: &[&str] = &[
-    "Thinking",
-    "Mulling it over",
-    "Reasoning",
-    "Working",
-    "Pondering",
-    "Figuring it out",
-];
-
 /// One ordered entry in a thinking block. Interleaving mirrors the real model
 /// turn — text, then a tool call, then more text, then another tool call — so
 /// the transcript reads naturally instead of putting every tool at the top.
@@ -523,18 +551,13 @@ impl ThinkBlock {
 }
 
 pub struct ThinkingCell {
-    pub phrase: String,
     pub blocks: Vec<ThinkBlock>,
     pub streaming: bool,
 }
 
 impl ThinkingCell {
     pub fn new() -> Self {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-        let phrase = THINK_PHRASES[n % THINK_PHRASES.len()].to_string();
         ThinkingCell {
-            phrase,
             blocks: Vec::new(),
             streaming: true,
         }
@@ -605,27 +628,10 @@ impl ThinkingCell {
     }
 
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
-        // The "Thinking…" phrase is a transient indicator: it only occupies a
-        // row while we're still waiting (no content yet). Once anything arrives
-        // it disappears and doesn't persist in the transcript.
-        let indicator = self.streaming && self.blocks.is_empty();
-        if indicator {
-            let line = match ctx {
-                Some(c) => Line::from(shimmer_spans(
-                    &format!("{}…", self.phrase),
-                    Color::Rgb(150, 150, 160),
-                    c.shimmer_phase,
-                )),
-                None => Line::from(self.phrase.clone() + "…"),
-            };
-            return vec![
-                Row::blank(width),
-                Row {
-                    x: 2,
-                    w: width.saturating_sub(2),
-                    line,
-                },
-            ];
+        // Waiting / Thinking / Responding live in the activity strip above the
+        // input bar (Claude Code style) — not inside the transcript cell.
+        if self.blocks.is_empty() {
+            return Vec::new();
         }
 
         let mut rows = vec![Row::blank(width)]; // top padding
@@ -660,7 +666,10 @@ impl ThinkingCell {
                 rows.push(Row {
                     x: 2,
                     w: width.saturating_sub(2),
-                    line: Line::from(Span::styled("▍", Style::default().fg(Color::White))),
+                    line: Line::from(Span::styled(
+                        "▍",
+                        Style::default().fg(theme::ACCENT),
+                    )),
                 });
             }
         }

@@ -13,15 +13,19 @@
 //! interactive wizard rendered as a centered modal — see [`wizard`].
 //!
 //! Module layout:
+//! - [`theme`]   — gray + orange palette (no purple)
 //! - [`shimmer`] — animated highlight helpers
 //! - [`cells`]   — the `HistoryCell` trait and concrete cell types
+//! - [`think`]   — stream phase + `<think>` filter
 //! - [`slash`]   — slash-command table + fuzzy filter
 //! - [`render`]  — shared per-frame [`render::RenderContext`]
 //! - [`wizard`]  — in-TUI provider / model selection modal
 //! - [`app`]     — the `App` state machine, event handlers, draw, and `run`
 
+mod theme;
 mod shimmer;
 mod cells;
+mod think;
 mod slash;
 mod render;
 pub mod wizard;
