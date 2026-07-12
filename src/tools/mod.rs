@@ -9,6 +9,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use similar::TextDiff;
+
 use serde_json::Value;
 
 /// A local agent tool.
@@ -96,14 +98,31 @@ impl Tool for ReadTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "path to the file" }
+                "path": { "type": "string", "description": "path to the file" },
+                "offset": { "type": "integer", "description": "1-based line to start reading from (optional)" },
+                "limit": { "type": "integer", "description": "max number of lines to read (optional)" }
             },
             "required": ["path"]
         })
     }
     fn execute(&self, args: Value) -> Result<String, String> {
         let path = arg_str(&args, "path")?;
-        read_file_capped(Path::new(path), 200 * 1024)
+        let text = read_file_capped(Path::new(path), 200 * 1024)?;
+        let offset = args.get("offset").and_then(|n| n.as_u64()).map(|n| n as usize);
+        let limit = args.get("limit").and_then(|n| n.as_u64()).map(|n| n as usize);
+        if offset.is_none() && limit.is_none() {
+            return Ok(text);
+        }
+        let start = offset.map(|n| n.saturating_sub(1)).unwrap_or(0);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut end = lines.len();
+        if let Some(lim) = limit {
+            end = (start + lim).min(lines.len());
+        }
+        Ok(lines
+            .get(start..end)
+            .map(|s| s.join("\n"))
+            .unwrap_or_default())
     }
 }
 
@@ -115,7 +134,7 @@ pub struct WriteTool;
 impl Tool for WriteTool {
     fn name(&self) -> &str { "write" }
     fn description(&self) -> &str {
-        "Write text content to a file, creating parent directories as needed. Overwrites existing files."
+        "Write text content to a file, creating parent directories as needed. Prefer `edit` for modifying existing files — only use `write` to create a brand-new file or replace an entire file on purpose. NEVER use `write` for a small change to an existing file."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -148,7 +167,7 @@ pub struct EditTool;
 impl Tool for EditTool {
     fn name(&self) -> &str { "edit" }
     fn description(&self) -> &str {
-        "Replace the first occurrence of `old` with `new` in a file and write it back."
+        "Make a small, surgical change: replace the first occurrence of `old` with `new` in a file and write it back. Use this for edits to existing files — keep `old`/`new` to just the lines that change. Use `write` only to create a new file."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -311,47 +330,51 @@ impl Tool for GrepTool {
     }
 }
 
-/// Produce a colorful-free unified `git diff` for `path` so the TUI can render
-/// exactly what an `edit`/`write` tool changed.
+/// Produce a minimal, colorful-free unified diff between the *before* and
+/// *after* contents of `path` so the TUI can render exactly what an
+/// `edit`/`write` tool changed.
 ///
-/// - Inside a git work tree we use `git diff` (working tree vs index) so edits
-///   to tracked files show context.
-/// - New / untracked files fall back to `git diff --no-index /dev/null <path>`
-///   so additions still render as a diff.
-///
-/// Returns `None` when there is nothing to show (e.g. not under git, or the
-/// file is unchanged).
-pub fn git_diff_of(path: &str) -> Option<String> {
-    let in_repo = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let run = |args: &[&str]| -> Option<String> {
-        Command::new("git")
-            .args(["-c", "core.pager=cat"])
-            .args(args)
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).to_string();
-                if s.trim().is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            })
-    };
-
-    if in_repo {
-        if let Some(d) = run(&["diff", "--no-color", "--", path]) {
-            return Some(d);
-        }
+/// Unlike the previous git-based approach, this is purely content based: it
+/// works whether or not the file is tracked by git, and — crucially — edits to
+/// an untracked file show only the changed hunk(s) instead of the entire file
+/// being printed as a wall of `+` lines. New/empty `before` content is treated
+/// as a brand-new file and emits a `--- /dev/null` header so the TUI still
+/// labels it "← New file".
+pub fn unified_diff(path: &str, before: &str, after: &str) -> Option<String> {
+    if before == after {
+        return None;
     }
-    // Untracked / new file: diff against the empty file.
-    let devnull = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    run(&["diff", "--no-color", "--no-index", "--", devnull, path])
+
+    if before.is_empty() {
+        // Brand-new file: every line is an addition.
+        let n = after.lines().count();
+        let mut s = String::new();
+        s.push_str(&format!("diff --git a/{p} b/{p}\n", p = path));
+        s.push_str("new file mode 100644\n");
+        s.push_str("--- /dev/null\n");
+        s.push_str(&format!("+++ b/{p}\n", p = path));
+        s.push_str(&format!("@@ -0,0 +1,{n} @@\n"));
+        for line in after.lines() {
+            s.push('+');
+            s.push_str(line);
+            s.push('\n');
+        }
+        return Some(s);
+    }
+
+    let diff = TextDiff::from_lines(before, after);
+    let old_header = format!("a/{path}");
+    let new_header = format!("b/{path}");
+    let s = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&old_header, &new_header)
+        .to_string();
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// All built-in tools.

@@ -28,3 +28,4 @@ tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
 ratatui-markdown = "0.3"
 regex = "1"
 unicode-width = "0.2"
+similar = "3.1.1"

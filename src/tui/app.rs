@@ -201,7 +201,7 @@ impl App {
         self.active_think = Some(think_idx);
         self.sync_session();
         self.streaming = true;
-        self.status = format!("streaming · {}", self.provider.model);
+        self.status = "streaming".into();
         self.dirty = true;
 
         let provider = self.provider.clone();
@@ -241,7 +241,7 @@ impl App {
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
                 }
-                self.status = format!("streaming · {}", self.provider.model);
+                self.status = "streaming".into();
                 self.dirty = true;
             }
             StreamEvent::Done => {
@@ -282,6 +282,9 @@ impl App {
             }
             StreamEvent::ToolCall { name, arguments } => {
                 let preview = args_preview(&arguments);
+                // Pull path / read window out of the args for the `← Edit` /
+                // `→ Read` summaries.
+                let (path, read_offset, read_limit) = tool_path_window(&arguments);
                 // Ensure an active thinking cell exists, then add the tool.
                 let idx = if let Some(i) = self.active_think {
                     i
@@ -292,7 +295,7 @@ impl App {
                     i
                 };
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
-                    tc.add_tool(&name, &preview);
+                    tc.add_tool(&name, &preview, path, read_offset, read_limit);
                 }
                 self.dirty = true;
             }
@@ -313,7 +316,7 @@ impl App {
                 }
                 if !updated {
                     let mut tc = ThinkingCell::new();
-                    tc.add_tool(&name, "");
+                    tc.add_tool(&name, "", None, None, None);
                     tc.finish_tool(Some(output), is_error, diff);
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
@@ -1102,6 +1105,25 @@ impl App {
             wizard.draw(f, area);
         }
     }
+}
+
+/// Extract the file `path` and optional read `offset`/`limit` from a tool's
+/// JSON arguments, for the `← Edit` / `→ Read` card summaries.
+fn tool_path_window(arguments: &str) -> (Option<String>, Option<usize>, Option<usize>) {
+    let v: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(_) => return (None, None, None),
+    };
+    let map = match v.as_object() {
+        Some(m) => m,
+        None => return (None, None, None),
+    };
+    let path = map
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    let num = |k: &str| map.get(k).and_then(|n| n.as_u64()).map(|n| n as usize);
+    (path, num("offset"), num("limit"))
 }
 
 fn args_preview(arguments: &str) -> String {

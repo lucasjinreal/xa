@@ -6,6 +6,7 @@
 //! without any built-in/hardcoded provider URLs.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::Write;
 
@@ -379,7 +380,29 @@ pub async fn run_conversation(
 ) {
     loop {
         // Clone the current history so no mutex guard is held across an await.
-        let snapshot = history.lock().unwrap().clone();
+        let mut snapshot = history.lock().unwrap().clone();
+        // Inject a minimal system prompt every turn so the model knows its
+        // identity, environment and current time — even on a resumed session
+        // or after `/new`. Tools are already declared via the API `tools`
+        // array, so we keep this tiny. Prepended to the *snapshot* only, so it
+        // never accumulates duplicates inside `history`.
+        let cwd = env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let system_content = format!(
+            "You are xa, a coding agent. Current time: {now}. Working directory: {cwd}."
+        );
+        if snapshot.first().map(|m| m.role.as_str()) != Some("system") {
+            snapshot.insert(
+                0,
+                ChatMessage {
+                    role: "system".into(),
+                    content: system_content,
+                    ..Default::default()
+                },
+            );
+        }
         match stream_completion(provider, &snapshot, tools, &tx).await {
             Ok((text, calls)) => {
                 if calls.is_empty() {
@@ -408,14 +431,30 @@ pub async fn run_conversation(
                         .get("path")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let (output, is_error) = match crate::tools::call_tool(&tc.name, args, tools).await {
+                    let is_file_mut = tc.name == "edit" || tc.name == "write";
+                    // Snapshot the file *before* the tool runs so we can show a
+                    // minimal diff of exactly what changed (works whether or not
+                    // the file is tracked by git).
+                    let before = if is_file_mut {
+                        path.as_deref().and_then(|p| std::fs::read_to_string(p).ok())
+                    } else {
+                        None
+                    };
+                    let (mut output, is_error) = match crate::tools::call_tool(&tc.name, args, tools).await {
                         Ok(o) => (o, false),
                         Err(e) => (e, true),
                     };
-                    // For file-mutating tools, capture a diff so the user sees
-                    // exactly what changed.
-                    let diff = if (tc.name == "edit" || tc.name == "write") && !is_error {
-                        path.as_deref().and_then(crate::tools::git_diff_of)
+                    // Cap what we feed back to the model (and the TUI) so a
+                    // chatty tool (grep/read/bash) can't blow the context window.
+                    output = cap_tool_output(output);
+                    // For file-mutating tools, capture a minimal diff so the user
+                    // sees exactly what changed — not the whole file.
+                    let diff = if is_file_mut && !is_error {
+                        path.as_deref().and_then(|p| {
+                            std::fs::read_to_string(p).ok().and_then(|after| {
+                                crate::tools::unified_diff(p, before.as_deref().unwrap_or(""), &after)
+                            })
+                        })
                     } else {
                         None
                     };
@@ -566,4 +605,27 @@ async fn stream_completion(
 fn prune_calls(mut calls: Vec<ToolCallRepr>) -> Vec<ToolCallRepr> {
     calls.retain(|c| !c.name.is_empty());
     calls
+}
+
+/// Hard cap on tool output returned to the model. Keeps grep/read/bash from
+/// flooding the conversation history with thousands of lines. The TUI also
+/// receives the capped text, so it never has to render a giant blob.
+const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
+
+fn cap_tool_output(out: String) -> String {
+    if out.len() <= MAX_TOOL_OUTPUT_CHARS {
+        return out;
+    }
+    let lines = out.lines().count();
+    let mut end = MAX_TOOL_OUTPUT_CHARS;
+    while end > 0 && !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = out[..end].lines().count();
+    let truncated = out[..end].to_string();
+    format!(
+        "{truncated}\n…(output truncated: {cut}/{lines} lines, {} of {} chars shown)",
+        truncated.len(),
+        out.len()
+    )
 }

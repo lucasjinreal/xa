@@ -73,25 +73,6 @@ fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
 
-/// Color a single unified-diff line (no terminal color codes — we add our own).
-/// `+` additions green, `-` deletions red, hunk/`diff` metadata dimmed.
-fn diff_line_style(line: &str) -> Style {
-    let s = match line.chars().next() {
-        Some('+') if !line.starts_with("+++") => {
-            Style::default().fg(Color::Rgb(90, 210, 130))
-        }
-        Some('-') if !line.starts_with("---") => {
-            Style::default().fg(Color::Rgb(225, 110, 110))
-        }
-        Some('@') => Style::default().fg(Color::Rgb(120, 170, 255)),
-        Some('d') if line.starts_with("diff ") => {
-            Style::default().fg(Color::Rgb(150, 150, 170))
-        }
-        _ => Style::default().fg(Color::Rgb(150, 150, 150)),
-    };
-    s
-}
-
 /// One self-contained transcript entry.
 pub trait HistoryCell {
     /// Height in rows this cell needs at `width`.
@@ -216,6 +197,12 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// Left indent of thinking content: text blocks and tool-call headers align
+/// here, so the whole assistant turn reads as one indented column.
+const THINK_INDENT: u16 = 2;
+/// Extra indent for content nested *under* a tool card (diff / read meta).
+const TOOL_BODY_INDENT: u16 = 4;
+
 pub struct ToolCallCell {
     pub tool_name: String,
     pub args_preview: String,
@@ -224,6 +211,12 @@ pub struct ToolCallCell {
     /// A unified `git diff` (no color codes) for file-mutating tools.
     pub diff: Option<String>,
     pub expanded: bool,
+    /// Target path for read/edit/write tools (for the `← Edit` / `→ Read`
+    /// summary headers).
+    pub path: Option<String>,
+    /// Requested `offset`/`limit` for read tools (shown in the `→ Read` header).
+    pub read_offset: Option<usize>,
+    pub read_limit: Option<usize>,
 }
 
 impl ToolCallCell {
@@ -246,13 +239,31 @@ impl ToolCallCell {
             _ => spans.push(Span::styled(summary, Style::default().fg(color))),
         }
         let toggle = if self.output.is_some() || self.diff.is_some() {
-            if self.expanded {
-                "  ▾"
+            let hint = if self.expanded {
+                "  ▾".to_string()
             } else {
-                "  ▸"
-            }
+                // Collapsed: hide the bulk, show only a one-line summary so
+                // the user knows what's there without dumping content
+                // (DESIGN.md §7: long output is truncated + "see more", not
+                // shown by default). grep/bash/... get a count; edits get a
+                // change summary.
+                let n = if let Some(d) = self.diff.as_deref() {
+                    format!("  ▸ {}", diff_change_summary(d))
+                } else if let Some(o) = self.output.as_deref() {
+                    let c = o.lines().count();
+                    if self.tool_name == "grep" {
+                        format!("  ▸ {c} matches")
+                    } else {
+                        format!("  ▸ {c} lines")
+                    }
+                } else {
+                    "  ▸".to_string()
+                };
+                n
+            };
+            hint
         } else {
-            ""
+            "".to_string()
         };
         if !toggle.is_empty() {
             spans.push(Span::styled(
@@ -265,62 +276,221 @@ impl ToolCallCell {
 
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
         let mut rows = vec![Row {
-            x: 0,
-            w: width,
+            x: THINK_INDENT,
+            w: width.saturating_sub(THINK_INDENT),
             line: self.header_line(ctx),
         }];
         if self.expanded {
-            let x = 4u16;
-            let w = width.saturating_sub(4);
-            // Prefer a colorful git diff for file-mutating tools; it shows the
-            // user exactly what changed (DESIGN.md: "each edit/add prints git
-            // diff colorful").
-            if let Some(diff) = self.diff.as_deref() {
-                let limit = 60;
-                let all: Vec<&str> = diff.lines().collect();
-                let (lines, truncated) = if all.len() > limit {
-                    (all[..limit].to_vec(), true)
-                } else {
-                    (all, false)
-                };
-                for l in lines {
-                    rows.push(Row {
-                        x,
-                        w,
-                        line: Line::from(Span::styled(l.to_string(), diff_line_style(l))),
-                    });
+            let x = TOOL_BODY_INDENT;
+            let w = width.saturating_sub(TOOL_BODY_INDENT);
+            match self.tool_name.as_str() {
+                "read" => {
+                    // Reads don't dump the file; show a compact `→ Read` header
+                    // with the requested window instead of raw content.
+                    if let Some(p) = self.path.as_deref() {
+                        rows.push(Row {
+                            x,
+                            w,
+                            line: Line::from(Span::styled(
+                                format!("→ Read {}", p),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                        });
+                    }
+                    if self.read_offset.is_some() || self.read_limit.is_some() {
+                        let off = self.read_offset.map(|n| n as i64).unwrap_or(1);
+                        let lim = self.read_limit.map(|n| n as i64).unwrap_or(-1);
+                        rows.push(Row {
+                            x,
+                            w,
+                            line: Line::from(Span::styled(
+                                format!("  [offset={}, limit={}]", off, lim),
+                                Style::default().fg(Color::Rgb(150, 150, 170)),
+                            )),
+                        });
+                    }
                 }
-                if truncated {
-                    rows.push(Row {
-                        x,
-                        w,
-                        line: Line::from(Span::styled(
-                            "…(truncated)".to_string(),
-                            Style::default().fg(Color::Rgb(150, 150, 150)),
-                        )),
-                    });
-                }
-            } else if let Some(out) = self.output.as_deref() {
-                let shown: String = if out.lines().count() > 20 {
-                    out.lines().take(20).collect::<Vec<_>>().join("\n") + "\n…(truncated)"
-                } else {
-                    out.to_string()
-                };
-                let color = if self.status == ToolStatus::Failed {
-                    Color::Rgb(220, 120, 120)
-                } else {
-                    Color::Rgb(150, 150, 150)
-                };
-                for l in shown.lines() {
-                    rows.push(Row {
-                        x,
-                        w,
-                        line: Line::from(Span::styled(l.to_string(), Style::default().fg(color))),
-                    });
+                _ => {
+                    // Prefer a colorful, line-numbered edit view for
+                    // file-mutating tools (DESIGN.md §7: "each edit/add prints
+                    // git diff colorful").
+                    if let Some(diff) = self.diff.as_deref() {
+                        let label = if diff_is_new_file(diff) {
+                            "← New file"
+                        } else {
+                            "← Edit"
+                        };
+                        let mut shown = build_diff_rows(diff, x, w, label);
+                        let limit = 60;
+                        if shown.len() > limit {
+                            shown.truncate(limit);
+                            shown.push(Row {
+                                x,
+                                w,
+                                line: Line::from(Span::styled(
+                                    "…(truncated)".to_string(),
+                                    Style::default().fg(Color::Rgb(150, 150, 150)),
+                                )),
+                            });
+                        }
+                        rows.append(&mut shown);
+                    } else if let Some(out) = self.output.as_deref() {
+                        let all: Vec<&str> = out.lines().collect();
+                        // Keep the expanded preview tiny: the bulk is hidden by
+                        // default, this is just a peek. Content is also capped
+                        // upstream before it ever reaches the TUI.
+                        let limit = 5;
+                        let shown: String = if all.len() > limit {
+                            format!("{}\n…({} more lines, expand to view)", all[..limit].join("\n"), all.len() - limit)
+                        } else {
+                            out.to_string()
+                        };
+                        let color = if self.status == ToolStatus::Failed {
+                            Color::Rgb(220, 120, 120)
+                        } else {
+                            Color::Rgb(150, 150, 150)
+                        };
+                        for l in shown.lines() {
+                            rows.push(Row {
+                                x,
+                                w,
+                                line: Line::from(Span::styled(
+                                    l.to_string(),
+                                    Style::default().fg(color),
+                                )),
+                            });
+                        }
+                    }
                 }
             }
         }
         rows
+    }
+}
+
+/// Parse a unified `git diff` into a compact, line-numbered edit view:
+/// a `<header_label> <path>` header followed by each changed line prefixed
+/// with its line number and a `-`/`+` marker. `header_label` is "← Edit" for
+/// an edit to a tracked file or "← New file" for an untracked/new file, so a
+/// full-file addition is never misread as a "full rewrite" of an existing one.
+fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut old_ln: usize = 0;
+    let mut new_ln: usize = 0;
+    for raw in diff.lines() {
+        if raw.starts_with("diff --git")
+            || raw.starts_with("index ")
+            || raw.starts_with("new file mode")
+            || raw.starts_with("old mode")
+            || raw.starts_with("deleted file mode")
+            || raw.starts_with("Binary files")
+            || raw.starts_with("--- ")
+        {
+            continue;
+        }
+        if raw.starts_with("+++ ") {
+            let p = raw[4..].trim_start();
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            let p = p.strip_prefix("./").unwrap_or(p);
+            rows.push(Row {
+                x,
+                w,
+                line: Line::from(Span::styled(
+                    format!("{} {}", header_label, p),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            });
+            continue;
+        }
+        if raw.starts_with("@@") {
+            if let Some((old, new)) = parse_hunk_header(raw) {
+                old_ln = old;
+                new_ln = new;
+            }
+            continue;
+        }
+        let (sign, content, ln) = match raw.chars().next() {
+            Some('-') => ("-", &raw[1..], old_ln),
+            Some('+') => ("+", &raw[1..], new_ln),
+            Some(' ') => (" ", &raw[1..], new_ln),
+            _ => ("", raw, new_ln),
+        };
+        match raw.chars().next() {
+            Some('-') => old_ln += 1,
+            Some('+') => new_ln += 1,
+            Some(' ') => {
+                old_ln += 1;
+                new_ln += 1;
+            }
+            _ => {}
+        }
+        let color = match sign {
+            "-" => Color::Rgb(225, 110, 110),
+            "+" => Color::Rgb(90, 210, 130),
+            _ => Color::Rgb(150, 150, 150),
+        };
+        rows.push(Row {
+            x,
+            w,
+            line: Line::from(vec![
+                Span::styled(
+                    format!("{:>4} ", ln),
+                    Style::default().fg(Color::Rgb(110, 110, 130)),
+                ),
+                Span::styled(format!("{} ", sign), Style::default().fg(color)),
+                Span::styled(content.to_string(), Style::default().fg(color)),
+            ]),
+        });
+    }
+    rows
+}
+
+/// Parse the line numbers out of a hunk header like `@@ -204,7 +204,7 @@`.
+fn parse_hunk_header(h: &str) -> Option<(usize, usize)> {
+    let mut parts = h.split_whitespace();
+    let _ = parts.next(); // "@@"
+    let old = parts.next()?;
+    let new = parts.next()?;
+    let old_n = old
+        .trim_start_matches('-')
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    let new_n = new
+        .trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((old_n, new_n))
+}
+
+/// True when the diff is the *creation* of a new/untracked file rather than an
+/// edit to an existing one. `git diff --no-index /dev/null <path>` (xa's
+/// fallback for untracked files) emits `--- /dev/null`, and a tracked new file
+/// emits `new file mode`. In both cases the entire file shows as `+`, which is
+/// expected — we just mustn't label it "Edit" (that would imply a full rewrite
+/// of an existing file).
+fn diff_is_new_file(diff: &str) -> bool {
+    diff.contains("--- /dev/null") || diff.contains("new file mode")
+}
+
+/// Short summary of how many lines changed, for the collapsed tool header
+/// (e.g. "3 changed"). Counts added/removed lines; context lines are ignored.
+fn diff_change_summary(diff: &str) -> String {
+    let added = diff.lines().filter(|l| l.starts_with('+')).count();
+    let removed = diff.lines().filter(|l| l.starts_with('-')).count();
+    if diff_is_new_file(diff) {
+        format!("{added} new lines")
+    } else if removed == 0 {
+        format!("{added} added")
+    } else {
+        format!("{added}↑ / {removed}↓")
     }
 }
 
@@ -381,7 +551,14 @@ impl ThinkingCell {
     }
 
     /// Add a freshly-started tool-call card.
-    pub fn add_tool(&mut self, name: &str, preview: &str) {
+    pub fn add_tool(
+        &mut self,
+        name: &str,
+        preview: &str,
+        path: Option<String>,
+        read_offset: Option<usize>,
+        read_limit: Option<usize>,
+    ) {
         self.blocks.push(ThinkBlock::Tool(ToolCallCell {
             tool_name: name.to_string(),
             args_preview: preview.to_string(),
@@ -389,6 +566,9 @@ impl ThinkingCell {
             output: None,
             diff: None,
             expanded: false,
+            path,
+            read_offset,
+            read_limit,
         }));
     }
 
@@ -404,8 +584,9 @@ impl ThinkingCell {
                     };
                     t.output = output;
                     t.diff = diff;
-                    // Auto-expand on failure, or whenever we have a diff to show.
-                    t.expanded = is_error || t.diff.is_some();
+                    // Auto-expand on failure, when we have a diff to show, or for
+                    // reads (so the `→ Read` header is visible).
+                    t.expanded = is_error || t.diff.is_some() || t.tool_name == "read";
                     return;
                 }
             }
