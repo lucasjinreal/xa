@@ -455,16 +455,23 @@ impl ToolCallCell {
             Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
         ));
         
-        // Args: trim if too long, use dimmer white
-        let max_args_len = 60;
-        let args_display = if self.args_preview.len() > max_args_len {
-            let trimmed = &self.args_preview[..max_args_len];
-            format!("{}...)", trimmed)
+        // For edit/write tools, show the file path; otherwise show args preview
+        let is_edit_write = self.tool_name == "edit" || self.tool_name == "write";
+        let display_text = if is_edit_write {
+            self.path.as_deref().unwrap_or(&self.args_preview).to_string()
         } else {
-            format!("{})", self.args_preview)
+            self.args_preview.clone()
         };
         
-        let args_style = if self.args_preview.len() > max_args_len {
+        let max_display_len = 60;
+        let args_display = if display_text.len() > max_display_len {
+            let trimmed = &display_text[..max_display_len];
+            format!("{}...)", trimmed)
+        } else {
+            format!("{})", display_text)
+        };
+        
+        let args_style = if display_text.len() > max_display_len {
             Style::default().fg(theme::TEXT_HINT) // Even dimmer for trimmed
         } else {
             Style::default().fg(theme::TEXT_DIM) // Dimmer white for normal args
@@ -603,11 +610,9 @@ impl ToolCallCell {
 }
 
 /// Parse a unified `git diff` into a compact, line-numbered edit view:
-/// a `<header_label> <path>` header followed by each changed line prefixed
-/// with its line number and a `-`/`+` marker. `header_label` is "← Edit" for
-/// an edit to a tracked file or "← New file" for an untracked/new file, so a
-/// full-file addition is never misread as a "full rewrite" of an existing one.
-fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
+/// each changed line is shown with its line number and a colored background
+/// (green for additions, red for deletions) — no `+`/`-` prefix characters.
+fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut old_ln: usize = 0;
     let mut new_ln: usize = 0;
@@ -619,23 +624,8 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
             || raw.starts_with("deleted file mode")
             || raw.starts_with("Binary files")
             || raw.starts_with("--- ")
+            || raw.starts_with("+++ ")
         {
-            continue;
-        }
-        if raw.starts_with("+++ ") {
-            let p = raw[4..].trim_start();
-            let p = p.strip_prefix("b/").unwrap_or(p);
-            let p = p.strip_prefix("./").unwrap_or(p);
-            rows.push(Row {
-                x,
-                w,
-                line: Line::from(Span::styled(
-                    format!("{} {}", header_label, p),
-                    Style::default()
-                        .fg(theme::WARNING)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            });
             continue;
         }
         if raw.starts_with("@@") {
@@ -660,21 +650,34 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, header_label: &str) -> Vec<Row> {
             }
             _ => {}
         }
-        let color = match sign {
-            "-" => theme::DIFF_DEL,
-            "+" => theme::DIFF_ADD,
-            _ => theme::DIFF_META,
+        let (fg, bg) = match sign {
+            "-" => (theme::DIFF_DEL, theme::DIFF_DEL_BG),
+            "+" => (theme::DIFF_ADD, theme::DIFF_ADD_BG),
+            _ => (theme::DIFF_META, Color::Reset),
+        };
+        let ln_style = if sign == " " || sign == "" {
+            Style::default().fg(theme::TEXT_HINT)
+        } else {
+            Style::default().fg(fg).bg(bg)
+        };
+        let content_style = if sign == " " || sign == "" {
+            Style::default().fg(theme::DIFF_META)
+        } else {
+            Style::default().fg(fg).bg(bg)
+        };
+        let ln_width = 5;
+        let content_w = (w as usize).saturating_sub(ln_width);
+        let padded_content = if content.len() < content_w {
+            format!("{:<width$}", content, width = content_w)
+        } else {
+            content.to_string()
         };
         rows.push(Row {
             x,
             w,
             line: Line::from(vec![
-                Span::styled(
-                    format!("{:>4} ", ln),
-                    Style::default().fg(theme::TEXT_HINT),
-                ),
-                Span::styled(format!("{} ", sign), Style::default().fg(color)),
-                Span::styled(content.to_string(), Style::default().fg(color)),
+                Span::styled(format!("{:>4} ", ln), ln_style),
+                Span::styled(padded_content, content_style),
             ]),
         });
     }

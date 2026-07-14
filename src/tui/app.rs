@@ -109,6 +109,8 @@ pub struct App {
     /// Paste blocks: multi-line pasted text shown as compact inline blocks
     /// (opencode/codex-style), deletable with one backspace.
     paste_blocks: Vec<String>,
+    /// Shared flag checked by the agent loop to support ESC-to-interrupt.
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -148,6 +150,7 @@ impl App {
             input_area_width: 80,
             wizard: None,
             paste_blocks: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -241,6 +244,7 @@ impl App {
         self.sync_session();
         self.streaming = true;
         self.think_filter.reset();
+        self.cancel_flag.store(false, Ordering::SeqCst);
         self.set_stream_phase(StreamPhase::Waiting);
         self.status.clear();
         self.dirty = true;
@@ -248,6 +252,7 @@ impl App {
         let provider = self.provider.clone();
         let event_tx = self.event_tx.clone();
         let agent_hist = self.agent_history.clone();
+        let cancel = self.cancel_flag.clone();
         let assistant_idx = think_idx as u32;
         tokio::spawn(async move {
             let (stx, mut srx) = mpsc::channel::<StreamEvent>(64);
@@ -260,7 +265,7 @@ impl App {
                 }
             });
             let tools = crate::tools::all_tools();
-            agent::run_conversation(&provider, agent_hist, stx, &tools).await;
+            agent::run_conversation(&provider, agent_hist, stx, &tools, cancel).await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::Done)).await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::InternalAssistIdx(assistant_idx))).await;
         });
@@ -639,6 +644,12 @@ impl App {
             return self.handle_slash_key(key);
         }
         match key.code {
+            KeyCode::Esc if self.streaming => {
+                self.cancel_flag.store(true, Ordering::SeqCst);
+                self.set_stream_phase(StreamPhase::Error);
+                self.status = "interrupted".into();
+                self.dirty = true;
+            }
             KeyCode::PageUp => {
                 self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_sub(5);

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use dirs::config_dir;
 use serde::{Deserialize, Serialize};
@@ -377,8 +379,13 @@ pub async fn run_conversation(
     history: std::sync::Arc<std::sync::Mutex<Vec<ChatMessage>>>,
     tx: mpsc::Sender<StreamEvent>,
     tools: &[std::sync::Arc<dyn crate::tools::Tool>],
+    cancel: Arc<AtomicBool>,
 ) {
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(StreamEvent::Done).await;
+            return;
+        }
         // Clone the current history so no mutex guard is held across an await.
         let mut snapshot = history.lock().unwrap().clone();
         // Inject a minimal system prompt every turn so the model knows its
@@ -403,8 +410,12 @@ pub async fn run_conversation(
                 },
             );
         }
-        match stream_completion(provider, &snapshot, tools, &tx).await {
+        match stream_completion(provider, &snapshot, tools, &tx, cancel.clone()).await {
             Ok((text, calls)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
+                }
                 if calls.is_empty() {
                     // Final answer (text already streamed) — signal completion.
                     let _ = tx.send(StreamEvent::Done).await;
@@ -419,6 +430,10 @@ pub async fn run_conversation(
                 });
                 // Execute each tool call and append the result message.
                 for tc in &calls {
+                    if cancel.load(Ordering::SeqCst) {
+                        let _ = tx.send(StreamEvent::Done).await;
+                        return;
+                    }
                     let _ = tx
                         .send(StreamEvent::ToolCall {
                             name: tc.name.clone(),
@@ -491,6 +506,7 @@ async fn stream_completion(
     messages: &[ChatMessage],
     tools: &[std::sync::Arc<dyn crate::tools::Tool>],
     tx: &mpsc::Sender<StreamEvent>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(String, Vec<ToolCallRepr>), String> {
     let client = reqwest::Client::new();
 
@@ -538,6 +554,9 @@ async fn stream_completion(
     let mut calls: Vec<ToolCallRepr> = Vec::new();
 
     while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok((text, prune_calls(calls)));
+        }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 

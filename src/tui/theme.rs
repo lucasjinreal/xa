@@ -47,3 +47,6 @@ pub const WARNING: Color = Color::Rgb(220, 170, 70);
 pub const DIFF_ADD: Color = Color::Rgb(100, 185, 120);
 pub const DIFF_DEL: Color = Color::Rgb(220, 115, 105);
 pub const DIFF_META: Color = Color::Rgb(120, 120, 120);
+/// Diff line background colors (subtle tints for changed lines).
+pub const DIFF_ADD_BG: Color = Color::Rgb(30, 50, 35);
+pub const DIFF_DEL_BG: Color = Color::Rgb(55, 30, 28);
