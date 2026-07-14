@@ -886,7 +886,7 @@ impl App {
             self.provider.model.clone()
         };
 
-        if area.width < 60 || area.height < 9 {
+        if area.width < 80 || area.height < 7 {
             let fallback = Line::from(vec![
                 Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled("xa", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
@@ -899,14 +899,12 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(28),
-                Constraint::Length(42),
-                Constraint::Min(0),
+                Constraint::Length(22),
+                Constraint::Length(18),
+                Constraint::Min(40),
             ])
             .split(area);
 
-        let version_line = format!("v{}", version);
-        let version_line_padded = format!("  {}", version_line);
         let logo_lines = vec![
             "  ██╗  ██╗ █████╗",
             "  ╚██╗██╔╝██╔══██╗",
@@ -914,25 +912,37 @@ impl App {
             "   ██╔██╗ ██╔══██║",
             "  ██╔╝ ██╗██║  ██║",
             "  ╚═╝  ╚═╝╚═╝  ╚═╝",
-            "",
-            "  XA Code Agent",
-            &version_line_padded,
         ];
 
         let logo_spans: Vec<Line> = logo_lines.iter().map(|line| {
-            if line.is_empty() {
-                Line::from("")
-            } else if line.contains("██") || line.contains("╚") || line.contains("╔") || line.contains("╝") || line.contains("╗") || line.contains("═") {
-                Line::from(Span::styled(*line, Style::default().fg(theme::ACCENT)))
-            } else if line.contains("XA Code Agent") {
-                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)))
-            } else {
-                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT_DIM)))
-            }
+            Line::from(Span::styled(*line, Style::default().fg(theme::ACCENT)))
         }).collect();
 
         let logo = Paragraph::new(logo_spans);
         f.render_widget(logo, chunks[0]);
+
+        let version_line = format!("v{}", version);
+        let version_padded = format!("  {}", version_line);
+        let name_lines = vec![
+            "",
+            "",
+            "  XA Code Agent",
+            &version_padded,
+            "",
+            "",
+            "",
+        ];
+        let name_spans: Vec<Line> = name_lines.iter().map(|line| {
+            if line.contains("XA Code Agent") {
+                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)))
+            } else if line.contains('v') && line.contains('.') {
+                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT_DIM)))
+            } else {
+                Line::from("")
+            }
+        }).collect();
+        let name_para = Paragraph::new(name_spans);
+        f.render_widget(name_para, chunks[1]);
 
         let box_w = 42usize;
         let cw = box_w.saturating_sub(2);
@@ -984,13 +994,6 @@ impl App {
                 Span::styled(format!("{}│", " ".repeat(line_pad)), border_style),
             ])
         };
-        let blank_line = || -> Line<'static> {
-            Line::from(vec![
-                Span::styled("│", border_style),
-                Span::styled(" ".repeat(cw), border_style),
-                Span::styled("│", border_style),
-            ])
-        };
 
         let title = "─ Session ";
         let title_w = unicode_width::UnicodeWidthStr::width(title);
@@ -1007,13 +1010,13 @@ impl App {
         ];
 
         let session = Paragraph::new(session_lines);
-        f.render_widget(session, chunks[1]);
+        f.render_widget(session, chunks[2]);
     }
 
     /// Render the short codex-style tip line beneath the header box.
     fn draw_tip(&self, f: &mut ratatui::Frame, area: Rect) {
         let tip = Line::from(vec![
-            Span::styled("Tip: ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("  Tip: ", Style::default().fg(theme::TEXT_DIM)),
             Span::styled(
                 "type `/` for the command menu, or just start chatting.",
                 Style::default().fg(theme::TEXT),
@@ -1140,7 +1143,7 @@ impl App {
         // while the view is pinned to the very top they are shown, but once the
         // user scrolls down into the transcript they scroll away and the full
         // height is handed to the conversation.
-        const HEADER_H: u16 = 9;
+        const HEADER_H: u16 = 7;
         const TIP_H: u16 = 2;
         const PRE: u16 = HEADER_H + TIP_H;
 
@@ -1393,7 +1396,7 @@ fn args_preview(arguments: &str) -> String {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                return format!("({})", s.chars().take(40).collect::<String>());
+                return s.chars().take(40).collect::<String>();
             }
         }
     }

@@ -77,16 +77,26 @@ fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
     out
 }
 
+/// ratatui-markdown only supports h1–h3; h4+ get misparsed as h3 with leading
+/// `#` in the text. Convert h4–h6 to bold so they render distinctly from
+/// regular paragraphs without stray hash marks.
+fn convert_h456_to_bold(text: &str) -> String {
+    text.replace("###### ", "**")
+        .replace("##### ", "**")
+        .replace("#### ", "**")
+}
+
 /// Normalize raw model text before markdown parse.
 ///
 /// - `\r\n` / bare `\r` → `\n`
 /// - collapse 3+ consecutive newlines to a double newline (one blank line)
+/// - convert h4–h6 headings to bold (library only supports h1–h3)
 fn normalize_md_source(text: &str) -> String {
     let mut s = text.replace("\r\n", "\n").replace('\r', "\n");
     while s.contains("\n\n\n") {
         s = s.replace("\n\n\n", "\n\n");
     }
-    s
+    convert_h456_to_bold(&s)
 }
 
 /// True when `s` is non-empty and only ASCII punctuation (e.g. `"?"`, `"..."`).
@@ -230,7 +240,9 @@ fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let mut blocks = renderer.parse(&src);
     join_paragraph_soft_breaks(&mut blocks);
     merge_orphan_punct_paragraphs(&mut blocks);
-    let lines = renderer.render(&blocks, &ThemeConfig::default());
+    let mut theme = ThemeConfig::default();
+    theme.muted_text_color = Color::Rgb(160, 160, 160);
+    let lines = renderer.render(&blocks, &theme);
     compact_md_lines(lines)
 }
 
@@ -418,54 +430,54 @@ impl ToolCallCell {
     pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
             ToolStatus::Running => ("▸", theme::ACCENT),
-            ToolStatus::Success => ("✓", theme::SUCCESS),
-            ToolStatus::Failed => ("✗", theme::ERROR),
+            ToolStatus::Success => ("▪", theme::TEXT),
+            ToolStatus::Failed => ("▪", theme::ERROR),
         };
+        
         let mut spans = vec![Span::styled(
-            format!(" {icon} "),
+            format!("{} ", icon),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )];
-        let summary = format!("{}  {}", self.tool_name, self.args_preview);
+        
+        // Capitalize tool name and make it bold white
+        let tool_name_cap = if self.tool_name.len() > 0 {
+            let mut chars = self.tool_name.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        } else {
+            self.tool_name.clone()
+        };
+        
+        spans.push(Span::styled(
+            format!("{}(", tool_name_cap),
+            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+        ));
+        
+        // Args: trim if too long, use dimmer white
+        let max_args_len = 60;
+        let args_display = if self.args_preview.len() > max_args_len {
+            let trimmed = &self.args_preview[..max_args_len];
+            format!("{}...)", trimmed)
+        } else {
+            format!("{})", self.args_preview)
+        };
+        
+        let args_style = if self.args_preview.len() > max_args_len {
+            Style::default().fg(theme::TEXT_HINT) // Even dimmer for trimmed
+        } else {
+            Style::default().fg(theme::TEXT_DIM) // Dimmer white for normal args
+        };
+        
         match ctx {
             Some(c) if self.status == ToolStatus::Running => {
-                let mut s = shimmer_spans(&summary, color, c.shimmer_phase);
+                let mut s = shimmer_spans(&args_display, color, c.shimmer_phase);
                 spans.append(&mut s);
             }
-            _ => spans.push(Span::styled(summary, Style::default().fg(color))),
+            _ => spans.push(Span::styled(args_display, args_style)),
         }
-        let toggle = if self.output.is_some() || self.diff.is_some() {
-            let hint = if self.expanded {
-                "  ▾".to_string()
-            } else {
-                // Collapsed: hide the bulk, show only a one-line summary so
-                // the user knows what's there without dumping content
-                // (DESIGN.md §7: long output is truncated + "see more", not
-                // shown by default). grep/bash/... get a count; edits get a
-                // change summary.
-                let n = if let Some(d) = self.diff.as_deref() {
-                    format!("  ▸ {}", diff_change_summary(d))
-                } else if let Some(o) = self.output.as_deref() {
-                    let c = o.lines().count();
-                    if self.tool_name == "grep" {
-                        format!("  ▸ {c} matches")
-                    } else {
-                        format!("  ▸ {c} lines")
-                    }
-                } else {
-                    "  ▸".to_string()
-                };
-                n
-            };
-            hint
-        } else {
-            "".to_string()
-        };
-        if !toggle.is_empty() {
-            spans.push(Span::styled(
-                toggle.to_string(),
-                Style::default().fg(theme::TEXT_DIM),
-            ));
-        }
+        
         Line::from(spans)
     }
 
@@ -475,92 +487,117 @@ impl ToolCallCell {
             w: width.saturating_sub(THINK_INDENT),
             line: self.header_line(ctx),
         }];
-        if self.expanded {
-            let x = TOOL_BODY_INDENT;
-            let w = width.saturating_sub(TOOL_BODY_INDENT);
-            match self.tool_name.as_str() {
-                "read" => {
-                    // Reads don't dump the file; show a compact `→ Read` header
-                    // with the requested window instead of raw content.
-                    if let Some(p) = self.path.as_deref() {
-                        rows.push(Row {
-                            x,
-                            w,
-                            line: Line::from(Span::styled(
-                                format!("→ Read {}", p),
-                                Style::default()
-                                    .fg(theme::ACCENT)
-                                    .add_modifier(Modifier::BOLD),
-                            )),
-                        });
-                    }
-                    if self.read_offset.is_some() || self.read_limit.is_some() {
-                        let off = self.read_offset.map(|n| n as i64).unwrap_or(1);
-                        let lim = self.read_limit.map(|n| n as i64).unwrap_or(-1);
-                        rows.push(Row {
-                            x,
-                            w,
-                            line: Line::from(Span::styled(
-                                format!("  [offset={}, limit={}]", off, lim),
+        
+        // Show output/summary below the header with tree prefix
+        let x = THINK_INDENT + 3; // Indent for tree branch
+        let w = width.saturating_sub(THINK_INDENT + 3);
+        
+        match self.tool_name.as_str() {
+            "read" => {
+                // Show "Read N lines" summary
+                if let Some(_p) = self.path.as_deref() {
+                    let line_count = if let Some(output) = &self.output {
+                        output.lines().count()
+                    } else {
+                        0
+                    };
+                    rows.push(Row {
+                        x,
+                        w,
+                        line: Line::from(vec![
+                            Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled(
+                                format!("Read {} lines", line_count),
                                 Style::default().fg(theme::TEXT_DIM),
-                            )),
+                            ),
+                        ]),
+                    });
+                }
+            }
+            "edit" | "write" => {
+                // Show git diff for edits
+                if let Some(diff) = self.diff.as_deref() {
+                    let label = if diff_is_new_file(diff) {
+                        "New file"
+                    } else {
+                        "Edit"
+                    };
+                    let mut shown = build_diff_rows(diff, x, w, label);
+                    let limit = 10;
+                    if shown.len() > limit {
+                        shown.truncate(limit);
+                        rows.push(Row {
+                            x,
+                            w,
+                            line: Line::from(vec![
+                                Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled(
+                                    format!("… +{} lines", shown.len() - limit),
+                                    Style::default().fg(theme::TEXT_HINT),
+                                ),
+                            ]),
                         });
                     }
+                    rows.append(&mut shown);
                 }
-                _ => {
-                    // Prefer a colorful, line-numbered edit view for
-                    // file-mutating tools (DESIGN.md §7: "each edit/add prints
-                    // git diff colorful").
-                    if let Some(diff) = self.diff.as_deref() {
-                        let label = if diff_is_new_file(diff) {
-                            "← New file"
-                        } else {
-                            "← Edit"
-                        };
-                        let mut shown = build_diff_rows(diff, x, w, label);
-                        let limit = 60;
-                        if shown.len() > limit {
-                            shown.truncate(limit);
-                            shown.push(Row {
-                                x,
-                                w,
-                                line: Line::from(Span::styled(
-                                    "…(truncated)".to_string(),
+            }
+            _ => {
+                // For bash/grep/other tools, show output with tree prefix
+                if let Some(out) = self.output.as_deref() {
+                    let lines: Vec<&str> = out.lines().collect();
+                    let max_lines = 3;
+                    let show_lines = if lines.len() > max_lines {
+                        &lines[..max_lines]
+                    } else {
+                        &lines
+                    };
+                    
+                    for (i, line) in show_lines.iter().enumerate() {
+                        let prefix = if i == 0 { "└ " } else { "  " };
+                        rows.push(Row {
+                            x,
+                            w,
+                            line: Line::from(vec![
+                                Span::styled(prefix, Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled(
+                                    line.to_string(),
                                     Style::default().fg(theme::TEXT_DIM),
-                                )),
-                            });
-                        }
-                        rows.append(&mut shown);
-                    } else if let Some(out) = self.output.as_deref() {
-                        let all: Vec<&str> = out.lines().collect();
-                        // Keep the expanded preview tiny: the bulk is hidden by
-                        // default, this is just a peek. Content is also capped
-                        // upstream before it ever reaches the TUI.
-                        let limit = 5;
-                        let shown: String = if all.len() > limit {
-                            format!("{}\n…({} more lines, expand to view)", all[..limit].join("\n"), all.len() - limit)
-                        } else {
-                            out.to_string()
-                        };
-                        let color = if self.status == ToolStatus::Failed {
-                            theme::ERROR
-                        } else {
-                            theme::TEXT_DIM
-                        };
-                        for l in shown.lines() {
-                            rows.push(Row {
-                                x,
-                                w,
-                                line: Line::from(Span::styled(
-                                    l.to_string(),
-                                    Style::default().fg(color),
-                                )),
-                            });
-                        }
+                                ),
+                            ]),
+                        });
                     }
+                    
+                    if lines.len() > max_lines {
+                        rows.push(Row {
+                            x,
+                            w,
+                            line: Line::from(vec![
+                                Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled(
+                                    format!("… +{} lines", lines.len() - max_lines),
+                                    Style::default().fg(theme::TEXT_HINT),
+                                ),
+                            ]),
+                        });
+                    }
+                } else if let Some(diff) = self.diff.as_deref() {
+                    // For edits with diff, show change summary
+                    let summary = diff_change_summary(diff);
+                    rows.push(Row {
+                        x,
+                        w,
+                        line: Line::from(vec![
+                            Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled(
+                                summary,
+                                Style::default().fg(theme::TEXT_DIM),
+                            ),
+                        ]),
+                    });
                 }
             }
         }
+        
         rows
     }
 }
@@ -835,7 +872,6 @@ impl ThinkingCell {
                 }
             }
         }
-        rows.push(Row::blank(width)); // bottom padding
         rows
     }
 }
