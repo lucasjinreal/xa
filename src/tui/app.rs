@@ -106,6 +106,9 @@ pub struct App {
     /// Active provider/model setup wizard (codex-style modal). While set,
     /// all keys are routed to it and it is drawn as a centered overlay.
     wizard: Option<Wizard>,
+    /// Paste blocks: multi-line pasted text shown as compact inline blocks
+    /// (opencode/codex-style), deletable with one backspace.
+    paste_blocks: Vec<String>,
 }
 
 impl App {
@@ -144,6 +147,7 @@ impl App {
             queued_inputs: std::collections::VecDeque::new(),
             input_area_width: 80,
             wizard: None,
+            paste_blocks: Vec::new(),
         }
     }
 
@@ -212,11 +216,13 @@ impl App {
         if text.starts_with('/') {
             self.handle_slash(&text);
             self.input = TextArea::default();
+            self.paste_blocks.clear();
             return;
         }
 
         self.push_cell(Box::new(UserCell { content: text.clone() }));
         self.input = TextArea::default();
+        self.paste_blocks.clear();
         self.scroll = u16::MAX;
         self.auto_scroll = true;
 
@@ -448,11 +454,39 @@ impl App {
         self.input.lines().iter().all(|l| l.is_empty())
     }
 
-    /// Recover the logical input text. Soft-wrap line breaks inserted by
-    /// [`Self::reflow_input`] carry no characters, so concatenating the lines
-    /// losslessly reproduces what the user typed (paste newlines are folded).
+    /// Recover the logical input text, including paste block content.
+    /// Soft-wrap line breaks carry no characters, so concatenating the lines
+    /// losslessly reproduces what the user typed.
     fn input_text(&self) -> String {
-        self.input.lines().concat().trim().to_string()
+        let mut parts: Vec<String> = self.paste_blocks.clone();
+        let text = self.input.lines().concat().trim().to_string();
+        if !text.is_empty() {
+            parts.push(text);
+        }
+        parts.join("\n")
+    }
+
+    /// Handle a bracketed paste event from the terminal.
+    /// Multi-line pastes become a deletable block (opencode/codex-style);
+    /// single-line pastes are inserted directly into the textarea.
+    fn handle_paste(&mut self, text: String) {
+        if text.contains('\n') {
+            let trimmed = text.trim_end_matches('\n').to_string();
+            if !trimmed.is_empty() {
+                self.paste_blocks.push(trimmed);
+                self.dirty = true;
+            }
+        } else if !text.is_empty() {
+            for c in text.chars() {
+                self.input.input(Input {
+                    key: Key::Char(c),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
+            }
+            self.dirty = true;
+        }
     }
 
     /// Display width of a single character, treating wide/CJK glyphs as 2 cols.
@@ -582,7 +616,8 @@ impl App {
             // If the composer is empty, Ctrl-C quits immediately. Otherwise the
             // first press clears the input and a second within 1s quits.
             let has_text = self.input.lines().iter().any(|l| !l.trim().is_empty());
-            if !has_text {
+            let has_blocks = !self.paste_blocks.is_empty();
+            if !has_text && !has_blocks {
                 return Ok(true);
             }
             let now = Instant::now();
@@ -595,6 +630,7 @@ impl App {
             }
             self.last_ctrl_c = Some(now);
             self.input = TextArea::default();
+            self.paste_blocks.clear();
             self.status = "press Ctrl-C again to exit".into();
             self.dirty = true;
             return Ok(false);
@@ -631,6 +667,7 @@ impl App {
                 self.slash_mode = true;
                 self.slash_query.clear();
                 self.slash_selected = 0;
+                self.paste_blocks.clear();
                 self.dirty = true;
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -640,6 +677,7 @@ impl App {
                     if !text.is_empty() {
                         self.queued_inputs.push_back(text);
                         self.input = TextArea::default();
+                        self.paste_blocks.clear();
                         self.status = format!("queued · {} pending", self.queued_inputs.len());
                         self.dirty = true;
                     }
@@ -650,6 +688,9 @@ impl App {
                     self.history.push(text.clone());
                     self.history_idx = None;
                     self.submit(text);
+                } else if !self.paste_blocks.is_empty() {
+                    self.paste_blocks.clear();
+                    self.dirty = true;
                 }
             }
             KeyCode::Tab if self.streaming => {
@@ -657,9 +698,18 @@ impl App {
                 if !text.is_empty() {
                     self.queued_inputs.push_back(text);
                     self.input = TextArea::default();
+                    self.paste_blocks.clear();
                     self.status = format!("queued · {} pending", self.queued_inputs.len());
                     self.dirty = true;
                 }
+            }
+            KeyCode::Backspace
+                if self.input_is_empty()
+                    && self.input.lines().len() <= 1
+                    && !self.paste_blocks.is_empty() =>
+            {
+                self.paste_blocks.pop();
+                self.dirty = true;
             }
             _ => {
                 self.history_idx = None;
@@ -1115,8 +1165,9 @@ impl App {
         // the input block can grow vertically with the wrapped line count.
         let wrapped = self.wrapped_input();
         let input_lines = wrapped.lines().len().max(1) as u16;
+        let paste_block_rows = self.paste_blocks.len() as u16;
         // One blank padding row above and below the text; grows with content.
-        let input_h = (input_lines + 2).clamp(3, 14);
+        let input_h = (input_lines + paste_block_rows + 2).clamp(3, 14);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1248,6 +1299,53 @@ impl App {
         // matching UserCell. Pad left enough for the icon so typed text lines
         // up under (and with) the transcript user messages.
         let input_bg = theme::INPUT_BG;
+
+        // Fill entire input area with background (covers paste block rows too).
+        f.buffer_mut()
+            .set_style(input_area, Style::default().bg(input_bg));
+
+        // Render paste blocks as compact inline summaries (opencode/codex-style).
+        let paste_block_rows = self.paste_blocks.len() as u16;
+        for (i, block_text) in self.paste_blocks.iter().enumerate() {
+            let row_y = input_area.top() + i as u16;
+            if row_y >= input_area.bottom() {
+                break;
+            }
+            let line_count = block_text.lines().count();
+            let summary = format!(
+                "  \u{2398} Pasted text \u{00b7} {} line{} \u{2399}",
+                line_count,
+                if line_count == 1 { "" } else { "s" }
+            );
+            let style = Style::default()
+                .fg(theme::ACCENT)
+                .bg(theme::SURFACE);
+            let row_area = Rect {
+                x: input_area.left(),
+                y: row_y,
+                width: input_area.width,
+                height: 1,
+            };
+            f.buffer_mut().set_style(row_area, style);
+            f.buffer_mut().set_stringn(
+                row_area.x + 1,
+                row_area.y,
+                &summary,
+                (input_area.width as usize).saturating_sub(2),
+                style,
+            );
+        }
+
+        // Textarea sits below paste block rows within the input area.
+        let text_area_top = input_area.top() + paste_block_rows;
+        let text_area_height = input_area.height.saturating_sub(paste_block_rows).max(1);
+        let text_area = Rect {
+            x: input_area.x,
+            y: text_area_top,
+            width: input_area.width,
+            height: text_area_height,
+        };
+
         let input_block = Block::default()
             .borders(Borders::NONE)
             .padding(Padding::new(1 + USER_LEAD_COLS, 1, 1, 1))
@@ -1263,25 +1361,28 @@ impl App {
         );
         wrapped.set_cursor_line_style(Style::default().bg(input_bg));
         // Placeholder hint when empty and not streaming.
-        if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) && !self.streaming {
-            wrapped.set_placeholder_text("Type a message, or / for commands…");
+        if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true)
+            && !self.streaming
+            && self.paste_blocks.is_empty()
+        {
+            wrapped.set_placeholder_text("Type a message, or / for commands\u{2026}");
             wrapped.set_placeholder_style(Style::default().fg(theme::TEXT_DIM).bg(input_bg));
         }
         // Render the soft-wrapped copy (already built above) so long input
         // grows vertically instead of overflowing; the editable buffer itself
         // is never mutated.
-        f.render_widget(&wrapped, input_area);
+        f.render_widget(&wrapped, text_area);
 
         // Paint the shared `❯` lead in the left pad of the first content row
         // (same glyph + style family as UserCell).
-        if input_area.height > 2 && input_area.width > 1 + USER_LEAD_COLS {
+        if text_area.height >= 2 && text_area.width > 1 + USER_LEAD_COLS {
             let lead_style = Style::default()
                 .fg(theme::INPUT_LEAD)
                 .bg(input_bg)
                 .add_modifier(Modifier::BOLD);
             f.buffer_mut().set_stringn(
-                input_area.left() + 1,
-                input_area.top() + 1,
+                text_area.left() + 1,
+                text_area.top() + 1,
                 USER_PROMPT,
                 USER_PROMPT.chars().count(),
                 lead_style,
@@ -1461,7 +1562,8 @@ pub async fn run(
     crossterm::execute!(
         stdout,
         terminal::EnterAlternateScreen,
-        crossterm::cursor::Hide
+        crossterm::cursor::Hide,
+        crossterm::event::EnableBracketedPaste
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1562,6 +1664,9 @@ pub async fn run(
                             break;
                         }
                     }
+                    AppEvent::Terminal(crossterm::event::Event::Paste(text)) => {
+                        app.handle_paste(text);
+                    }
                     AppEvent::Terminal(crossterm::event::Event::Mouse(m)) => app.handle_mouse(m),
                     AppEvent::Terminal(_) => {}
                     AppEvent::Stream(se) => app.handle_stream(se),
@@ -1593,7 +1698,8 @@ pub async fn run(
     terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
-        terminal::LeaveAlternateScreen
+        terminal::LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     Ok(())
