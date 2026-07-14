@@ -16,7 +16,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
-use ratatui_markdown::{markdown::MarkdownRenderer, theme::ThemeConfig};
+use ratatui_markdown::{
+    markdown::{MarkdownBlock, MarkdownRenderer},
+    theme::ThemeConfig,
+};
+
+use crate::tui::render::RenderContext;
+use crate::tui::shimmer::shimmer_spans;
+use crate::tui::theme;
 
 /// A single drawable row inside a cell. `x`/`w` are offsets relative to the
 /// cell's left edge (which is always the transcript's left edge), so the same
@@ -70,9 +77,162 @@ fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
     out
 }
 
-use crate::tui::render::RenderContext;
-use crate::tui::shimmer::shimmer_spans;
-use crate::tui::theme;
+/// Normalize raw model text before markdown parse.
+///
+/// - `\r\n` / bare `\r` → `\n`
+/// - collapse 3+ consecutive newlines to a double newline (one blank line)
+fn normalize_md_source(text: &str) -> String {
+    let mut s = text.replace("\r\n", "\n").replace('\r', "\n");
+    while s.contains("\n\n\n") {
+        s = s.replace("\n\n\n", "\n\n");
+    }
+    s
+}
+
+/// True when `s` is non-empty and only ASCII punctuation (e.g. `"?"`, `"..."`).
+fn only_ascii_punct(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_punctuation())
+}
+
+/// `ratatui-markdown` keeps every source line of a paragraph as a separate
+/// render line, so a single soft newline becomes a hard visual break. CommonMark
+/// treats those as soft breaks (a space). Join multi-line paragraphs (and
+/// nested blockquote paragraphs) before wrapping.
+///
+/// Hard breaks (two trailing spaces before the newline) are preserved as `\n`.
+/// A next line that is only punctuation is glued without a space (`today` +
+/// `?` → `today?`) so model soft-wraps don't leave a lone `?` on the next row.
+fn join_paragraph_soft_breaks(blocks: &mut [MarkdownBlock]) {
+    for block in blocks {
+        match block {
+            MarkdownBlock::Paragraph(lines) if lines.len() > 1 => {
+                let mut joined = String::new();
+                for (i, raw) in lines.iter().enumerate() {
+                    if i == 0 {
+                        joined.push_str(raw.trim_end());
+                        continue;
+                    }
+                    let prev_hard = lines[i - 1].ends_with("  ");
+                    let piece = raw.trim_start();
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    if prev_hard {
+                        joined.push('\n');
+                        joined.push_str(piece.trim_end());
+                    } else if only_ascii_punct(piece) {
+                        // glue punctuation onto the previous word
+                        joined.push_str(piece.trim_end());
+                    } else {
+                        if !joined.is_empty()
+                            && !joined.ends_with(|c: char| c.is_whitespace())
+                        {
+                            joined.push(' ');
+                        }
+                        joined.push_str(piece.trim_end());
+                    }
+                }
+                *lines = vec![joined];
+            }
+            MarkdownBlock::Blockquote { children, .. } => {
+                join_paragraph_soft_breaks(children);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn line_is_blank(l: &Line<'_>) -> bool {
+    l.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// Keep at most one blank line between content blocks; drop leading/trailing.
+fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut prev_blank = true; // suppress leading blanks
+    for line in lines {
+        let blank = line_is_blank(&line);
+        if blank {
+            if !prev_blank {
+                out.push(Line::default());
+                prev_blank = true;
+            }
+        } else {
+            out.push(line);
+            prev_blank = false;
+        }
+    }
+    while out.last().is_some_and(line_is_blank) {
+        out.pop();
+    }
+    out
+}
+
+/// Merge a paragraph that is only punctuation into the previous paragraph.
+/// Fixes model output like `"…today\n\n?"` which otherwise renders as a lone
+/// `?` row after a blank line.
+fn merge_orphan_punct_paragraphs(blocks: &mut Vec<MarkdownBlock>) {
+    let mut i = 1;
+    while i < blocks.len() {
+        let is_orphan = matches!(
+            &blocks[i],
+            MarkdownBlock::Paragraph(lines)
+                if lines.len() == 1 && only_ascii_punct(&lines[0])
+        );
+        if !is_orphan {
+            i += 1;
+            continue;
+        }
+        // Prefer merging into the nearest previous paragraph, skipping a
+        // single BlankLine in between.
+        let mut target = None;
+        if matches!(&blocks[i - 1], MarkdownBlock::Paragraph(_)) {
+            target = Some(i - 1);
+        } else if i >= 2
+            && matches!(&blocks[i - 1], MarkdownBlock::BlankLine)
+            && matches!(&blocks[i - 2], MarkdownBlock::Paragraph(_))
+        {
+            target = Some(i - 2);
+        }
+        if let Some(t) = target {
+            let punct = match blocks.remove(i) {
+                MarkdownBlock::Paragraph(lines) => lines.into_iter().next().unwrap_or_default(),
+                _ => unreachable!(),
+            };
+            // Drop the blank separator if we skipped over it.
+            if t + 1 < blocks.len() && matches!(&blocks[t + 1], MarkdownBlock::BlankLine) {
+                blocks.remove(t + 1);
+            }
+            if let MarkdownBlock::Paragraph(lines) = &mut blocks[t] {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(punct.trim());
+                } else {
+                    lines.push(punct);
+                }
+            }
+            // stay at i (now points at whatever followed the orphan)
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Parse + render markdown into styled lines at `max_width`, with soft-break
+/// joining and blank-line compaction so assistant text doesn't fracture into
+/// odd one-word / lone-punctuation rows.
+fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let src = normalize_md_source(text);
+    let renderer = MarkdownRenderer::new(max_width.max(1));
+    let mut blocks = renderer.parse(&src);
+    join_paragraph_soft_breaks(&mut blocks);
+    merge_orphan_punct_paragraphs(&mut blocks);
+    let lines = renderer.render(&blocks, &ThemeConfig::default());
+    compact_md_lines(lines)
+}
 
 /// One self-contained transcript entry.
 pub trait HistoryCell {
@@ -114,9 +274,7 @@ pub struct SystemCell {
 
 impl SystemCell {
     fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
-        let renderer = MarkdownRenderer::new(width as usize);
-        let blocks = renderer.parse(&self.content);
-        let styled = renderer.render(&blocks, &ThemeConfig::default());
+        let styled = render_markdown(&self.content, width as usize);
         let mut rows: Vec<Row> = styled
             .into_iter()
             .map(|line| Row {
@@ -634,6 +792,8 @@ impl ThinkingCell {
             return Vec::new();
         }
 
+        let indent = THINK_INDENT;
+        let text_w = width.saturating_sub(indent).max(1) as usize;
         let mut rows = vec![Row::blank(width)]; // top padding
         for b in &self.blocks {
             match b {
@@ -642,35 +802,37 @@ impl ThinkingCell {
                     if text.is_empty() {
                         continue;
                     }
-                    // Render this text block, but only its non-blank content.
-                    let renderer = MarkdownRenderer::new(width.saturating_sub(2) as usize);
-                    let blocks = renderer.parse(text);
-                    let lines = renderer.render(&blocks, &ThemeConfig::default());
-                    let is_blank = |l: &Line<'static>| {
-                        l.spans.iter().all(|s| s.content.trim().is_empty())
-                    };
-                    for line in lines.into_iter().filter(|l| !is_blank(l)) {
+                    for line in render_markdown(text, text_w) {
                         rows.push(Row {
-                            x: 2,
-                            w: width.saturating_sub(2),
+                            x: indent,
+                            w: width.saturating_sub(indent),
                             line,
                         });
                     }
                 }
             }
         }
-        // Cursor while still streaming and no trailing tool card is open.
+        // Streaming cursor: append to the last text row so it sits at the end
+        // of the answer (not on its own row, which looked like a stray glyph /
+        // broken line break after the message).
         if self.streaming {
             let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)));
             if !tail_is_tool {
-                rows.push(Row {
-                    x: 2,
-                    w: width.saturating_sub(2),
-                    line: Line::from(Span::styled(
-                        "▍",
-                        Style::default().fg(theme::ACCENT),
-                    )),
-                });
+                let cursor = Span::styled("█", Style::default().fg(theme::ACCENT));
+                let mut glued = false;
+                if let Some(last) = rows.last_mut() {
+                    if last.x == indent && !line_is_blank(&last.line) {
+                        last.line.spans.push(cursor.clone());
+                        glued = true;
+                    }
+                }
+                if !glued {
+                    rows.push(Row {
+                        x: indent,
+                        w: width.saturating_sub(indent),
+                        line: Line::from(cursor),
+                    });
+                }
             }
         }
         rows.push(Row::blank(width)); // bottom padding
@@ -691,5 +853,82 @@ impl HistoryCell for ThinkingCell {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod markdown_layout_tests {
+    use super::*;
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn soft_break_joins_mid_sentence() {
+        let lines = render_markdown("Hi! How can I help you\ntoday?", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "Hi! How can I help you today?");
+    }
+
+    #[test]
+    fn soft_break_glues_lone_question_mark() {
+        let lines = render_markdown("Hi! How can I help you today\n?", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "Hi! How can I help you today?");
+    }
+
+    #[test]
+    fn double_newline_orphan_punct_merges() {
+        let lines = render_markdown("Hi! How can I help you today\n\n?", 80);
+        assert_eq!(
+            lines.len(),
+            1,
+            "got: {:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+        assert_eq!(line_text(&lines[0]), "Hi! How can I help you today?");
+    }
+
+    #[test]
+    fn plain_greeting_stays_one_line() {
+        let lines = render_markdown(
+            "Hi! I'm xa, a coding agent. How can I help you today?",
+            80,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            line_text(&lines[0]),
+            "Hi! I'm xa, a coding agent. How can I help you today?"
+        );
+    }
+
+    #[test]
+    fn paragraph_spacing_kept_once() {
+        let lines = render_markdown("Hello.\n\nWorld.", 80);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(line_text(&lines[0]), "Hello.");
+        assert!(line_is_blank(&lines[1]));
+        assert_eq!(line_text(&lines[2]), "World.");
+    }
+
+    #[test]
+    fn thinking_cell_inline_cursor() {
+        let mut tc = ThinkingCell::new();
+        tc.add_text("Hi! How can I help you today?");
+        tc.streaming = true;
+        let rows = tc.build(80, None);
+        let content: Vec<_> = rows
+            .iter()
+            .filter(|r| !line_is_blank(&r.line))
+            .map(|r| line_text(&r.line))
+            .collect();
+        assert_eq!(content.len(), 1);
+        assert!(
+            content[0].ends_with('█'),
+            "cursor should be inline, got {:?}",
+            content[0]
+        );
+        assert!(content[0].contains("today?"));
     }
 }
