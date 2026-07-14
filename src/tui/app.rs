@@ -965,19 +965,23 @@ impl App {
         let model_display = truncate(&model, max_val_w);
         let cwd_display = truncate(&cwd, max_val_w);
 
+        let keys = ["Model", "Workspace", "Permission", "Context"];
+        let max_key_w = keys.iter().map(|k| unicode_width::UnicodeWidthStr::width(*k)).max().unwrap_or(0);
+
         let kv_line = |key: &str, value: &str| -> Line<'static> {
             let key_w = unicode_width::UnicodeWidthStr::width(key);
             let val_w = unicode_width::UnicodeWidthStr::width(value);
+            let key_pad = max_key_w.saturating_sub(key_w);
             let gap = 2;
-            let content_w = 1 + key_w + gap + val_w;
-            let pad = cw.saturating_sub(content_w);
+            let content_w = 1 + max_key_w + gap + val_w;
+            let line_pad = cw.saturating_sub(content_w);
             Line::from(vec![
                 Span::styled("│", border_style),
                 Span::styled(" ", border_style),
                 Span::styled(key.to_string(), label_style),
-                Span::styled(" ".repeat(gap), border_style),
+                Span::styled(" ".repeat(key_pad + gap), border_style),
                 Span::styled(value.to_string(), value_style),
-                Span::styled(format!("{}│", " ".repeat(pad)), border_style),
+                Span::styled(format!("{}│", " ".repeat(line_pad)), border_style),
             ])
         };
         let blank_line = || -> Line<'static> {
