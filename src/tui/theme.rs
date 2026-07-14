@@ -6,11 +6,11 @@
 use ratatui::style::Color;
 
 /// Brand accent (warm orange).
-pub const ACCENT: Color = Color::Rgb(232, 140, 60);
+pub const ACCENT: Color = Color::Rgb(217, 119, 87);
 /// Softer orange for secondary emphasis / selected idle states.
-pub const ACCENT_DIM: Color = Color::Rgb(190, 120, 60);
+pub const ACCENT_DIM: Color = Color::Rgb(180, 100, 70);
 /// Bright peak used by shimmer highlights.
-pub const ACCENT_BRIGHT: Color = Color::Rgb(255, 190, 120);
+pub const ACCENT_BRIGHT: Color = Color::Rgb(240, 150, 110);
 
 /// Primary body text.
 pub const TEXT: Color = Color::Rgb(225, 225, 225);

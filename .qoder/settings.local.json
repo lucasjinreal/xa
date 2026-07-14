@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -R /home/lumos1/work/xa/ | head -200)",
+      "Bash(cargo build 2>&1)",
+      "Bash(cargo build 2>&1 | grep -E \"^\\(error|warning:.*xa\\)\" )",
+      "Bash(cargo build 2>&1 | grep -E \"^error\")",
+      "Bash(cargo build 2>&1 | grep -A 10 \"lifetime\")",
+      "Bash(cargo build 2>&1 | grep -E \"^\\(error|Finished\\)\")",
+      "Bash(grep -r \"set_placeholder\" /home/lumos1/work/xa/src/ 2>/dev/null || echo \"Not found in src\")",
+      "Bash(cargo build 2>&1 | grep -E \"^\\(error|warning:.*app\\\\.rs\\)\")",
+      "Bash(cargo build 2>&1 | tail -20)",
+      "Bash(cargo build 2>&1 | grep -E \"\\(error|Finished\\)\")",
+      "Bash(cargo build 2>&1 | grep \"unused\")",
+      "Bash(cargo build 2>&1 | grep -E \"\\(error|^warning:.*app\\\\.rs|^warning:.*theme\\\\.rs|Finished\\)\")",
+      "Bash(git diff src/tui/app.rs | head -200)"
+    ]
+  }
+}

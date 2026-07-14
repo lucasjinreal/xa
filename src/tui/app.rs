@@ -13,7 +13,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
@@ -865,7 +865,7 @@ impl App {
         self.system_msg(s);
     }
 
-    /// Render the codex-style banner box pinned at the top of the view.
+    /// Render the header: ASCII art logo on the left, session info box on the right.
     fn draw_header(&self, f: &mut ratatui::Frame, area: Rect) {
         let cwd = std::env::current_dir()
             .map(|p| {
@@ -886,50 +886,124 @@ impl App {
             self.provider.model.clone()
         };
 
-        // A bordered box around the header. Rendering via a widget guarantees
-        // the content is clipped to the inner area and can never bleed onto
-        // neighbouring rows.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::BORDER));
+        if area.width < 60 || area.height < 9 {
+            let fallback = Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("xa", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" (v{version})"), Style::default().fg(theme::TEXT_DIM)),
+            ]);
+            f.render_widget(Paragraph::new(fallback), area);
+            return;
+        }
 
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "❯ ",
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "xa",
-                    Style::default()
-                        .fg(theme::TEXT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" (v{version})"),
-                    Style::default().fg(theme::TEXT_DIM),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" model:    ", Style::default().fg(theme::TEXT_DIM)),
-                Span::styled(model, Style::default().fg(theme::ACCENT)),
-                Span::styled(
-                    "     /models to change",
-                    Style::default().fg(theme::TEXT_HINT),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" directory:", Style::default().fg(theme::TEXT_DIM)),
-                Span::styled(format!("  {cwd}"), Style::default().fg(theme::TEXT)),
-            ]),
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(28),
+                Constraint::Length(42),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let version_line = format!("v{}", version);
+        let version_line_padded = format!("  {}", version_line);
+        let logo_lines = vec![
+            "  ██╗  ██╗ █████╗",
+            "  ╚██╗██╔╝██╔══██╗",
+            "   ╚███╔╝ ███████║",
+            "   ██╔██╗ ██╔══██║",
+            "  ██╔╝ ██╗██║  ██║",
+            "  ╚═╝  ╚═╝╚═╝  ╚═╝",
+            "",
+            "  XA Code Agent",
+            &version_line_padded,
         ];
 
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .alignment(ratatui::layout::Alignment::Left);
-        f.render_widget(paragraph, area);
+        let logo_spans: Vec<Line> = logo_lines.iter().map(|line| {
+            if line.is_empty() {
+                Line::from("")
+            } else if line.contains("██") || line.contains("╚") || line.contains("╔") || line.contains("╝") || line.contains("╗") || line.contains("═") {
+                Line::from(Span::styled(*line, Style::default().fg(theme::ACCENT)))
+            } else if line.contains("XA Code Agent") {
+                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)))
+            } else {
+                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT_DIM)))
+            }
+        }).collect();
+
+        let logo = Paragraph::new(logo_spans);
+        f.render_widget(logo, chunks[0]);
+
+        let box_w = 42usize;
+        let cw = box_w.saturating_sub(2);
+
+        let truncate = |s: &str, max: usize| -> String {
+            let sw = unicode_width::UnicodeWidthStr::width(s);
+            if sw <= max {
+                s.to_string()
+            } else {
+                let mut t = String::new();
+                let mut w = 0;
+                for ch in s.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if w + ch_w + 3 > max {
+                        t.push_str("...");
+                        break;
+                    }
+                    t.push(ch);
+                    w += ch_w;
+                }
+                t
+            }
+        };
+
+        let border_style = Style::default().fg(theme::BORDER);
+        let label_style = Style::default().fg(theme::TEXT_DIM);
+        let value_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
+
+        let max_val_w = cw.saturating_sub(14);
+        let model_display = truncate(&model, max_val_w);
+        let cwd_display = truncate(&cwd, max_val_w);
+
+        let kv_line = |key: &str, value: &str| -> Line<'static> {
+            let key_w = unicode_width::UnicodeWidthStr::width(key);
+            let val_w = unicode_width::UnicodeWidthStr::width(value);
+            let gap = 2;
+            let content_w = 1 + key_w + gap + val_w;
+            let pad = cw.saturating_sub(content_w);
+            Line::from(vec![
+                Span::styled("│", border_style),
+                Span::styled(" ", border_style),
+                Span::styled(key.to_string(), label_style),
+                Span::styled(" ".repeat(gap), border_style),
+                Span::styled(value.to_string(), value_style),
+                Span::styled(format!("{}│", " ".repeat(pad)), border_style),
+            ])
+        };
+        let blank_line = || -> Line<'static> {
+            Line::from(vec![
+                Span::styled("│", border_style),
+                Span::styled(" ".repeat(cw), border_style),
+                Span::styled("│", border_style),
+            ])
+        };
+
+        let title = "─ Session ";
+        let title_w = unicode_width::UnicodeWidthStr::width(title);
+        let top_fill = cw.saturating_sub(title_w);
+        let top_border = format!("╭{}{}╮", title, "─".repeat(top_fill));
+
+        let session_lines: Vec<Line> = vec![
+            Line::from(vec![Span::styled(top_border, border_style)]),
+            kv_line("Model", &model_display),
+            kv_line("Workspace", &cwd_display),
+            kv_line("Permission", "Auto"),
+            kv_line("Context", "128k tokens"),
+            Line::from(vec![Span::styled(format!("╰{}╯", "─".repeat(cw)), border_style)]),
+        ];
+
+        let session = Paragraph::new(session_lines);
+        f.render_widget(session, chunks[1]);
     }
 
     /// Render the short codex-style tip line beneath the header box.
@@ -960,25 +1034,33 @@ impl App {
 
         let base = match self.stream_phase {
             StreamPhase::Error => theme::ERROR,
-            StreamPhase::Thinking => theme::ACCENT,
-            StreamPhase::Responding => theme::ACCENT_DIM,
+            StreamPhase::Thinking => theme::TEXT_DIM,
+            StreamPhase::Responding => theme::TEXT_DIM,
             StreamPhase::RunningTool => theme::WARNING,
             StreamPhase::Waiting => theme::TEXT_DIM,
             StreamPhase::Idle => theme::TEXT_DIM,
         };
 
+        let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let elapsed_ms = self.shimmer_start.elapsed().as_millis() as f32;
+        let spinner_idx = ((elapsed_ms / 80.0) as usize) % spinner_frames.len();
+        let spinner = spinner_frames[spinner_idx];
+
         let mut spans = vec![Span::styled("  ", Style::default().fg(theme::TEXT_DIM))];
         if self.stream_phase.is_active() && self.stream_phase != StreamPhase::Error {
+            spans.push(Span::styled(
+                format!("{} ", spinner),
+                Style::default().fg(theme::TEXT),
+            ));
             spans.extend(shimmer_spans_to(
                 &label,
                 base,
-                theme::ACCENT_BRIGHT,
+                Color::White,
                 phase,
             ));
         } else {
             spans.push(Span::styled(label, Style::default().fg(base)));
         }
-        // Per-status elapsed timer (restarts on phase change).
         if self.stream_phase.is_active() {
             spans.push(Span::styled(
                 format!("  {}", self.phase_elapsed_label()),
@@ -988,7 +1070,7 @@ impl App {
         if self.streaming {
             spans.push(Span::styled(
                 "  · esc to interrupt",
-                Style::default().fg(theme::TEXT_HINT),
+                Style::default().fg(theme::TEXT_DIM),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1013,12 +1095,14 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
+                Constraint::Length(1),  // padding above activity
                 Constraint::Length(activity_h),
+                Constraint::Length(1),  // padding below activity
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(area);
-        self.input_area_width = chunks[2].width;
+        self.input_area_width = chunks[4].width;
 
         // Build the soft-wrapped composer copy now that we know the width, so
         // the input block can grow vertically with the wrapped line count.
@@ -1031,17 +1115,19 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
+                Constraint::Length(1),  // padding above activity
                 Constraint::Length(activity_h),
+                Constraint::Length(1),  // padding below activity
                 Constraint::Length(input_h),
                 Constraint::Length(1),
             ])
             .split(area);
-        self.input_area_width = chunks[2].width;
+        self.input_area_width = chunks[4].width;
 
         let view = chunks[0];
-        let activity_area = chunks[1];
-        let input_area = chunks[2];
-        let footer_area = chunks[3];
+        let activity_area = chunks[2];
+        let input_area = chunks[4];
+        let footer_area = chunks[5];
         let ctx = RenderContext {
             shimmer_phase: shimmer_phase(self.shimmer_start, 1.8),
         };
@@ -1050,7 +1136,7 @@ impl App {
         // while the view is pinned to the very top they are shown, but once the
         // user scrolls down into the transcript they scroll away and the full
         // height is handed to the conversation.
-        const HEADER_H: u16 = 5;
+        const HEADER_H: u16 = 9;
         const TIP_H: u16 = 2;
         const PRE: u16 = HEADER_H + TIP_H;
 
@@ -1172,6 +1258,7 @@ impl App {
         // Placeholder hint when empty and not streaming.
         if self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) && !self.streaming {
             wrapped.set_placeholder_text("Type a message, or / for commands…");
+            wrapped.set_placeholder_style(Style::default().fg(theme::TEXT_DIM).bg(input_bg));
         }
         // Render the soft-wrapped copy (already built above) so long input
         // grows vertically instead of overflowing; the editable buffer itself
