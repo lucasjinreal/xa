@@ -2,3 +2,6 @@
 /vendor
 /data
 .qoder/
+.agents/
+.claude/
+.codex/
