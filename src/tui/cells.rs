@@ -340,8 +340,8 @@ fn is_code_line(line: &Line<'_>) -> bool {
         .any(|s| s.style.bg == Some(theme::CODE_BG))
 }
 
-/// Full-width code row: left think-indent + markdown code line + trailing
-/// spaces, all on [`theme::CODE_BG`], painted from column 0.
+/// Full-width code body row: left think-indent + code spans + trailing spaces,
+/// all on [`theme::CODE_BG`], painted from column 0.
 fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if THINK_INDENT > 0 {
@@ -351,6 +351,11 @@ fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
         ));
     }
     for mut span in line.spans {
+        // Keep indent/spaces that are part of the source line; only drop fully
+        // empty markers (no content at all).
+        if span.content.is_empty() {
+            continue;
+        }
         span.style = span.style.bg(theme::CODE_BG);
         spans.push(span);
     }
@@ -361,11 +366,42 @@ fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
     let w = width as usize;
     if used < w {
         spans.push(Span::styled(" ".repeat(w - used), code_bg_style()));
-    } else if used > w {
-        // Extremely long (shouldn't wrap past max_width); still paint bg.
-        // Truncation is handled by set_line's width clip.
     }
     Row::new(0, width, Line::from(spans))
+}
+
+/// Empty full-width CODE_BG row used as the 1-line pad above/below code body.
+fn code_pad_row(width: u16) -> Row {
+    Row::new(
+        0,
+        width,
+        Line::from(Span::styled(
+            " ".repeat(width.max(1) as usize),
+            code_bg_style(),
+        )),
+    )
+}
+
+/// Emit a fenced code block with exactly one blank (bg) line above the first
+/// content line and one below the last — edge-to-edge CODE_BG bar.
+fn push_code_block_rows(code_lines: Vec<Line<'static>>, width: u16, rows: &mut Vec<Row>) {
+    // Real body: non-whitespace text. Leading/trailing empty fence lines and
+    // markdown-side pad markers are stripped so we always own the pads here.
+    let body: Vec<Line<'static>> = code_lines
+        .into_iter()
+        .filter(|l| !line_is_blank(l))
+        .collect();
+
+    rows.push(code_pad_row(width)); // top pad above first content
+    if body.is_empty() {
+        // Empty fence still shows a minimal bar (top pad + bottom pad).
+        rows.push(code_pad_row(width));
+        return;
+    }
+    for line in body {
+        rows.push(full_width_code_row(line, width));
+    }
+    rows.push(code_pad_row(width)); // bottom pad below last content
 }
 
 impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
@@ -1189,14 +1225,25 @@ impl ThinkingCell {
                         continue;
                     }
                     let md_lines = render_markdown(text, text_w);
+                    // Group consecutive code lines so each fence becomes one
+                    // full-width bar with a guaranteed 1-line top/bottom pad
+                    // around the body content.
+                    let mut code_buf: Vec<Line<'static>> = Vec::new();
+                    let flush_code = |buf: &mut Vec<Line<'static>>, rows: &mut Vec<Row>| {
+                        if !buf.is_empty() {
+                            let chunk = std::mem::take(buf);
+                            push_code_block_rows(chunk, width, rows);
+                        }
+                    };
                     for line in md_lines {
                         if is_code_line(&line) {
-                            // Full-width subtle bar (edge to edge).
-                            rows.push(full_width_code_row(line, width));
+                            code_buf.push(line);
                         } else {
+                            flush_code(&mut code_buf, &mut rows);
                             rows.push(Row::new(indent, text_row_w, line));
                         }
                     }
+                    flush_code(&mut code_buf, &mut rows);
                 }
             }
         }
@@ -1375,8 +1422,9 @@ mod markdown_layout_tests {
             .iter()
             .filter(|r| is_code_line(&r.line))
             .collect();
-        assert!(!code_rows.is_empty());
-        for r in code_rows {
+        // top pad + body + bottom pad
+        assert_eq!(code_rows.len(), 3, "expected top pad, body, bottom pad");
+        for r in &code_rows {
             assert_eq!(r.x, 0, "code bar starts at left edge");
             assert_eq!(r.w, width, "code bar spans full width");
             assert_eq!(
@@ -1385,6 +1433,24 @@ mod markdown_layout_tests {
                 "line is padded with CODE_BG spaces to full width"
             );
         }
+        // Pads are blank; middle row holds the body.
+        assert!(line_is_blank(&code_rows[0].line));
+        assert!(line_text(&code_rows[1].line).contains("hello"));
+        assert!(line_is_blank(&code_rows[2].line));
+    }
+
+    #[test]
+    fn thinking_cell_code_pad_around_multiline_body() {
+        let mut tc = ThinkingCell::new();
+        tc.add_text("```text\nline1\nline2\n```");
+        tc.streaming = false;
+        let rows = tc.build(40, None);
+        let code_rows: Vec<_> = rows.iter().filter(|r| is_code_line(&r.line)).collect();
+        assert_eq!(code_rows.len(), 4); // pad + line1 + line2 + pad
+        assert!(line_is_blank(&code_rows[0].line));
+        assert!(line_text(&code_rows[1].line).contains("line1"));
+        assert!(line_text(&code_rows[2].line).contains("line2"));
+        assert!(line_is_blank(&code_rows[3].line));
     }
 
     fn line_display_width_for_test(line: &Line<'_>) -> usize {
