@@ -132,7 +132,7 @@ pub struct ChatMessage {
 pub enum StreamEvent {
     Delta(String),
     /// A tool call is about to be executed (for rendering in the TUI).
-    ToolCall { name: String, arguments: String },
+    ToolCall { id: String, name: String, arguments: String },
     /// A tool call finished (for rendering in the TUI).
     ToolResult {
         name: String,
@@ -143,6 +143,10 @@ pub enum StreamEvent {
     },
     Done,
     Error(String),
+    /// Token usage reported by the API (may arrive mid-stream or at end).
+    Usage { prompt: u32, completion: u32, total: u32 },
+    /// A transient error occurred; the agent is retrying automatically.
+    Retrying { attempt: u32, max: u32, reason: String },
     /// Internal: marks the assistant cell at `0` as no longer streaming.
     InternalAssistIdx(u32),
 }
@@ -410,7 +414,7 @@ pub async fn run_conversation(
                 },
             );
         }
-        match stream_completion(provider, &snapshot, tools, &tx, cancel.clone()).await {
+        match stream_completion_with_retry(provider, &snapshot, tools, &tx, cancel.clone()).await {
             Ok((text, calls)) => {
                 if cancel.load(Ordering::SeqCst) {
                     let _ = tx.send(StreamEvent::Done).await;
@@ -436,6 +440,7 @@ pub async fn run_conversation(
                     }
                     let _ = tx
                         .send(StreamEvent::ToolCall {
+                            id: tc.id.clone(),
                             name: tc.name.clone(),
                             arguments: tc.arguments.clone(),
                         })
@@ -498,6 +503,55 @@ pub async fn run_conversation(
     }
 }
 
+const MAX_RETRIES: u32 = 3;
+
+/// Wrap `stream_completion` with automatic retry on transient HTTP errors
+/// (429 rate-limit, 500+ server errors, 404 not-found). Sends `Retrying`
+/// events so the TUI can show progress.
+async fn stream_completion_with_retry(
+    provider: &Provider,
+    messages: &[ChatMessage],
+    tools: &[std::sync::Arc<dyn crate::tools::Tool>],
+    tx: &mpsc::Sender<StreamEvent>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(String, Vec<ToolCallRepr>), String> {
+    let mut last_err = String::new();
+    for attempt in 0..MAX_RETRIES {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        match stream_completion(provider, messages, tools, tx, cancel.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let is_retryable = e.contains("HTTP 429")
+                    || e.contains("HTTP 500")
+                    || e.contains("HTTP 502")
+                    || e.contains("HTTP 503")
+                    || e.contains("HTTP 504")
+                    || e.contains("HTTP 404")
+                    || e.contains("request failed")
+                    || e.contains("stream error")
+                    || e.contains("timed out")
+                    || e.contains("connection");
+                if !is_retryable || attempt + 1 >= MAX_RETRIES {
+                    return Err(e);
+                }
+                last_err = e.clone();
+                let _ = tx
+                    .send(StreamEvent::Retrying {
+                        attempt: attempt + 1,
+                        max: MAX_RETRIES,
+                        reason: e,
+                    })
+                    .await;
+                // Brief backoff before retry (1s, 2s, 3s).
+                tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Stream one completion from `provider`. Forwards text deltas to `tx` and
 /// returns the accumulated `(text, tool_calls)` for the turn. Uses raw SSE
 /// over reqwest so any custom OpenAI-compatible endpoint works.
@@ -513,6 +567,7 @@ async fn stream_completion(
     let mut body = serde_json::json!({
         "model": provider.model,
         "stream": true,
+        "stream_options": { "include_usage": true },
         "messages": messages_to_json(messages),
     });
     if !tools.is_empty() {
@@ -575,6 +630,14 @@ async fn stream_completion(
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
                     if let Some(err) = v.get("error") {
                         return Err(format!("api error: {err}"));
+                    }
+                    if let Some(u) = v.get("usage") {
+                        let prompt = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        let completion = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        let total = u.get("total_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        if total > 0 {
+                            let _ = tx.send(StreamEvent::Usage { prompt, completion, total }).await;
+                        }
                     }
                     if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
                         if let Some(c) = choices.first() {

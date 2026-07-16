@@ -18,18 +18,23 @@ pub enum StreamPhase {
     Responding,
     /// A tool call is in flight.
     RunningTool,
+    /// Retrying after a transient error.
+    Retrying { attempt: u32, max: u32 },
     Error,
 }
 
 impl StreamPhase {
-    pub fn label(self) -> Option<&'static str> {
+    pub fn label(self) -> Option<String> {
         match self {
             StreamPhase::Idle => None,
-            StreamPhase::Waiting => Some("Waiting for response…"),
-            StreamPhase::Thinking => Some("Thinking…"),
-            StreamPhase::Responding => Some("Responding…"),
-            StreamPhase::RunningTool => Some("Running tools…"),
-            StreamPhase::Error => Some("Error"),
+            StreamPhase::Waiting => Some("Waiting for response\u{2026}".into()),
+            StreamPhase::Thinking => Some("Thinking\u{2026}".into()),
+            StreamPhase::Responding => Some("Responding\u{2026}".into()),
+            StreamPhase::RunningTool => Some("Running tools\u{2026}".into()),
+            StreamPhase::Retrying { attempt, max } => {
+                Some(format!("Retrying ({attempt}/{max})\u{2026}"))
+            }
+            StreamPhase::Error => Some("Error".into()),
         }
     }
 

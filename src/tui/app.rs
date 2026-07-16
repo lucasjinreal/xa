@@ -66,6 +66,16 @@ enum AppEvent {
     Wizard(Result<Vec<String>, String>),
 }
 
+/// Information printed after leaving the alternate-screen TUI. Keeping this
+/// separate from the header makes the terminal handoff useful without turning
+/// the live UI into a session-management dashboard.
+struct ExitSummary {
+    model: String,
+    directory: String,
+    session_id: String,
+    session_title: String,
+}
+
 pub struct App {
     provider: Provider,
     cells: Vec<Box<dyn crate::tui::cells::HistoryCell>>,
@@ -199,19 +209,79 @@ impl App {
                 msgs.push(session::StoredMessage {
                     role: "user".into(),
                     content: u.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
             } else if let Some(tc) = c.as_any().downcast_ref::<ThinkingCell>() {
+                let tools = tc.tool_blocks();
+                if !tools.is_empty() {
+                    let stored_tcs: Vec<session::StoredToolCall> = tools
+                        .iter()
+                        .filter_map(|t| {
+                            Some(session::StoredToolCall {
+                                id: t.tool_call_id.clone()?,
+                                name: t.tool_name.clone(),
+                                arguments: t.arguments.clone().unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    if !stored_tcs.is_empty() {
+                        let answer = tc.answer_text();
+                        msgs.push(session::StoredMessage {
+                            role: "assistant".into(),
+                            content: answer,
+                            tool_calls: Some(stored_tcs.clone()),
+                            tool_call_id: None,
+                        });
+                        for stc in &stored_tcs {
+                            let output = tools
+                                .iter()
+                                .find(|t| t.tool_call_id.as_deref() == Some(&stc.id))
+                                .and_then(|t| t.output.clone())
+                                .unwrap_or_default();
+                            msgs.push(session::StoredMessage {
+                                role: "tool".into(),
+                                content: output,
+                                tool_calls: None,
+                                tool_call_id: Some(stc.id.clone()),
+                            });
+                        }
+                    }
+                }
                 let answer = tc.answer_text();
                 if !answer.trim().is_empty() {
                     msgs.push(session::StoredMessage {
                         role: "assistant".into(),
                         content: answer,
+                        tool_calls: None,
+                        tool_call_id: None,
                     });
                 }
             }
         }
         self.session.messages = msgs;
         self.session.touch();
+
+        // Auto-generate a session title from the first user message once
+        // there are at least 2 user turns (so we know the session is real).
+        if self.session.title == "untitled" {
+            let user_msgs: Vec<&str> = self.cells.iter().filter_map(|c| {
+                c.as_any().downcast_ref::<UserCell>().map(|u| u.content.as_str())
+            }).collect();
+            if user_msgs.len() >= 2 {
+                let first = user_msgs[0];
+                let title = first.lines().next().unwrap_or("").trim();
+                let title = if title.len() > 44 {
+                    format!("{}...", &title[..44])
+                } else {
+                    title.to_string()
+                };
+                if !title.is_empty() {
+                    self.session.title = title;
+                }
+            }
+        }
+
         let _ = session::save(&self.session);
     }
 
@@ -352,7 +422,13 @@ impl App {
                 self.active_think = None;
                 self.dirty = true;
             }
-            StreamEvent::ToolCall { name, arguments } => {
+            StreamEvent::Retrying { attempt, max, reason } => {
+                self.set_stream_phase(StreamPhase::Retrying { attempt, max });
+                self.status = format!("retry {attempt}/{max}: {reason}");
+                self.dirty = true;
+            }
+            StreamEvent::Usage { .. } => {}
+            StreamEvent::ToolCall { id, name, arguments } => {
                 let preview = args_preview(&arguments);
                 // Pull path / read window out of the args for the `← Edit` /
                 // `→ Read` summaries.
@@ -367,7 +443,7 @@ impl App {
                     i
                 };
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
-                    tc.add_tool(&name, &preview, path, read_offset, read_limit);
+                    tc.add_tool(&name, &preview, path, read_offset, read_limit, Some(id), Some(arguments));
                 }
                 self.set_stream_phase(StreamPhase::RunningTool);
                 self.dirty = true;
@@ -389,7 +465,7 @@ impl App {
                 }
                 if !updated {
                     let mut tc = ThinkingCell::new();
-                    tc.add_tool(&name, "", None, None, None);
+                    tc.add_tool(&name, "", None, None, None, None, None);
                     tc.finish_tool(Some(output), is_error, diff);
                     self.cells.push(Box::new(tc));
                     self.active_think = Some(self.cells.len() - 1);
@@ -918,6 +994,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Save the conversation and collect the information needed for the
+    /// post-TUI resume instructions.
+    fn exit_summary(&mut self) -> ExitSummary {
+        self.sync_session();
+        ExitSummary {
+            model: self.provider.model.clone(),
+            directory: display_directory(),
+            session_id: self.session.id.clone(),
+            session_title: self.session.title.clone(),
+        }
+    }
+
     fn list_tools(&mut self) {
         let mut s = String::from("## Available tools\n\n");
         for t in crate::tools::all_tools() {
@@ -928,18 +1016,6 @@ impl App {
 
     /// Render the header: ASCII art logo on the left, session info box on the right.
     fn draw_header(&self, f: &mut ratatui::Frame, area: Rect) {
-        let cwd = std::env::current_dir()
-            .map(|p| {
-                let s = p.display().to_string();
-                if let Some(home) = dirs::home_dir() {
-                    if let Ok(rest) = p.strip_prefix(&home) {
-                        return format!("~{}", rest.display());
-                    }
-                }
-                s
-            })
-            .unwrap_or_else(|_| ".".to_string());
-
         let version = env!("CARGO_PKG_VERSION");
         let model = if self.provider.model.is_empty() {
             "<unset>".to_string()
@@ -1005,7 +1081,16 @@ impl App {
         let name_para = Paragraph::new(name_spans);
         f.render_widget(name_para, chunks[1]);
 
-        let box_w = 42usize;
+        // Keep the status card with the leading XA brand group: logo, name,
+        // then card. Wide terminals retain empty space on the right.
+        let card_x = chunks[1].right();
+        let box_w = area.right().saturating_sub(card_x).clamp(40, 46) as usize;
+        let session_area = Rect {
+            x: card_x,
+            y: area.top(),
+            width: box_w as u16,
+            height: area.height,
+        };
         let cw = box_w.saturating_sub(2);
 
         let truncate = |s: &str, max: usize| -> String {
@@ -1032,11 +1117,13 @@ impl App {
         let label_style = Style::default().fg(theme::TEXT_DIM);
         let value_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
 
-        let max_val_w = cw.saturating_sub(14);
+        let max_val_w = cw.saturating_sub(18);
         let model_display = truncate(&model, max_val_w);
-        let cwd_display = truncate(&cwd, max_val_w);
+        let cwd_display = truncate(&display_directory(), max_val_w);
 
-        let keys = ["Model", "Workspace", "Permission", "Context"];
+        // Keep the header focused on the live operating context. Session
+        // metadata and rename/resume help are shown after the TUI exits.
+        let keys = ["Model", "Directory", "Permission", "Context"];
         let max_key_w = keys.iter().map(|k| unicode_width::UnicodeWidthStr::width(*k)).max().unwrap_or(0);
 
         let kv_line = |key: &str, value: &str| -> Line<'static> {
@@ -1064,14 +1151,14 @@ impl App {
         let session_lines: Vec<Line> = vec![
             Line::from(vec![Span::styled(top_border, border_style)]),
             kv_line("Model", &model_display),
-            kv_line("Workspace", &cwd_display),
-            kv_line("Permission", "Auto"),
+            kv_line("Directory", &cwd_display),
+            kv_line("Permission", "workspace-write"),
             kv_line("Context", "128k tokens"),
             Line::from(vec![Span::styled(format!("╰{}╯", "─".repeat(cw)), border_style)]),
         ];
 
         let session = Paragraph::new(session_lines);
-        f.render_widget(session, chunks[2]);
+        f.render_widget(session, session_area);
     }
 
     /// Render the short codex-style tip line beneath the header box.
@@ -1093,7 +1180,7 @@ impl App {
             return;
         }
         let label = if let Some(l) = self.stream_phase.label() {
-            l.to_string()
+            l
         } else if !self.status.is_empty() {
             self.status.clone()
         } else {
@@ -1105,6 +1192,7 @@ impl App {
             StreamPhase::Thinking => theme::TEXT_DIM,
             StreamPhase::Responding => theme::TEXT_DIM,
             StreamPhase::RunningTool => theme::WARNING,
+            StreamPhase::Retrying { .. } => theme::WARNING,
             StreamPhase::Waiting => theme::TEXT_DIM,
             StreamPhase::Idle => theme::TEXT_DIM,
         };
@@ -1515,6 +1603,40 @@ fn args_preview(arguments: &str) -> String {
     String::new()
 }
 
+/// Render the current directory compactly, using `~` for the user's home.
+fn display_directory() -> String {
+    std::env::current_dir()
+        .map(|path| {
+            if let Some(home) = dirs::home_dir() {
+                if let Ok(rest) = path.strip_prefix(&home) {
+                    return format!("~{}", rest.display());
+                }
+            }
+            path.display().to_string()
+        })
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn print_exit_summary(summary: &ExitSummary) {
+    let title = if summary.session_title == "untitled" {
+        "untitled (rename with /save <title>)".to_string()
+    } else {
+        summary.session_title.clone()
+    };
+
+    println!("\nSession saved");
+    println!("  Model:           {}", summary.model);
+    println!("  Directory:       {}", summary.directory);
+    println!("  Permission mode: workspace-write");
+    println!("  Context length:  128k tokens");
+    println!("  Session:         {}", summary.session_id);
+    println!("  Title:           {title}");
+    println!("\nResume this session next time:");
+    println!("  xa session resume {}", summary.session_id);
+    println!("  xa chat --session {}", summary.session_id);
+    println!("\nUse `xa session ls` to see saved sessions.");
+}
+
 /// Map a crossterm key event into tui-textarea's backend-agnostic `Input`.
 fn map_key(key: KeyEvent) -> Option<Input> {
     use KeyModifiers as M;
@@ -1624,24 +1746,74 @@ pub async fn run(
     if !app.session.messages.is_empty() {
         let resumed = app.session.messages.clone();
         app.system_msg(format!("resumed session `{}`", app.session.id));
-        for m in &resumed {
+        let mut i = 0;
+        while i < resumed.len() {
+            let m = &resumed[i];
             match m.role.as_str() {
-                "user" => app.push_cell(Box::new(UserCell { content: m.content.clone() })),
+                "user" => {
+                    app.push_cell(Box::new(UserCell { content: m.content.clone() }));
+                    i += 1;
+                }
                 "assistant" => {
+                    let mut tc = ThinkingCell::new();
+                    if let Some(tool_calls) = &m.tool_calls {
+                        for stc in tool_calls {
+                            let args_preview = args_preview(&stc.arguments);
+                            let (path, read_offset, read_limit) = tool_path_window(&stc.arguments);
+                            tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                                crate::tui::cells::ToolCallCell {
+                                    tool_name: stc.name.clone(),
+                                    args_preview,
+                                    status: crate::tui::cells::ToolStatus::Success,
+                                    output: None,
+                                    diff: None,
+                                    expanded: false,
+                                    path,
+                                    read_offset,
+                                    read_limit,
+                                    tool_call_id: Some(stc.id.clone()),
+                                    arguments: Some(stc.arguments.clone()),
+                                },
+                            ));
+                        }
+                        // Consume following tool-result messages and attach their
+                        // output to the matching tool card.
+                        i += 1;
+                        while i < resumed.len() && resumed[i].role == "tool" {
+                            let tool_msg = &resumed[i];
+                            if let Some(tcid) = &tool_msg.tool_call_id {
+                                for b in tc.blocks.iter_mut() {
+                                    if let crate::tui::cells::ThinkBlock::Tool(ref mut tool) = b {
+                                        if tool.tool_call_id.as_deref() == Some(tcid.as_str()) {
+                                            tool.output = Some(tool_msg.content.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
                     // Strip any persisted think tags so resume matches live turns.
                     let mut filter = ThinkFilter::new();
                     let (visible, _) = filter.feed(&m.content);
                     let tail = filter.finish();
                     let mut text = visible;
                     text.push_str(&tail);
-                    let mut tc = ThinkingCell::new();
                     if !text.is_empty() {
                         tc.add_text(&text);
                     }
                     tc.streaming = false;
                     app.push_cell(Box::new(tc));
                 }
-                _ => {}
+                "tool" | "system" => {
+                    // Tool results are attached to their ThinkingCell above;
+                    // system messages are re-injected by the agent loop.
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
             }
         }
         let hist: Vec<agent::ChatMessage> = app
@@ -1651,11 +1823,21 @@ pub async fn run(
             .map(|m| agent::ChatMessage {
                 role: match m.role.as_str() {
                     "user" => "user",
+                    "tool" => "tool",
                     _ => "assistant",
                 }
                 .to_string(),
                 content: m.content.clone(),
-                ..Default::default()
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|stc| agent::ToolCallRepr {
+                            id: stc.id.clone(),
+                            name: stc.name.clone(),
+                            arguments: stc.arguments.clone(),
+                        })
+                        .collect()
+                }),
+                tool_call_id: m.tool_call_id.clone(),
             })
             .collect();
         *app.agent_history.lock().unwrap() = hist;
@@ -1706,6 +1888,7 @@ pub async fn run(
         }
     }
 
+    let summary = app.exit_summary();
     terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -1713,5 +1896,6 @@ pub async fn run(
         crossterm::event::DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
+    print_exit_summary(&summary);
     Ok(())
 }

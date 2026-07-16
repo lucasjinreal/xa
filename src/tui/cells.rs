@@ -17,13 +17,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 use ratatui_markdown::{
+    highlight::{segments_to_lines, CodeHighlighter, TreeSitterHighlighter},
     markdown::{MarkdownBlock, MarkdownRenderer},
     theme::ThemeConfig,
 };
+use std::sync::Arc;
 
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
 use crate::tui::theme;
+
+static TS_HIGHLIGHTER: std::sync::LazyLock<Arc<TreeSitterHighlighter>> =
+    std::sync::LazyLock::new(|| Arc::new(TreeSitterHighlighter::new()));
 
 /// A single drawable row inside a cell. `x`/`w` are offsets relative to the
 /// cell's left edge (which is always the transcript's left edge), so the same
@@ -41,6 +46,10 @@ impl Row {
             w: width,
             line: Line::default(),
         }
+    }
+
+    fn new(x: u16, w: u16, line: Line<'static>) -> Self {
+        Row { x, w, line }
     }
 }
 
@@ -93,10 +102,40 @@ fn convert_h456_to_bold(text: &str) -> String {
 /// - convert h4–h6 headings to bold (library only supports h1–h3)
 fn normalize_md_source(text: &str) -> String {
     let mut s = text.replace("\r\n", "\n").replace('\r', "\n");
+    s = repair_orphan_punctuation_lines(&s);
     while s.contains("\n\n\n") {
         s = s.replace("\n\n\n", "\n\n");
     }
     convert_h456_to_bold(&s)
+}
+
+/// Models occasionally put sentence-ending punctuation on its own, sometimes
+/// after a whitespace-only line. Repair that source form before the markdown
+/// parser can turn it into a separate paragraph. Fenced code is left exactly
+/// as written.
+fn repair_orphan_punctuation_lines(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push(raw.to_string());
+            continue;
+        }
+        if !in_fence && only_ascii_punct(trimmed) {
+            while out.last().is_some_and(|line| line.trim().is_empty()) {
+                out.pop();
+            }
+            if let Some(previous) = out.last_mut().filter(|line| !line.trim().is_empty()) {
+                previous.push_str(trimmed);
+                continue;
+            }
+        }
+        out.push(raw.to_string());
+    }
+    out.join("\n")
 }
 
 /// True when `s` is non-empty and only ASCII punctuation (e.g. `"?"`, `"..."`).
@@ -228,15 +267,49 @@ fn merge_orphan_punct_paragraphs(blocks: &mut Vec<MarkdownBlock>) {
     }
 }
 
+/// Custom markdown hook for fenced code. `segments_to_lines` translates the
+/// highlighter's whole-block byte offsets into each rendered line correctly;
+/// the prior implementation incorrectly reused those offsets on every line.
+struct XaRenderHooks {
+    max_width: usize,
+}
+
+impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
+    fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
+        let segments = TS_HIGHLIGHTER.highlight(lang, content);
+        if segments.is_empty() {
+            let code_style = Style::default().fg(theme::TEXT_DIM);
+            return Some(
+                content
+                    .split('\n')
+                    .map(|line| Line::from(Span::styled(line.to_string(), code_style)))
+                    .collect(),
+            );
+        }
+        Some(segments_to_lines(
+            content,
+            &segments,
+            "",
+            Style::default(),
+            self.max_width,
+        ))
+    }
+}
+
 /// Parse + render markdown into styled lines at `max_width`, with soft-break
 /// joining and blank-line compaction so assistant text doesn't fracture into
-/// odd one-word / lone-punctuation rows.
+/// odd one-word / lone-punctuation rows. Code blocks are syntax-highlighted
+/// via tree-sitter when a grammar is available.
 fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     if text.is_empty() {
         return Vec::new();
     }
     let src = normalize_md_source(text);
-    let renderer = MarkdownRenderer::new(max_width.max(1));
+    let hooks = XaRenderHooks {
+        max_width: max_width.max(1),
+    };
+    let mut renderer = MarkdownRenderer::new(max_width.max(1));
+    renderer = renderer.with_render_hooks(Box::new(hooks));
     let mut blocks = renderer.parse(&src);
     join_paragraph_soft_breaks(&mut blocks);
     merge_orphan_punct_paragraphs(&mut blocks);
@@ -289,11 +362,7 @@ impl SystemCell {
         let styled = render_markdown(&self.content, width as usize);
         let mut rows: Vec<Row> = styled
             .into_iter()
-            .map(|line| Row {
-                x: 0,
-                w: width,
-                line,
-            })
+            .map(|line| Row::new(0, width, line))
             .collect();
         rows.push(Row::blank(width)); // trailing separator
         rows
@@ -354,20 +423,20 @@ impl UserCell {
         for (i, l) in wrapped.into_iter().enumerate() {
             if i == 0 {
                 // First line carries the ❯ lead; wrapped lines hang under the text.
-                rows.push(Row {
-                    x: left_margin,
-                    w: USER_LEAD_COLS + avail,
-                    line: Line::from(vec![
+                rows.push(Row::new(
+                    left_margin,
+                    USER_LEAD_COLS + avail,
+                    Line::from(vec![
                         Span::styled(format!("{USER_PROMPT} "), prompt_style),
                         Span::styled(l, text_style),
                     ]),
-                });
+                ));
             } else {
-                rows.push(Row {
-                    x: text_x,
-                    w: avail,
-                    line: Line::from(Span::styled(l, text_style)),
-                });
+                rows.push(Row::new(
+                    text_x,
+                    avail,
+                    Line::from(Span::styled(l, text_style)),
+                ));
             }
         }
         rows.push(Row::blank(width)); // bottom padding
@@ -424,6 +493,11 @@ pub struct ToolCallCell {
     /// Requested `offset`/`limit` for read tools (shown in the `→ Read` header).
     pub read_offset: Option<usize>,
     pub read_limit: Option<usize>,
+    /// OpenAI-style tool call id (e.g. `call_abc123`), needed to rebuild the
+    /// agent history on session resume.
+    pub tool_call_id: Option<String>,
+    /// Full JSON arguments string (the preview is truncated for display).
+    pub arguments: Option<String>,
 }
 
 impl ToolCallCell {
@@ -489,11 +563,11 @@ impl ToolCallCell {
     }
 
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
-        let mut rows = vec![Row {
-            x: THINK_INDENT,
-            w: width.saturating_sub(THINK_INDENT),
-            line: self.header_line(ctx),
-        }];
+        let mut rows = vec![Row::new(
+            THINK_INDENT,
+            width.saturating_sub(THINK_INDENT),
+            self.header_line(ctx),
+        )];
         
         // Show output/summary below the header with tree prefix
         let x = THINK_INDENT + 3; // Indent for tree branch
@@ -508,17 +582,17 @@ impl ToolCallCell {
                     } else {
                         0
                     };
-                    rows.push(Row {
+                    rows.push(Row::new(
                         x,
                         w,
-                        line: Line::from(vec![
+                        Line::from(vec![
                             Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
                             Span::styled(
                                 format!("Read {} lines", line_count),
                                 Style::default().fg(theme::TEXT_DIM),
                             ),
                         ]),
-                    });
+                    ));
                 }
             }
             "edit" | "write" => {
@@ -529,21 +603,22 @@ impl ToolCallCell {
                     } else {
                         "Edit"
                     };
-                    let mut shown = build_diff_rows(diff, x, w, label);
+                    let lang = self.path.as_deref().and_then(lang_from_path);
+                    let mut shown = build_diff_rows(diff, x, w, label, lang);
                     let limit = 10;
                     if shown.len() > limit {
                         shown.truncate(limit);
-                        rows.push(Row {
+                        rows.push(Row::new(
                             x,
                             w,
-                            line: Line::from(vec![
+                            Line::from(vec![
                                 Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
                                 Span::styled(
                                     format!("… +{} lines", shown.len() - limit),
                                     Style::default().fg(theme::TEXT_HINT),
                                 ),
                             ]),
-                        });
+                        ));
                     }
                     rows.append(&mut shown);
                 }
@@ -561,46 +636,46 @@ impl ToolCallCell {
                     
                     for (i, line) in show_lines.iter().enumerate() {
                         let prefix = if i == 0 { "└ " } else { "  " };
-                        rows.push(Row {
+                        rows.push(Row::new(
                             x,
                             w,
-                            line: Line::from(vec![
+                            Line::from(vec![
                                 Span::styled(prefix, Style::default().fg(theme::TEXT_DIM)),
                                 Span::styled(
                                     line.to_string(),
                                     Style::default().fg(theme::TEXT_DIM),
                                 ),
                             ]),
-                        });
+                        ));
                     }
                     
                     if lines.len() > max_lines {
-                        rows.push(Row {
+                        rows.push(Row::new(
                             x,
                             w,
-                            line: Line::from(vec![
+                            Line::from(vec![
                                 Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
                                 Span::styled(
                                     format!("… +{} lines", lines.len() - max_lines),
                                     Style::default().fg(theme::TEXT_HINT),
                                 ),
                             ]),
-                        });
+                        ));
                     }
                 } else if let Some(diff) = self.diff.as_deref() {
                     // For edits with diff, show change summary
                     let summary = diff_change_summary(diff);
-                    rows.push(Row {
+                    rows.push(Row::new(
                         x,
                         w,
-                        line: Line::from(vec![
+                        Line::from(vec![
                             Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
                             Span::styled(
                                 summary,
                                 Style::default().fg(theme::TEXT_DIM),
                             ),
                         ]),
-                    });
+                    ));
                 }
             }
         }
@@ -612,7 +687,8 @@ impl ToolCallCell {
 /// Parse a unified `git diff` into a compact, line-numbered edit view:
 /// each changed line is shown with its line number and a colored background
 /// (green for additions, red for deletions) — no `+`/`-` prefix characters.
-fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str) -> Vec<Row> {
+/// Code content is syntax-highlighted via tree-sitter when the language is known.
+fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option<&str>) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut old_ln: usize = 0;
     let mut new_ln: usize = 0;
@@ -660,29 +736,110 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str) -> Vec<Row> 
         } else {
             Style::default().fg(fg).bg(bg)
         };
-        let content_style = if sign == " " || sign == "" {
-            Style::default().fg(theme::DIFF_META)
-        } else {
-            Style::default().fg(fg).bg(bg)
-        };
         let ln_width = 5;
         let content_w = (w as usize).saturating_sub(ln_width);
-        let padded_content = if content.len() < content_w {
-            format!("{:<width$}", content, width = content_w)
+
+        let mut line_spans = vec![Span::styled(format!("{:>4} ", ln), ln_style)];
+
+        if let Some(lg) = lang {
+            let bg_ov = if sign == "-" || sign == "+" { Some(bg) } else { None };
+            let mut hl_spans = highlight_code_spans(content, lg, bg_ov, content_w);
+            let visible_w: usize = hl_spans.iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            if visible_w < content_w {
+                let pad_style = if sign == "-" || sign == "+" {
+                    Style::default().bg(bg)
+                } else {
+                    Style::default()
+                };
+                hl_spans.push(Span::styled(" ".repeat(content_w - visible_w), pad_style));
+            }
+            line_spans.extend(hl_spans);
         } else {
-            content.to_string()
+            let content_style = if sign == " " || sign == "" {
+                Style::default().fg(theme::DIFF_META)
+            } else {
+                Style::default().fg(fg).bg(bg)
+            };
+            let padded = if content.len() < content_w {
+                format!("{:<width$}", content, width = content_w)
+            } else {
+                content.to_string()
+            };
+            line_spans.push(Span::styled(padded, content_style));
         };
-        rows.push(Row {
+
+        rows.push(Row::new(
             x,
             w,
-            line: Line::from(vec![
-                Span::styled(format!("{:>4} ", ln), ln_style),
-                Span::styled(padded_content, content_style),
-            ]),
-        });
+            Line::from(line_spans),
+        ));
     }
     rows
 }
+
+/// Map a file path to a tree-sitter language name for syntax highlighting.
+fn lang_from_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?;
+    Some(match ext {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "go" => "go",
+        "sh" | "bash" | "zsh" => "bash",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "c" | "h" => "c",
+        "cpp" | "cxx" | "cc" | "hpp" => "cpp",
+        "html" | "htm" => "html",
+        "css" | "scss" => "css",
+        "sql" => "sql",
+        "rb" => "ruby",
+        "diff" | "patch" => "diff",
+        _ => return None,
+    })
+}
+
+/// Syntax-highlight a single line of code, returning styled spans.
+/// If `bg_override` is set, it replaces the background on every span (used for
+/// diff +/- lines that carry a green/red background).
+fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max_w: usize) -> Vec<Span<'static>> {
+    let segments = TS_HIGHLIGHTER.highlight(lang, code);
+    if segments.is_empty() {
+        let style = if let Some(bg) = bg_override {
+            Style::default().fg(theme::DIFF_META).bg(bg)
+        } else {
+            Style::default().fg(theme::DIFF_META)
+        };
+        return vec![Span::styled(code.to_string(), style)];
+    }
+    let mut spans = Vec::new();
+    for seg in &segments {
+        let text: String = code.chars().skip(seg.start).take(seg.end - seg.start).collect();
+        if text.is_empty() {
+            continue;
+        }
+        let mut style = seg.style;
+        if let Some(bg) = bg_override {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled(text, style));
+    }
+    if spans.is_empty() {
+        let style = if let Some(bg) = bg_override {
+            Style::default().fg(theme::DIFF_META).bg(bg)
+        } else {
+            Style::default().fg(theme::DIFF_META)
+        };
+        spans.push(Span::styled(code.to_string(), style));
+    }
+    spans
+}
+
 
 /// Parse the line numbers out of a hunk header like `@@ -204,7 +204,7 @@`.
 fn parse_hunk_header(h: &str) -> Option<(usize, usize)> {
@@ -779,6 +936,8 @@ impl ThinkingCell {
         path: Option<String>,
         read_offset: Option<usize>,
         read_limit: Option<usize>,
+        tool_call_id: Option<String>,
+        arguments: Option<String>,
     ) {
         self.blocks.push(ThinkBlock::Tool(ToolCallCell {
             tool_name: name.to_string(),
@@ -790,6 +949,8 @@ impl ThinkingCell {
             path,
             read_offset,
             read_limit,
+            tool_call_id,
+            arguments,
         }));
     }
 
@@ -825,6 +986,17 @@ impl ThinkingCell {
         s
     }
 
+    /// References to every tool-call card in order (for session persistence).
+    pub fn tool_blocks(&self) -> Vec<&ToolCallCell> {
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                ThinkBlock::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
         // Waiting / Thinking / Responding live in the activity strip above the
         // input bar (Claude Code style) — not inside the transcript cell.
@@ -842,12 +1014,9 @@ impl ThinkingCell {
                     if text.is_empty() {
                         continue;
                     }
-                    for line in render_markdown(text, text_w) {
-                        rows.push(Row {
-                            x: indent,
-                            w: width.saturating_sub(indent),
-                            line,
-                        });
+                    let md_lines = render_markdown(text, text_w);
+                    for line in md_lines {
+                        rows.push(Row::new(indent, width.saturating_sub(indent), line));
                     }
                 }
             }
@@ -867,14 +1036,15 @@ impl ThinkingCell {
                     }
                 }
                 if !glued {
-                    rows.push(Row {
-                        x: indent,
-                        w: width.saturating_sub(indent),
-                        line: Line::from(cursor),
-                    });
+                    rows.push(Row::new(
+                        indent,
+                        width.saturating_sub(indent),
+                        Line::from(cursor),
+                    ));
                 }
             }
         }
+        rows.push(Row::blank(width)); // bottom padding, matching the top row
         rows
     }
 }
@@ -930,6 +1100,19 @@ mod markdown_layout_tests {
     }
 
     #[test]
+    fn whitespace_separated_orphan_period_merges() {
+        let lines = render_markdown(
+            "LeRobot. The README hasn't been updated to reflect the actual implementation\n   \n  .",
+            120,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            line_text(&lines[0]),
+            "LeRobot. The README hasn't been updated to reflect the actual implementation."
+        );
+    }
+
+    #[test]
     fn plain_greeting_stays_one_line() {
         let lines = render_markdown(
             "Hi! I'm xa, a coding agent. How can I help you today?",
@@ -952,6 +1135,26 @@ mod markdown_layout_tests {
     }
 
     #[test]
+    fn fenced_code_is_plain_and_indented() {
+        let lines = render_markdown("```bash\npython -m magnus.training.train_sarm --resume /tmp/checkpoint.pt\n```", 100);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            line_text(&lines[0]),
+            "python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
+        );
+    }
+
+    #[test]
+    fn trailing_blank_code_lines_are_removed() {
+        let lines = render_markdown("```text\nUsage: `python -m magnus.training.train_sarm`\n\n\n```", 100);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            line_text(&lines[0]),
+            "Usage: `python -m magnus.training.train_sarm`"
+        );
+    }
+
+    #[test]
     fn thinking_cell_inline_cursor() {
         let mut tc = ThinkingCell::new();
         tc.add_text("Hi! How can I help you today?");
@@ -969,5 +1172,15 @@ mod markdown_layout_tests {
             content[0]
         );
         assert!(content[0].contains("today?"));
+    }
+
+    #[test]
+    fn thinking_cell_has_matching_top_and_bottom_padding() {
+        let mut tc = ThinkingCell::new();
+        tc.add_text("Done.");
+        tc.streaming = false;
+        let rows = tc.build(80, None);
+        assert!(line_is_blank(&rows[0].line));
+        assert!(line_is_blank(&rows[rows.len() - 1].line));
     }
 }

@@ -9,9 +9,20 @@ use dirs::config_dir;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct StoredMessage {
-    pub role: String, // "user" | "assistant" | "system"
+    pub role: String, // "user" | "assistant" | "system" | "tool"
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<StoredToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
