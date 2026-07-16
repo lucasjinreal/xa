@@ -1861,6 +1861,14 @@ pub async fn run(
                         app.handle_paste(text);
                     }
                     AppEvent::Terminal(crossterm::event::Event::Mouse(m)) => app.handle_mouse(m),
+                    AppEvent::Terminal(crossterm::event::Event::Resize(_, _)) => {
+                        // Re-measure the backend and rebuild every cell using
+                        // the new frame width. Without this, a wide terminal
+                        // keeps the old narrow markdown wrapping until some
+                        // unrelated state change happens.
+                        terminal.autoresize()?;
+                        app.dirty = true;
+                    }
                     AppEvent::Terminal(_) => {}
                     AppEvent::Stream(se) => app.handle_stream(se),
                     AppEvent::Wizard(res) => {

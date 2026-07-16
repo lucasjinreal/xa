@@ -102,40 +102,10 @@ fn convert_h456_to_bold(text: &str) -> String {
 /// - convert h4–h6 headings to bold (library only supports h1–h3)
 fn normalize_md_source(text: &str) -> String {
     let mut s = text.replace("\r\n", "\n").replace('\r', "\n");
-    s = repair_orphan_punctuation_lines(&s);
     while s.contains("\n\n\n") {
         s = s.replace("\n\n\n", "\n\n");
     }
     convert_h456_to_bold(&s)
-}
-
-/// Models occasionally put sentence-ending punctuation on its own, sometimes
-/// after a whitespace-only line. Repair that source form before the markdown
-/// parser can turn it into a separate paragraph. Fenced code is left exactly
-/// as written.
-fn repair_orphan_punctuation_lines(text: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut in_fence = false;
-
-    for raw in text.lines() {
-        let trimmed = raw.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            out.push(raw.to_string());
-            continue;
-        }
-        if !in_fence && only_ascii_punct(trimmed) {
-            while out.last().is_some_and(|line| line.trim().is_empty()) {
-                out.pop();
-            }
-            if let Some(previous) = out.last_mut().filter(|line| !line.trim().is_empty()) {
-                previous.push_str(trimmed);
-                continue;
-            }
-        }
-        out.push(raw.to_string());
-    }
-    out.join("\n")
 }
 
 /// True when `s` is non-empty and only ASCII punctuation (e.g. `"?"`, `"..."`).
@@ -1097,19 +1067,6 @@ mod markdown_layout_tests {
             lines.iter().map(line_text).collect::<Vec<_>>()
         );
         assert_eq!(line_text(&lines[0]), "Hi! How can I help you today?");
-    }
-
-    #[test]
-    fn whitespace_separated_orphan_period_merges() {
-        let lines = render_markdown(
-            "LeRobot. The README hasn't been updated to reflect the actual implementation\n   \n  .",
-            120,
-        );
-        assert_eq!(lines.len(), 1);
-        assert_eq!(
-            line_text(&lines[0]),
-            "LeRobot. The README hasn't been updated to reflect the actual implementation."
-        );
     }
 
     #[test]
