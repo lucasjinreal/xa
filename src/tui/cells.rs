@@ -21,11 +21,55 @@ use ratatui_markdown::{
     markdown::{MarkdownBlock, MarkdownRenderer},
     theme::ThemeConfig,
 };
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::shimmer_spans;
 use crate::tui::theme;
+
+/// Cached layout for a history cell at a given terminal width.
+///
+/// Without this, every scroll/redraw re-parses markdown and re-runs
+/// tree-sitter highlighting for *every* cell just to measure height — which
+/// made mouse-wheel scroll feel stuck and delayed key handling (e.g. Ctrl-C).
+struct LayoutCache {
+    width: u16,
+    /// Extra key bits (streaming flag, content generation, …).
+    fingerprint: u64,
+    rows: Vec<Row>,
+}
+
+impl LayoutCache {
+    fn matches(&self, width: u16, fingerprint: u64) -> bool {
+        self.width == width && self.fingerprint == fingerprint
+    }
+}
+
+/// Return cached rows or rebuild via `build`.
+fn cached_rows<'a>(
+    cache: &'a RefCell<Option<LayoutCache>>,
+    width: u16,
+    fingerprint: u64,
+    build: impl FnOnce() -> Vec<Row>,
+) -> std::cell::Ref<'a, Vec<Row>> {
+    {
+        let mut slot = cache.borrow_mut();
+        let hit = slot
+            .as_ref()
+            .is_some_and(|c| c.matches(width, fingerprint));
+        if !hit {
+            *slot = Some(LayoutCache {
+                width,
+                fingerprint,
+                rows: build(),
+            });
+        }
+    }
+    std::cell::Ref::map(cache.borrow(), |c| {
+        &c.as_ref().expect("layout cache just populated").rows
+    })
+}
 
 static TS_HIGHLIGHTER: std::sync::LazyLock<Arc<TreeSitterHighlighter>> =
     std::sync::LazyLock::new(|| Arc::new(TreeSitterHighlighter::new()));
@@ -351,9 +395,17 @@ fn paint_rows(rows: &[Row], area: Rect, skip: u16, buf: &mut Buffer) {
 
 pub struct SystemCell {
     pub content: String,
+    layout: RefCell<Option<LayoutCache>>,
 }
 
 impl SystemCell {
+    pub fn new(content: impl Into<String>) -> Self {
+        SystemCell {
+            content: content.into(),
+            layout: RefCell::new(None),
+        }
+    }
+
     fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
         let styled = render_markdown(&self.content, width as usize);
         let mut rows: Vec<Row> = styled
@@ -363,15 +415,18 @@ impl SystemCell {
         rows.push(Row::blank(width)); // trailing separator
         rows
     }
+
+    fn rows(&self, width: u16) -> std::cell::Ref<'_, Vec<Row>> {
+        cached_rows(&self.layout, width, 0, || self.build(width, None))
+    }
 }
 
 impl HistoryCell for SystemCell {
     fn desired_height(&self, width: u16) -> u16 {
-        self.build(width, None).len() as u16
+        self.rows(width).len() as u16
     }
-    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
-        let rows = self.build(area.width, Some(ctx));
-        paint_rows(&rows, area, skip, buf);
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, _ctx: &RenderContext) {
+        paint_rows(&self.rows(area.width), area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -392,9 +447,17 @@ pub const USER_LEAD_COLS: u16 = 2;
 
 pub struct UserCell {
     pub content: String,
+    layout: RefCell<Option<LayoutCache>>,
 }
 
 impl UserCell {
+    pub fn new(content: impl Into<String>) -> Self {
+        UserCell {
+            content: content.into(),
+            layout: RefCell::new(None),
+        }
+    }
+
     fn build(&self, width: u16, _ctx: Option<&RenderContext>) -> Vec<Row> {
         // Layout: [1 col margin][❯ ][text…][1 col margin]
         let left_margin = 1u16;
@@ -438,15 +501,18 @@ impl UserCell {
         rows.push(Row::blank(width)); // bottom padding
         rows
     }
+
+    fn rows(&self, width: u16) -> std::cell::Ref<'_, Vec<Row>> {
+        cached_rows(&self.layout, width, 0, || self.build(width, None))
+    }
 }
 
 impl HistoryCell for UserCell {
     fn desired_height(&self, width: u16) -> u16 {
-        self.build(width, None).len() as u16
+        self.rows(width).len() as u16
     }
-    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
-        let rows = self.build(area.width, Some(ctx));
-        paint_rows(&rows, area, skip, buf);
+    fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, _ctx: &RenderContext) {
+        paint_rows(&self.rows(area.width), area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -904,6 +970,9 @@ impl ThinkBlock {
 pub struct ThinkingCell {
     pub blocks: Vec<ThinkBlock>,
     pub streaming: bool,
+    /// Bumped on content mutations so the layout cache invalidates.
+    layout_gen: u64,
+    layout: RefCell<Option<LayoutCache>>,
 }
 
 impl ThinkingCell {
@@ -911,7 +980,32 @@ impl ThinkingCell {
         ThinkingCell {
             blocks: Vec::new(),
             streaming: true,
+            layout_gen: 0,
+            layout: RefCell::new(None),
         }
+    }
+
+    fn bump_layout(&mut self) {
+        self.layout_gen = self.layout_gen.wrapping_add(1);
+        *self.layout.borrow_mut() = None;
+    }
+
+    fn fingerprint(&self) -> u64 {
+        // Include streaming so the cursor row appears/disappears correctly
+        // even when external code toggles the flag without bump_layout.
+        self.layout_gen
+            .wrapping_mul(2)
+            .wrapping_add(u64::from(self.streaming))
+    }
+
+    /// True when a tool header still needs the shimmer animation.
+    fn has_running_tool(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            matches!(
+                b,
+                ThinkBlock::Tool(t) if t.status == ToolStatus::Running
+            )
+        })
     }
 
     /// Append streamed text, merging into the previous text block when the
@@ -922,6 +1016,7 @@ impl ThinkingCell {
         } else {
             self.blocks.push(ThinkBlock::Text(s.to_string()));
         }
+        self.bump_layout();
     }
 
     /// Add a freshly-started tool-call card.
@@ -948,6 +1043,7 @@ impl ThinkingCell {
             tool_call_id,
             arguments,
         }));
+        self.bump_layout();
     }
 
     /// Mark the most recent still-running tool card as finished.
@@ -965,6 +1061,7 @@ impl ThinkingCell {
                     // Auto-expand on failure, when we have a diff to show, or for
                     // reads (so the `→ Read` header is visible).
                     t.expanded = is_error || t.diff.is_some() || t.tool_name == "read";
+                    self.bump_layout();
                     return;
                 }
             }
@@ -1043,15 +1140,32 @@ impl ThinkingCell {
         rows.push(Row::blank(width)); // bottom padding, matching the top row
         rows
     }
+
+    fn rows(&self, width: u16, ctx: Option<&RenderContext>) -> std::cell::Ref<'_, Vec<Row>> {
+        // Running tool headers shimmer every frame — skip the cache so the
+        // animation keeps moving. Idle/finished cells hit the cache hard on
+        // scroll, which is the expensive path we care about.
+        let live = self.has_running_tool() && ctx.is_some();
+        if live {
+            // Force rebuild into the cache slot so subsequent height queries
+            // in the same frame still benefit.
+            *self.layout.borrow_mut() = None;
+            return cached_rows(&self.layout, width, self.fingerprint(), || {
+                self.build(width, ctx)
+            });
+        }
+        cached_rows(&self.layout, width, self.fingerprint(), || {
+            self.build(width, None)
+        })
+    }
 }
 
 impl HistoryCell for ThinkingCell {
     fn desired_height(&self, width: u16) -> u16 {
-        self.build(width, None).len() as u16
+        self.rows(width, None).len() as u16
     }
     fn render(&self, area: Rect, skip: u16, buf: &mut Buffer, ctx: &RenderContext) {
-        let rows = self.build(area.width, Some(ctx));
-        paint_rows(&rows, area, skip, buf);
+        paint_rows(&self.rows(area.width, Some(ctx)), area, skip, buf);
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self

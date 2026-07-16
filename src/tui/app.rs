@@ -219,9 +219,7 @@ impl App {
     }
 
     fn system_msg(&mut self, content: impl Into<String>) {
-        self.push_cell(Box::new(SystemCell {
-            content: content.into(),
-        }));
+        self.push_cell(Box::new(SystemCell::new(content)));
     }
 
     /// Rebuild the persisted session from the current messages and save it.
@@ -318,7 +316,7 @@ impl App {
             return;
         }
 
-        self.push_cell(Box::new(UserCell { content: text.clone() }));
+        self.push_cell(Box::new(UserCell::new(text.clone())));
         self.input = TextArea::default();
         self.paste_blocks.clear();
         self.scroll = u16::MAX;
@@ -1289,8 +1287,14 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn total_height(&self, width: u16) -> u16 {
-        self.cells.iter().map(|c| c.desired_height(width)).sum()
+    /// Measure every cell once for this frame. Callers previously re-ran
+    /// `desired_height` (full markdown + highlight) for total, then again per
+    /// cell while painting — O(2N) of the hottest path.
+    fn cell_heights(&self, width: u16) -> Vec<u16> {
+        self.cells
+            .iter()
+            .map(|c| c.desired_height(width))
+            .collect()
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame) {
@@ -1354,7 +1358,9 @@ impl App {
         const TIP_H: u16 = 2;
         const PRE: u16 = HEADER_H + TIP_H;
 
-        let total_cells = self.total_height(view.width);
+        // One layout pass for all cells at this width (cache fills here).
+        let heights = self.cell_heights(view.width);
+        let total_cells: u16 = heights.iter().sum();
 
         // First pass assumes the banner is shown to decide whether we're at the
         // top, then recompute the true scroll range for the chosen layout.
@@ -1397,7 +1403,7 @@ impl App {
             self.draw_tip(f, tip_area);
         }
 
-        // Virtual scroll: compute per-cell heights, clip to viewport.
+        // Virtual scroll: clip precomputed heights to the viewport.
         let total = total_cells;
         let view_h = transcript.height;
         let max_scroll = total.saturating_sub(view_h);
@@ -1419,8 +1425,8 @@ impl App {
         self.scroll = scroll; // reconcile
 
         let mut y: i32 = -(scroll as i32);
-        for c in self.cells.iter() {
-            let h = c.desired_height(transcript.width) as i32;
+        for (c, &h_u) in self.cells.iter().zip(heights.iter()) {
+            let h = h_u as i32;
             if y + h > 0 && y < view_h as i32 {
                 let top = y.max(0) as u16;
                 let bottom = (y + h).min(view_h as i32) as u16;
@@ -1694,6 +1700,41 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("\nUse `xa session ls` to see saved sessions.");
 }
 
+/// Handle one multiplexed app event. Returns `true` when the UI should exit.
+fn apply_app_event(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ev: AppEvent,
+) -> io::Result<bool> {
+    match ev {
+        AppEvent::Terminal(crossterm::event::Event::Key(k)) => {
+            if app.handle_key(k)? {
+                return Ok(true);
+            }
+        }
+        AppEvent::Terminal(crossterm::event::Event::Paste(text)) => {
+            app.handle_paste(text);
+        }
+        AppEvent::Terminal(crossterm::event::Event::Mouse(m)) => app.handle_mouse(m),
+        AppEvent::Terminal(crossterm::event::Event::Resize(_, _)) => {
+            // Re-measure the backend and rebuild every cell using the new
+            // frame width. Without this, a wide terminal keeps the old narrow
+            // markdown wrapping until some unrelated state change happens.
+            terminal.autoresize()?;
+            app.dirty = true;
+        }
+        AppEvent::Terminal(_) => {}
+        AppEvent::Stream(se) => app.handle_stream(se),
+        AppEvent::Wizard(res) => {
+            if let Some(w) = &mut app.wizard {
+                w.on_fetch_result(res);
+            }
+            app.dirty = true;
+        }
+    }
+    Ok(false)
+}
+
 /// Map a crossterm key event into tui-textarea's backend-agnostic `Input`.
 fn map_key(key: KeyEvent) -> Option<Input> {
     use KeyModifiers as M;
@@ -1808,7 +1849,7 @@ pub async fn run(
             let m = &resumed[i];
             match m.role.as_str() {
                 "user" => {
-                    app.push_cell(Box::new(UserCell { content: m.content.clone() }));
+                    app.push_cell(Box::new(UserCell::new(m.content.clone())));
                     i += 1;
                 }
                 "assistant" => {
@@ -1901,47 +1942,37 @@ pub async fn run(
     }
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
-    loop {
-        if app.dirty {
-            terminal.draw(|f| app.draw(f))?;
-        }
+    // First paint before waiting on input.
+    terminal.draw(|f| app.draw(f))?;
 
+    'ui: loop {
+        // Wait for the next event or animation tick, then drain anything else
+        // already queued. Drawing once per batch (not per mouse-wheel tick)
+        // keeps scroll responsive and prevents Ctrl-C from sitting behind a
+        // backlog of expensive redraws.
         tokio::select! {
             Some(ev) = rx_event.recv() => {
-                match ev {
-                    AppEvent::Terminal(crossterm::event::Event::Key(k)) => {
-                        if app.handle_key(k)? {
-                            break;
-                        }
-                    }
-                    AppEvent::Terminal(crossterm::event::Event::Paste(text)) => {
-                        app.handle_paste(text);
-                    }
-                    AppEvent::Terminal(crossterm::event::Event::Mouse(m)) => app.handle_mouse(m),
-                    AppEvent::Terminal(crossterm::event::Event::Resize(_, _)) => {
-                        // Re-measure the backend and rebuild every cell using
-                        // the new frame width. Without this, a wide terminal
-                        // keeps the old narrow markdown wrapping until some
-                        // unrelated state change happens.
-                        terminal.autoresize()?;
-                        app.dirty = true;
-                    }
-                    AppEvent::Terminal(_) => {}
-                    AppEvent::Stream(se) => app.handle_stream(se),
-                    AppEvent::Wizard(res) => {
-                        if let Some(w) = &mut app.wizard {
-                            w.on_fetch_result(res);
-                        }
-                        app.dirty = true;
+                if apply_app_event(&mut app, &mut terminal, ev)? {
+                    break 'ui;
+                }
+                while let Ok(ev) = rx_event.try_recv() {
+                    if apply_app_event(&mut app, &mut terminal, ev)? {
+                        break 'ui;
                     }
                 }
             }
             _ = tick.tick() => {
-                // Only redraw when something is animating.
+                // Only redraw when something is animating (stream, shimmer,
+                // slash menu, or wizard). Sticky interrupted/error lines are
+                // static and must not force a 20fps repaint loop.
                 if app.streaming || app.slash_mode || app.wizard.is_some() {
                     app.dirty = true;
                 }
             }
+        }
+
+        if app.dirty {
+            terminal.draw(|f| app.draw(f))?;
         }
 
         if !matches!(app.pending, Pending::None) {
