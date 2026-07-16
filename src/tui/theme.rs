@@ -24,6 +24,8 @@ pub const BG: Color = Color::Rgb(22, 22, 22);
 /// Elevated surface (header box, cards, popups).
 #[allow(dead_code)]
 pub const SURFACE: Color = Color::Rgb(36, 36, 36);
+/// Subtle full-width bar behind fenced code in AI messages (just above BG).
+pub const CODE_BG: Color = Color::Rgb(30, 30, 30);
 /// User message cell background (dim, subtle lift off terminal bg).
 pub const USER_BG: Color = Color::Rgb(34, 34, 34);
 /// Input composer background (slightly lighter than user cell, still dim).

@@ -211,10 +211,17 @@ fn line_is_blank(l: &Line<'_>) -> bool {
 }
 
 /// Keep at most one blank line between content blocks; drop leading/trailing.
+/// Code-block rows (marked with [`theme::CODE_BG`]) are never treated as
+/// collapsible blanks — they form a solid full-width bar including pads.
 fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut prev_blank = true; // suppress leading blanks
     for line in lines {
+        if is_code_line(&line) {
+            out.push(line);
+            prev_blank = false;
+            continue;
+        }
         let blank = line_is_blank(&line);
         if blank {
             if !prev_blank {
@@ -226,8 +233,15 @@ fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
             prev_blank = false;
         }
     }
-    while out.last().is_some_and(line_is_blank) {
+    while out.last().is_some_and(|l| line_is_blank(l) && !is_code_line(l)) {
         out.pop();
+    }
+    // Drop leading non-code blanks only.
+    while out
+        .first()
+        .is_some_and(|l| line_is_blank(l) && !is_code_line(l))
+    {
+        out.remove(0);
     }
     out
 }
@@ -289,7 +303,8 @@ const CODE_BLOCK_INDENT: &str = "  ";
 /// the prior implementation incorrectly reused those offsets on every line.
 ///
 /// Layout: one blank line above, one blank line below, each content line
-/// prefixed with [`CODE_BLOCK_INDENT`].
+/// prefixed with [`CODE_BLOCK_INDENT`]. Spans carry [`theme::CODE_BG`] so the
+/// AI cell can paint a full-width subtle bar behind the block.
 struct XaRenderHooks {
     max_width: usize,
 }
@@ -300,38 +315,97 @@ fn trim_code_fence_body(content: &str) -> &str {
     content.trim_end_matches(['\n', '\r'])
 }
 
+fn code_bg_style() -> Style {
+    Style::default().bg(theme::CODE_BG)
+}
+
+/// Mark every span with the code-block background so ThinkingCell can detect
+/// and expand the bar to full terminal width.
+fn apply_code_bg(mut line: Line<'static>) -> Line<'static> {
+    for span in &mut line.spans {
+        span.style = span.style.bg(theme::CODE_BG);
+    }
+    if line.spans.is_empty() {
+        // Keep a single space so the row is still classified as a code bar
+        // (and can be padded to full width later).
+        line.spans
+            .push(Span::styled(" ", code_bg_style()));
+    }
+    line
+}
+
+fn is_code_line(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .any(|s| s.style.bg == Some(theme::CODE_BG))
+}
+
+/// Full-width code row: left think-indent + markdown code line + trailing
+/// spaces, all on [`theme::CODE_BG`], painted from column 0.
+fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if THINK_INDENT > 0 {
+        spans.push(Span::styled(
+            " ".repeat(THINK_INDENT as usize),
+            code_bg_style(),
+        ));
+    }
+    for mut span in line.spans {
+        span.style = span.style.bg(theme::CODE_BG);
+        spans.push(span);
+    }
+    let used: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let w = width as usize;
+    if used < w {
+        spans.push(Span::styled(" ".repeat(w - used), code_bg_style()));
+    } else if used > w {
+        // Extremely long (shouldn't wrap past max_width); still paint bg.
+        // Truncation is handled by set_line's width clip.
+    }
+    Row::new(0, width, Line::from(spans))
+}
+
 impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
         let content = trim_code_fence_body(content);
         let segments = TS_HIGHLIGHTER.highlight(lang, content);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        // 1 line top pad
-        lines.push(Line::default());
+        // 1 line top pad (marked as code so the bar includes breathing room)
+        lines.push(apply_code_bg(Line::default()));
 
         if segments.is_empty() {
-            let code_style = Style::default().fg(theme::TEXT_DIM);
+            let code_style = Style::default().fg(theme::TEXT_DIM).bg(theme::CODE_BG);
             if content.is_empty() {
-                lines.push(Line::from(Span::raw(CODE_BLOCK_INDENT.to_string())));
+                lines.push(apply_code_bg(Line::from(Span::styled(
+                    CODE_BLOCK_INDENT.to_string(),
+                    code_style,
+                ))));
             } else {
                 for line in content.split('\n') {
-                    lines.push(Line::from(vec![
-                        Span::raw(CODE_BLOCK_INDENT.to_string()),
+                    lines.push(apply_code_bg(Line::from(vec![
+                        Span::styled(CODE_BLOCK_INDENT.to_string(), code_style),
                         Span::styled(line.to_string(), code_style),
-                    ]));
+                    ])));
                 }
             }
         } else {
-            lines.extend(segments_to_lines(
+            let hl = segments_to_lines(
                 content,
                 &segments,
                 CODE_BLOCK_INDENT,
-                Style::default(),
+                code_bg_style(),
                 self.max_width,
-            ));
+            );
+            for line in hl {
+                lines.push(apply_code_bg(line));
+            }
         }
 
         // 1 line bottom pad
-        lines.push(Line::default());
+        lines.push(apply_code_bg(Line::default()));
         Some(lines)
     }
 }
@@ -538,6 +612,9 @@ pub enum ToolStatus {
 /// Left indent of thinking content: text blocks and tool-call headers align
 /// here, so the whole assistant turn reads as one indented column.
 const THINK_INDENT: u16 = 2;
+/// Right-side breathing room for AI markdown text (not used by full-width
+/// code bars, which paint edge-to-edge).
+const THINK_RIGHT_PAD: u16 = 1;
 /// Extra indent for content nested *under* a tool card (diff / read meta).
 const TOOL_BODY_INDENT: u16 = 4;
 
@@ -1098,7 +1175,11 @@ impl ThinkingCell {
         }
 
         let indent = THINK_INDENT;
-        let text_w = width.saturating_sub(indent).max(1) as usize;
+        // Left indent + 1-col right pad for normal markdown text.
+        let text_w = width
+            .saturating_sub(indent.saturating_add(THINK_RIGHT_PAD))
+            .max(1) as usize;
+        let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
         let mut rows = vec![Row::blank(width)]; // top padding
         for b in &self.blocks {
             match b {
@@ -1109,31 +1190,35 @@ impl ThinkingCell {
                     }
                     let md_lines = render_markdown(text, text_w);
                     for line in md_lines {
-                        rows.push(Row::new(indent, width.saturating_sub(indent), line));
+                        if is_code_line(&line) {
+                            // Full-width subtle bar (edge to edge).
+                            rows.push(full_width_code_row(line, width));
+                        } else {
+                            rows.push(Row::new(indent, text_row_w, line));
+                        }
                     }
                 }
             }
         }
         // Streaming cursor: append to the last text row so it sits at the end
         // of the answer (not on its own row, which looked like a stray glyph /
-        // broken line break after the message).
+        // broken line break after the message). Skip full-width code bars.
         if self.streaming {
             let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)));
             if !tail_is_tool {
                 let cursor = Span::styled("█", Style::default().fg(theme::ACCENT));
                 let mut glued = false;
                 if let Some(last) = rows.last_mut() {
-                    if last.x == indent && !line_is_blank(&last.line) {
+                    if last.x == indent
+                        && !line_is_blank(&last.line)
+                        && !is_code_line(&last.line)
+                    {
                         last.line.spans.push(cursor.clone());
                         glued = true;
                     }
                 }
                 if !glued {
-                    rows.push(Row::new(
-                        indent,
-                        width.saturating_sub(indent),
-                        Line::from(cursor),
-                    ));
+                    rows.push(Row::new(indent, text_row_w, Line::from(cursor)));
                 }
             }
         }
@@ -1233,15 +1318,18 @@ mod markdown_layout_tests {
 
     #[test]
     fn fenced_code_is_plain_and_indented() {
-        // Standalone fence: compact_md_lines drops leading/trailing pads of the
-        // whole output, but content still gets the 2-space indent.
+        // Standalone fence keeps top/bottom code-pad rows (subtle bg bar) plus
+        // the 2-space-indented body line.
         let lines = render_markdown(
             "```bash\npython -m magnus.training.train_sarm --resume /tmp/checkpoint.pt\n```",
             100,
         );
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 3, "top pad + body + bottom pad");
+        assert!(is_code_line(&lines[0]));
+        assert!(is_code_line(&lines[1]));
+        assert!(is_code_line(&lines[2]));
         assert_eq!(
-            line_text(&lines[0]),
+            line_text(&lines[1]).trim_end(),
             "  python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
         );
     }
@@ -1249,18 +1337,16 @@ mod markdown_layout_tests {
     #[test]
     fn fenced_code_has_pad_between_paragraphs() {
         let lines = render_markdown("Before.\n\n```text\ncode line\n```\n\nAfter.", 100);
-        let texts: Vec<_> = lines.iter().map(line_text).collect();
-        assert_eq!(
-            texts,
-            vec![
-                "Before.".to_string(),
-                String::new(),
-                "  code line".to_string(),
-                String::new(),
-                "After.".to_string(),
-            ],
-            "got: {texts:?}"
-        );
+        let texts: Vec<_> = lines.iter().map(|l| line_text(l).trim_end().to_string()).collect();
+        // Paragraph blank + code top/bottom pads (code pads are " " with CODE_BG).
+        assert!(texts.iter().any(|t| t == "Before."));
+        assert!(texts.iter().any(|t| t == "  code line"));
+        assert!(texts.iter().any(|t| t == "After."));
+        let code_idx = texts.iter().position(|t| t == "  code line").unwrap();
+        assert!(is_code_line(&lines[code_idx]));
+        // Immediate neighbors of the body are code pad rows with bg.
+        assert!(is_code_line(&lines[code_idx - 1]));
+        assert!(is_code_line(&lines[code_idx + 1]));
     }
 
     #[test]
@@ -1269,11 +1355,43 @@ mod markdown_layout_tests {
             "```text\nUsage: `python -m magnus.training.train_sarm`\n\n\n```",
             100,
         );
-        assert_eq!(lines.len(), 1);
+        // top pad + body + bottom pad (inner trailing fence blanks trimmed)
+        assert_eq!(lines.len(), 3);
         assert_eq!(
-            line_text(&lines[0]),
+            line_text(&lines[1]).trim_end(),
             "  Usage: `python -m magnus.training.train_sarm`"
         );
+        assert!(lines.iter().all(is_code_line));
+    }
+
+    #[test]
+    fn thinking_cell_code_bar_is_full_width() {
+        let mut tc = ThinkingCell::new();
+        tc.add_text("```text\nhello\n```");
+        tc.streaming = false;
+        let width = 40u16;
+        let rows = tc.build(width, None);
+        let code_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| is_code_line(&r.line))
+            .collect();
+        assert!(!code_rows.is_empty());
+        for r in code_rows {
+            assert_eq!(r.x, 0, "code bar starts at left edge");
+            assert_eq!(r.w, width, "code bar spans full width");
+            assert_eq!(
+                line_display_width_for_test(&r.line),
+                width as usize,
+                "line is padded with CODE_BG spaces to full width"
+            );
+        }
+    }
+
+    fn line_display_width_for_test(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
     }
 
     #[test]
