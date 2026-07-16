@@ -20,6 +20,8 @@ pub enum StreamPhase {
     RunningTool,
     /// Retrying after a transient error.
     Retrying { attempt: u32, max: u32 },
+    /// User cancelled the in-flight turn (ESC).
+    Interrupted,
     Error,
 }
 
@@ -34,12 +36,18 @@ impl StreamPhase {
             StreamPhase::Retrying { attempt, max } => {
                 Some(format!("Retrying ({attempt}/{max})\u{2026}"))
             }
+            StreamPhase::Interrupted => Some("interrupted".into()),
             StreamPhase::Error => Some("Error".into()),
         }
     }
 
     pub fn is_active(self) -> bool {
         !matches!(self, StreamPhase::Idle)
+    }
+
+    /// Terminal phases keep a sticky activity line until the next keystroke.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, StreamPhase::Interrupted | StreamPhase::Error)
     }
 }
 
@@ -149,6 +157,15 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_is_terminal_not_error() {
+        assert_eq!(StreamPhase::Interrupted.label().as_deref(), Some("interrupted"));
+        assert!(StreamPhase::Interrupted.is_terminal());
+        assert!(StreamPhase::Error.is_terminal());
+        assert!(!StreamPhase::Waiting.is_terminal());
+        assert!(StreamPhase::Interrupted.is_active());
+    }
 
     #[test]
     fn strips_think_block() {

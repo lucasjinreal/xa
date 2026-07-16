@@ -91,6 +91,9 @@ pub struct App {
     stream_phase: StreamPhase,
     /// When the current [`stream_phase`] began (timer restarts on phase change).
     phase_started: Instant,
+    /// Frozen elapsed seconds for terminal phases (Interrupted / Error).
+    /// When set, the activity timer stops advancing.
+    phase_elapsed_frozen: Option<f32>,
     /// Strips `<think>`…`</think>` from streamed text and drives Thinking phase.
     think_filter: ThinkFilter,
     pending: Pending,
@@ -141,6 +144,7 @@ impl App {
             status: String::new(),
             stream_phase: StreamPhase::Idle,
             phase_started: Instant::now(),
+            phase_elapsed_frozen: None,
             think_filter: ThinkFilter::new(),
             pending: Pending::None,
             event_tx,
@@ -173,19 +177,40 @@ impl App {
     }
 
     /// Update activity phase; restarts the elapsed timer only when it changes.
+    /// Terminal phases (Interrupted / Error) freeze the timer instead of
+    /// restarting it so the strip stops counting after the turn ends.
     fn set_stream_phase(&mut self, phase: StreamPhase) {
-        if self.stream_phase != phase {
-            self.stream_phase = phase;
-            self.phase_started = Instant::now();
-            self.dirty = true;
+        if self.stream_phase == phase {
+            return;
         }
+        if phase.is_terminal() {
+            // Freeze elapsed at the moment we leave the live phase. Do not
+            // restart the clock — that made interrupted/error look like it
+            // was still timing from zero.
+            if self.phase_elapsed_frozen.is_none() {
+                self.phase_elapsed_frozen =
+                    Some(self.phase_started.elapsed().as_secs_f32());
+            }
+        } else if phase == StreamPhase::Idle {
+            self.phase_elapsed_frozen = None;
+        } else {
+            self.phase_started = Instant::now();
+            self.phase_elapsed_frozen = None;
+        }
+        self.stream_phase = phase;
+        self.dirty = true;
     }
 
-    /// Elapsed time in the current status, e.g. `0.4s` / `12.3s` / `1m05s`.
+    /// Elapsed time in the current status, e.g. `0.4s` / `12s` / `1m05s`.
+    /// Tenths are only shown under 10s; after that whole seconds are enough.
     fn phase_elapsed_label(&self) -> String {
-        let secs = self.phase_started.elapsed().as_secs_f32();
-        if secs < 60.0 {
+        let secs = self
+            .phase_elapsed_frozen
+            .unwrap_or_else(|| self.phase_started.elapsed().as_secs_f32());
+        if secs < 10.0 {
             format!("{secs:.1}s")
+        } else if secs < 60.0 {
+            format!("{}s", secs as u32)
         } else {
             let m = (secs as u32) / 60;
             let s = (secs as u32) % 60;
@@ -346,14 +371,17 @@ impl App {
             StreamEvent::Delta(s) => {
                 // Strip `<think>`…`</think>` from the transcript; drive phase.
                 let (visible, inside_think) = self.think_filter.feed(&s);
-                let next = if inside_think {
-                    StreamPhase::Thinking
-                } else if self.think_filter.saw_visible || !visible.is_empty() {
-                    StreamPhase::Responding
-                } else {
-                    StreamPhase::Waiting
-                };
-                self.set_stream_phase(next);
+                // Late deltas after ESC must not clobber Interrupted.
+                if !self.stream_phase.is_terminal() {
+                    let next = if inside_think {
+                        StreamPhase::Thinking
+                    } else if self.think_filter.saw_visible || !visible.is_empty() {
+                        StreamPhase::Responding
+                    } else {
+                        StreamPhase::Waiting
+                    };
+                    self.set_stream_phase(next);
+                }
 
                 if !visible.is_empty() {
                     if let Some(i) = self.active_think {
@@ -386,8 +414,13 @@ impl App {
                     }
                 }
                 self.streaming = false;
-                self.set_stream_phase(StreamPhase::Idle);
-                self.status.clear();
+                // Keep sticky Interrupted / Error; only clear live phases.
+                if !self.stream_phase.is_terminal() {
+                    self.set_stream_phase(StreamPhase::Idle);
+                    self.status.clear();
+                } else {
+                    self.status.clear();
+                }
                 if let Some(i) = self.active_think {
                     if let Some(tc) = self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>() {
                         tc.streaming = false;
@@ -395,16 +428,34 @@ impl App {
                 }
                 self.active_think = None;
                 self.sync_session();
-                // flush queued inputs
-                if let Some(next) = self.queued_inputs.pop_front() {
-                    self.submit(next);
+                // Do not auto-flush the queue after an interrupt/error — the
+                // user stopped this turn on purpose.
+                if !self.stream_phase.is_terminal() {
+                    if let Some(next) = self.queued_inputs.pop_front() {
+                        self.submit(next);
+                    }
                 }
                 self.dirty = true;
             }
             StreamEvent::Error(e) => {
                 self.streaming = false;
-                self.set_stream_phase(StreamPhase::Error);
                 self.status.clear();
+                // User ESC / cancel is not a failure — show interrupted, no
+                // error body in the transcript.
+                if e == "cancelled" || self.cancel_flag.load(Ordering::SeqCst) {
+                    self.set_stream_phase(StreamPhase::Interrupted);
+                    if let Some(i) = self.active_think {
+                        if let Some(tc) =
+                            self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>()
+                        {
+                            tc.streaming = false;
+                        }
+                    }
+                    self.active_think = None;
+                    self.dirty = true;
+                    return;
+                }
+                self.set_stream_phase(StreamPhase::Error);
                 // Surface the error directly inside the AI response cell so the
                 // user can see what went wrong, rather than only the status bar.
                 let idx = if let Some(i) = self.active_think {
@@ -423,8 +474,10 @@ impl App {
                 self.dirty = true;
             }
             StreamEvent::Retrying { attempt, max, reason } => {
-                self.set_stream_phase(StreamPhase::Retrying { attempt, max });
-                self.status = format!("retry {attempt}/{max}: {reason}");
+                if !self.stream_phase.is_terminal() {
+                    self.set_stream_phase(StreamPhase::Retrying { attempt, max });
+                    self.status = format!("retry {attempt}/{max}: {reason}");
+                }
                 self.dirty = true;
             }
             StreamEvent::Usage { .. } => {}
@@ -445,7 +498,9 @@ impl App {
                 if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
                     tc.add_tool(&name, &preview, path, read_offset, read_limit, Some(id), Some(arguments));
                 }
-                self.set_stream_phase(StreamPhase::RunningTool);
+                if !self.stream_phase.is_terminal() {
+                    self.set_stream_phase(StreamPhase::RunningTool);
+                }
                 self.dirty = true;
             }
             StreamEvent::ToolResult {
@@ -471,7 +526,7 @@ impl App {
                     self.active_think = Some(self.cells.len() - 1);
                 }
                 // After a tool, wait for the next model tokens.
-                if self.streaming {
+                if self.streaming && !self.stream_phase.is_terminal() {
                     let next = if self.think_filter.inside_think() {
                         StreamPhase::Thinking
                     } else if self.think_filter.saw_visible {
@@ -667,8 +722,8 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
-        // Dismiss a sticky error activity line on the next keystroke.
-        if self.stream_phase == StreamPhase::Error && !self.streaming {
+        // Dismiss a sticky interrupted/error activity line on the next keystroke.
+        if self.stream_phase.is_terminal() && !self.streaming {
             self.set_stream_phase(StreamPhase::Idle);
         }
 
@@ -722,8 +777,8 @@ impl App {
         match key.code {
             KeyCode::Esc if self.streaming => {
                 self.cancel_flag.store(true, Ordering::SeqCst);
-                self.set_stream_phase(StreamPhase::Error);
-                self.status = "interrupted".into();
+                self.set_stream_phase(StreamPhase::Interrupted);
+                self.status.clear();
                 self.dirty = true;
             }
             KeyCode::PageUp => {
@@ -1189,6 +1244,7 @@ impl App {
 
         let base = match self.stream_phase {
             StreamPhase::Error => theme::ERROR,
+            StreamPhase::Interrupted => theme::WARNING,
             StreamPhase::Thinking => theme::TEXT_DIM,
             StreamPhase::Responding => theme::TEXT_DIM,
             StreamPhase::RunningTool => theme::WARNING,
@@ -1203,7 +1259,8 @@ impl App {
         let spinner = spinner_frames[spinner_idx];
 
         let mut spans = vec![Span::styled("  ", Style::default().fg(theme::TEXT_DIM))];
-        if self.stream_phase.is_active() && self.stream_phase != StreamPhase::Error {
+        // Live phases shimmer + spin; terminal phases (interrupted/error) are static.
+        if self.stream_phase.is_active() && !self.stream_phase.is_terminal() {
             spans.push(Span::styled(
                 format!("{} ", spinner),
                 Style::default().fg(theme::TEXT),

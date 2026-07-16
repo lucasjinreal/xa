@@ -237,32 +237,58 @@ fn merge_orphan_punct_paragraphs(blocks: &mut Vec<MarkdownBlock>) {
     }
 }
 
+/// Horizontal indent for fenced code bodies (2-space "tab").
+const CODE_BLOCK_INDENT: &str = "  ";
+
 /// Custom markdown hook for fenced code. `segments_to_lines` translates the
 /// highlighter's whole-block byte offsets into each rendered line correctly;
 /// the prior implementation incorrectly reused those offsets on every line.
+///
+/// Layout: one blank line above, one blank line below, each content line
+/// prefixed with [`CODE_BLOCK_INDENT`].
 struct XaRenderHooks {
     max_width: usize,
 }
 
+/// Drop trailing empty lines from fence body (models often leave a blank
+/// before the closing ```).
+fn trim_code_fence_body(content: &str) -> &str {
+    content.trim_end_matches(['\n', '\r'])
+}
+
 impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
+        let content = trim_code_fence_body(content);
         let segments = TS_HIGHLIGHTER.highlight(lang, content);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // 1 line top pad
+        lines.push(Line::default());
+
         if segments.is_empty() {
             let code_style = Style::default().fg(theme::TEXT_DIM);
-            return Some(
-                content
-                    .split('\n')
-                    .map(|line| Line::from(Span::styled(line.to_string(), code_style)))
-                    .collect(),
-            );
+            if content.is_empty() {
+                lines.push(Line::from(Span::raw(CODE_BLOCK_INDENT.to_string())));
+            } else {
+                for line in content.split('\n') {
+                    lines.push(Line::from(vec![
+                        Span::raw(CODE_BLOCK_INDENT.to_string()),
+                        Span::styled(line.to_string(), code_style),
+                    ]));
+                }
+            }
+        } else {
+            lines.extend(segments_to_lines(
+                content,
+                &segments,
+                CODE_BLOCK_INDENT,
+                Style::default(),
+                self.max_width,
+            ));
         }
-        Some(segments_to_lines(
-            content,
-            &segments,
-            "",
-            Style::default(),
-            self.max_width,
-        ))
+
+        // 1 line bottom pad
+        lines.push(Line::default());
+        Some(lines)
     }
 }
 
@@ -1093,21 +1119,46 @@ mod markdown_layout_tests {
 
     #[test]
     fn fenced_code_is_plain_and_indented() {
-        let lines = render_markdown("```bash\npython -m magnus.training.train_sarm --resume /tmp/checkpoint.pt\n```", 100);
+        // Standalone fence: compact_md_lines drops leading/trailing pads of the
+        // whole output, but content still gets the 2-space indent.
+        let lines = render_markdown(
+            "```bash\npython -m magnus.training.train_sarm --resume /tmp/checkpoint.pt\n```",
+            100,
+        );
         assert_eq!(lines.len(), 1);
         assert_eq!(
             line_text(&lines[0]),
-            "python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
+            "  python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
+        );
+    }
+
+    #[test]
+    fn fenced_code_has_pad_between_paragraphs() {
+        let lines = render_markdown("Before.\n\n```text\ncode line\n```\n\nAfter.", 100);
+        let texts: Vec<_> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Before.".to_string(),
+                String::new(),
+                "  code line".to_string(),
+                String::new(),
+                "After.".to_string(),
+            ],
+            "got: {texts:?}"
         );
     }
 
     #[test]
     fn trailing_blank_code_lines_are_removed() {
-        let lines = render_markdown("```text\nUsage: `python -m magnus.training.train_sarm`\n\n\n```", 100);
+        let lines = render_markdown(
+            "```text\nUsage: `python -m magnus.training.train_sarm`\n\n\n```",
+            100,
+        );
         assert_eq!(lines.len(), 1);
         assert_eq!(
             line_text(&lines[0]),
-            "Usage: `python -m magnus.training.train_sarm`"
+            "  Usage: `python -m magnus.training.train_sarm`"
         );
     }
 

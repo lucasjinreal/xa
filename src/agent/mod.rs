@@ -496,6 +496,12 @@ pub async fn run_conversation(
                 // Loop: let the model continue with the tool results.
             }
             Err(e) => {
+                // ESC / cancel is not an error — finish cleanly so the TUI
+                // can keep its Interrupted status instead of painting Error.
+                if e == "cancelled" || cancel.load(Ordering::SeqCst) {
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return;
+                }
                 let _ = tx.send(StreamEvent::Error(e)).await;
                 return;
             }
