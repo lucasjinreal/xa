@@ -601,9 +601,19 @@ impl App {
     }
 
     /// Handle a bracketed paste event from the terminal.
-    /// Multi-line pastes become a deletable block (opencode/codex-style);
-    /// single-line pastes are inserted directly into the textarea.
+    ///
+    /// When the provider/model wizard is open on a text field (API key, URL,
+    /// model name, …), paste goes into that field — never the chat input bar.
+    /// Otherwise multi-line pastes become a deletable block (opencode/codex-style)
+    /// and single-line pastes insert into the textarea.
     fn handle_paste(&mut self, text: String) {
+        if let Some(w) = &mut self.wizard {
+            if w.accepts_paste() {
+                w.handle_paste(&text);
+                self.dirty = true;
+                return;
+            }
+        }
         if text.contains('\n') {
             let trimmed = text.trim_end_matches('\n').to_string();
             if !trimmed.is_empty() {
@@ -1651,10 +1661,25 @@ fn tool_path_window(arguments: &str) -> (Option<String>, Option<usize>, Option<u
 }
 
 fn args_preview(arguments: &str) -> String {
-    // Try to pull the first interesting arg value for a one-line summary.
+    // Prefer known primary args so we never summarize a bare limit/offset
+    // (e.g. `Read(200)`) when a path/command is present.
+    const PREFERRED: &[&str] = &[
+        "path",
+        "command",
+        "cmd",
+        "pattern",
+        "query",
+        "url",
+        "name",
+        "file",
+    ];
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) {
         if let serde_json::Value::Object(map) = v {
-            if let Some((_, val)) = map.iter().next() {
+            let val = PREFERRED
+                .iter()
+                .find_map(|k| map.get(*k))
+                .or_else(|| map.values().next());
+            if let Some(val) = val {
                 let s = match val {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),

@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -30,6 +30,10 @@ const DIM: Color = theme::TEXT_DIM;
 const PLAIN: Color = theme::TEXT;
 const SELECT_BG: Color = theme::SELECT_BG;
 const BORDER: Color = theme::BORDER;
+/// Solid modal surface — opaque so transcript doesn't show through.
+const PANEL_BG: Color = theme::SURFACE;
+/// Slightly darker field strip for text inputs inside the modal.
+const FIELD_BG: Color = Color::Rgb(28, 28, 28);
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -215,26 +219,32 @@ impl Wizard {
             }
             tokio::select! {
                 Some(ev) = rx.recv() => {
-                    if let Event::Key(k) = ev {
-                        match wizard.handle_key(k) {
-                            WizardAction::None => {}
-                            WizardAction::Cancel => break,
-                            WizardAction::Done(p) => {
-                                result = Some(p);
-                                break;
+                    match ev {
+                        Event::Key(k) => {
+                            match wizard.handle_key(k) {
+                                WizardAction::None => {}
+                                WizardAction::Cancel => break,
+                                WizardAction::Done(p) => {
+                                    result = Some(p);
+                                    break;
+                                }
+                                WizardAction::StartFetch { endpoint, api_key } => {
+                                    let (ftx, frx) = mpsc::channel(4);
+                                    fetch_rx = Some(frx);
+                                    tokio::spawn(async move {
+                                        let r =
+                                            crate::agent::fetch_models(&endpoint, &api_key).await;
+                                        let _ = ftx.send(r).await;
+                                    });
+                                }
                             }
-                            WizardAction::StartFetch { endpoint, api_key } => {
-                                let (ftx, frx) = mpsc::channel(4);
-                                fetch_rx = Some(frx);
-                                tokio::spawn(async move {
-                                    let r = crate::agent::fetch_models(&endpoint, &api_key).await;
-                                    let _ = ftx.send(r).await;
-                                });
-                            }
+                            dirty = true;
                         }
-                        // Always redraw after a keypress so moved selection /
-                        // typed text is reflected (arrow keys return `None`).
-                        dirty = true;
+                        Event::Paste(text) => {
+                            wizard.handle_paste(&text);
+                            dirty = true;
+                        }
+                        _ => {}
                     }
                 }
                 Some(fr) = async { fetch_rx.as_mut().unwrap().recv().await },
@@ -311,6 +321,34 @@ impl Wizard {
                 WizardAction::None
             }
         }
+    }
+
+    /// True when paste should go into the wizard text field (not the chat bar).
+    pub fn accepts_paste(&self) -> bool {
+        matches!(
+            self.step,
+            Step::CustomName | Step::CustomUrl | Step::ApiKey | Step::CustomModel
+        )
+    }
+
+    /// Insert bracketed-paste text into the active field.
+    /// Newlines are collapsed so multi-line clipboard content still lands in
+    /// a single-line field (endpoint / API key / model name).
+    pub fn handle_paste(&mut self, text: &str) {
+        if !self.accepts_paste() {
+            return;
+        }
+        // Normalize clipboard junk: drop CR, treat newlines as nothing (join).
+        let cleaned: String = text
+            .chars()
+            .filter(|c| *c != '\r')
+            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .collect();
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            return;
+        }
+        self.text.push_str(cleaned);
     }
 
     fn key_provider(&mut self, key: KeyEvent) -> WizardAction {
@@ -481,10 +519,10 @@ impl Wizard {
     }
 
     pub fn draw(&self, f: &mut Frame, area: Rect) {
-        let width = area.width.min(66).max(40) as u16;
-        let height = area.height.min(22).max(10) as u16;
-        let x = area.width.saturating_sub(width) / 2;
-        let y = area.height.saturating_sub(height) / 2;
+        let width = area.width.min(66).max(40);
+        let height = area.height.min(22).max(12);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
         let popup = Rect {
             x,
             y,
@@ -492,23 +530,54 @@ impl Wizard {
             height,
         };
 
+        // Wipe underlying cells so the modal is fully opaque.
+        f.render_widget(Clear, popup);
+
+        let panel_style = Style::default().bg(PANEL_BG).fg(PLAIN);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(BORDER))
+            .border_style(Style::default().fg(ACCENT).bg(PANEL_BG))
+            .style(panel_style)
             .title(Span::styled(
                 self.title(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(PANEL_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(vec![
+                Span::styled(" ↑/↓ ", Style::default().fg(ACCENT).bg(PANEL_BG)),
+                Span::styled("nav ", Style::default().fg(DIM).bg(PANEL_BG)),
+                Span::styled("Enter ", Style::default().fg(ACCENT).bg(PANEL_BG)),
+                Span::styled("select ", Style::default().fg(DIM).bg(PANEL_BG)),
+                Span::styled("Esc ", Style::default().fg(ACCENT).bg(PANEL_BG)),
+                Span::styled("back ", Style::default().fg(DIM).bg(PANEL_BG)),
+                Span::styled(
+                    if self.accepts_paste() {
+                        "· paste ok "
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(DIM).bg(PANEL_BG),
+                ),
+            ]));
 
         let inner = block.inner(popup);
         f.render_widget(block, popup);
 
-        // Lay out [content area] over [footer hint].
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(inner);
-        let body = chunks[0];
+        // Paint inner body solid so list rows never show transcript through.
+        f.render_widget(
+            Block::default().style(Style::default().bg(PANEL_BG)),
+            inner,
+        );
+
+        // Content with a little horizontal padding.
+        let body = Rect {
+            x: inner.x.saturating_add(1),
+            y: inner.y.saturating_add(0),
+            width: inner.width.saturating_sub(2),
+            height: inner.height.saturating_sub(0),
+        };
 
         match self.step {
             Step::Provider => self.draw_provider(f, body),
@@ -518,19 +587,14 @@ impl Wizard {
             Step::Fetching => self.draw_fetching(f, body),
             Step::Model => self.draw_model(f, body),
         }
+    }
 
-        let hint = Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(ACCENT)),
-            Span::styled(" navigate  ", Style::default().fg(DIM)),
-            Span::styled("Enter", Style::default().fg(ACCENT)),
-            Span::styled(" select  ", Style::default().fg(DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT)),
-            Span::styled(" back", Style::default().fg(DIM)),
-        ]);
-        f.render_widget(
-            Paragraph::new(hint).alignment(Alignment::Center),
-            chunks[1],
-        );
+    fn row_style(selected: bool) -> Style {
+        if selected {
+            Style::default().bg(SELECT_BG).fg(PLAIN)
+        } else {
+            Style::default().bg(PANEL_BG).fg(PLAIN)
+        }
     }
 
     fn draw_provider(&self, f: &mut Frame, area: Rect) {
@@ -545,39 +609,37 @@ impl Wizard {
                 spans.push(Span::styled(
                     " › ",
                     Style::default()
-                        .fg(Color::White)
+                        .fg(ACCENT)
+                        .bg(SELECT_BG)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
-                spans.push(Span::styled("   ", Style::default()));
+                spans.push(Span::styled("   ", Style::default().bg(PANEL_BG)));
             }
             let label = src.label();
             spans.push(Span::styled(
                 format!("{:<12}", label),
                 Style::default()
-                    .fg(if sel { Color::White } else { ACCENT })
+                    .fg(if sel { ACCENT } else { PLAIN })
+                    .bg(if sel { SELECT_BG } else { PANEL_BG })
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
             let detail = match src {
                 Source::Existing(p) => format!("{}  (current)", p.endpoint),
                 Source::Preset(p) => match p.note {
-                    Some(n) => format!("{:<52}  ({})", p.base_url, n),
-                    None => format!("{:<52}", p.base_url),
+                    Some(n) => format!("{}  ({})", p.base_url, n),
+                    None => p.base_url.to_string(),
                 },
                 Source::Custom => "your own OpenAI-compatible endpoint".into(),
             };
             spans.push(Span::styled(
                 detail,
-                Style::default().fg(if sel { PLAIN } else { DIM }),
-            ));
-            let line = Line::from(spans);
-            let style = if sel {
-                Style::default().bg(SELECT_BG)
-            } else {
                 Style::default()
-            };
+                    .fg(if sel { PLAIN } else { DIM })
+                    .bg(if sel { SELECT_BG } else { PANEL_BG }),
+            ));
             f.render_widget(
-                Paragraph::new(line).style(style),
+                Paragraph::new(Line::from(spans)).style(Self::row_style(sel)),
                 Rect {
                     x: area.left(),
                     y,
@@ -595,8 +657,9 @@ impl Wizard {
         f.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 self.text_label.clone(),
-                Style::default().fg(DIM),
-            )])),
+                Style::default().fg(DIM).bg(PANEL_BG),
+            )]))
+            .style(Style::default().bg(PANEL_BG)),
             Rect {
                 x: area.left(),
                 y,
@@ -604,24 +667,32 @@ impl Wizard {
                 height: 1,
             },
         );
-        // Input line (echo dots for api key, plain otherwise).
+        // Input field on a darker strip so it reads as an editable box.
         let shown = if self.step == Step::ApiKey && !self.text.is_empty() {
             "•".repeat(self.text.chars().count())
         } else {
             self.text.clone()
         };
+        // Keep the caret visible; truncate from the left if the value is long.
+        let field_w = area.width.saturating_sub(2) as usize;
+        let mut display = format!("{shown}█");
+        while display_width(&display) > field_w && !display.is_empty() {
+            display = display.chars().skip(1).collect();
+        }
         let input_line = Line::from(vec![
-            Span::styled(" ", Style::default()),
+            Span::styled(" ", Style::default().bg(FIELD_BG)),
             Span::styled(
-                format!("{}{}", shown, "_"),
+                display,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(PLAIN)
+                    .bg(FIELD_BG)
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
-        if y + 1 < area.bottom() {
+        if y + 2 < area.bottom() {
+            // Spacer
             f.render_widget(
-                Paragraph::new(input_line),
+                Paragraph::new("").style(Style::default().bg(PANEL_BG)),
                 Rect {
                     x: area.left(),
                     y: y + 1,
@@ -629,6 +700,31 @@ impl Wizard {
                     height: 1,
                 },
             );
+            f.render_widget(
+                Paragraph::new(input_line).style(Style::default().bg(FIELD_BG)),
+                Rect {
+                    x: area.left(),
+                    y: y + 2,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            // Paste tip under the field.
+            if y + 4 < area.bottom() {
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![Span::styled(
+                        "  paste works here · Enter to continue · Esc back",
+                        Style::default().fg(DIM).bg(PANEL_BG),
+                    )]))
+                    .style(Style::default().bg(PANEL_BG)),
+                    Rect {
+                        x: area.left(),
+                        y: y + 4,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+            }
         }
     }
 
@@ -640,15 +736,16 @@ impl Wizard {
                 format!(" {frame} "),
                 Style::default()
                     .fg(ACCENT)
+                    .bg(PANEL_BG)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("Querying models at {}", self.draft.endpoint),
-                Style::default().fg(PLAIN),
+                Style::default().fg(PLAIN).bg(PANEL_BG),
             ),
         ]);
         f.render_widget(
-            Paragraph::new(line),
+            Paragraph::new(line).style(Style::default().bg(PANEL_BG)),
             Rect {
                 x: area.left(),
                 y: area.top(),
@@ -664,8 +761,9 @@ impl Wizard {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     format!(" ! {err}"),
-                    Style::default().fg(Color::Rgb(255, 180, 120)),
-                )])),
+                    Style::default().fg(Color::Rgb(255, 180, 120)).bg(PANEL_BG),
+                )]))
+                .style(Style::default().bg(PANEL_BG)),
                 Rect {
                     x: area.left(),
                     y,
@@ -677,8 +775,9 @@ impl Wizard {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     "   Enter a model manually, or Esc to go back.",
-                    Style::default().fg(DIM),
-                )])),
+                    Style::default().fg(DIM).bg(PANEL_BG),
+                )]))
+                .style(Style::default().bg(PANEL_BG)),
                 Rect {
                     x: area.left(),
                     y,
@@ -693,26 +792,24 @@ impl Wizard {
                 break;
             }
             let sel = i == self.model_idx;
+            let bg = if sel { SELECT_BG } else { PANEL_BG };
             let mut spans = Vec::new();
             spans.push(Span::styled(
                 if sel { " › " } else { "   " },
                 Style::default()
-                    .fg(Color::White)
+                    .fg(if sel { ACCENT } else { DIM })
+                    .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 m.clone(),
                 Style::default()
-                    .fg(if sel { Color::White } else { PLAIN })
+                    .fg(if sel { PLAIN } else { DIM })
+                    .bg(bg)
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
-            let style = if sel {
-                Style::default().bg(SELECT_BG)
-            } else {
-                Style::default()
-            };
             f.render_widget(
-                Paragraph::new(Line::from(spans)).style(style),
+                Paragraph::new(Line::from(spans)).style(Self::row_style(sel)),
                 Rect {
                     x: area.left(),
                     y,
@@ -725,25 +822,22 @@ impl Wizard {
         // Custom model entry.
         if y < area.bottom() {
             let sel = self.model_idx == self.models.len();
-            let style = if sel {
-                Style::default().bg(SELECT_BG)
-            } else {
-                Style::default()
-            };
+            let bg = if sel { SELECT_BG } else { PANEL_BG };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
                         if sel { " › " } else { "   " },
                         Style::default()
-                            .fg(Color::White)
+                            .fg(if sel { ACCENT } else { DIM })
+                            .bg(bg)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "custom… (enter a model name)",
-                        Style::default().fg(if sel { Color::White } else { DIM }),
+                        Style::default().fg(if sel { PLAIN } else { DIM }).bg(bg),
                     ),
                 ]))
-                .style(style),
+                .style(Self::row_style(sel)),
                 Rect {
                     x: area.left(),
                     y,
@@ -753,4 +847,8 @@ impl Wizard {
             );
         }
     }
+}
+
+fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
 }

@@ -15,11 +15,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui_markdown::{
     highlight::{segments_to_lines, CodeHighlighter, TreeSitterHighlighter},
     markdown::{MarkdownBlock, MarkdownRenderer},
-    theme::ThemeConfig,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -72,7 +71,11 @@ fn cached_rows<'a>(
 }
 
 static TS_HIGHLIGHTER: std::sync::LazyLock<Arc<TreeSitterHighlighter>> =
-    std::sync::LazyLock::new(|| Arc::new(TreeSitterHighlighter::new()));
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            TreeSitterHighlighter::new().with_code_colors(theme::code_syntax_colors()),
+        )
+    });
 
 /// A single drawable row inside a cell. `x`/`w` are offsets relative to the
 /// cell's left edge (which is always the transcript's left edge), so the same
@@ -298,15 +301,293 @@ fn merge_orphan_punct_paragraphs(blocks: &mut Vec<MarkdownBlock>) {
 /// Horizontal indent for fenced code bodies (2-space "tab").
 const CODE_BLOCK_INDENT: &str = "  ";
 
-/// Custom markdown hook for fenced code. `segments_to_lines` translates the
-/// highlighter's whole-block byte offsets into each rendered line correctly;
-/// the prior implementation incorrectly reused those offsets on every line.
+/// Custom markdown hook for fenced code + content-sized tables.
 ///
-/// Layout: one blank line above, one blank line below, each content line
-/// prefixed with [`CODE_BLOCK_INDENT`]. Spans carry [`theme::CODE_BG`] so the
-/// AI cell can paint a full-width subtle bar behind the block.
+/// Layout for code: one blank line above, one blank line below, each content
+/// line prefixed with [`CODE_BLOCK_INDENT`]. Spans carry [`theme::CODE_BG`] so
+/// the AI cell can paint a full-width subtle bar behind the block.
+///
+/// Tables size to their content instead of stretching to the terminal width;
+/// columns only shrink (and wrap) when the natural width exceeds `max_width`.
 struct XaRenderHooks {
     max_width: usize,
+}
+
+// Box-drawing chars for markdown tables (same set as ratatui-markdown).
+const T_HLINE: &str = "─";
+const T_VLINE: &str = "│";
+const T_TL: &str = "┌";
+const T_TR: &str = "┐";
+const T_BL: &str = "└";
+const T_BR: &str = "┘";
+const T_TM: &str = "┬";
+const T_BM: &str = "┴";
+const T_ML: &str = "├";
+const T_MR: &str = "┤";
+const T_X: &str = "┼";
+/// Spaces around cell text inside a column (`│ text │` → 1 each side).
+const TABLE_CELL_PAD: usize = 1;
+
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Word-wrap plain text to `max_w` display columns. Empty → one empty line.
+fn wrap_cell_text(text: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 {
+        return vec![String::new()];
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+
+    for word in text.split_whitespace() {
+        let ww = display_width(word);
+        if cur.is_empty() {
+            if ww <= max_w {
+                cur = word.to_string();
+                cur_w = ww;
+            } else {
+                // Hard-break overlong tokens.
+                let mut chunk = String::new();
+                let mut cw = 0usize;
+                for ch in word.chars() {
+                    let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cw + ch_w > max_w && !chunk.is_empty() {
+                        lines.push(std::mem::take(&mut chunk));
+                        cw = 0;
+                    }
+                    chunk.push(ch);
+                    cw += ch_w;
+                }
+                cur = chunk;
+                cur_w = cw;
+            }
+            continue;
+        }
+        if cur_w + 1 + ww <= max_w {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + ww;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            if ww <= max_w {
+                cur = word.to_string();
+                cur_w = ww;
+            } else {
+                let mut chunk = String::new();
+                let mut cw = 0usize;
+                for ch in word.chars() {
+                    let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cw + ch_w > max_w && !chunk.is_empty() {
+                        lines.push(std::mem::take(&mut chunk));
+                        cw = 0;
+                    }
+                    chunk.push(ch);
+                    cw += ch_w;
+                }
+                cur = chunk;
+                cur_w = cw;
+            }
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn table_hline(col_widths: &[usize], left: &str, mid: &str, right: &str) -> String {
+    let mut s = String::from(left);
+    for (i, w) in col_widths.iter().enumerate() {
+        if i > 0 {
+            s.push_str(mid);
+        }
+        s.push_str(&T_HLINE.repeat(*w));
+    }
+    s.push_str(right);
+    s
+}
+
+/// Content-sized markdown table: columns hug content; only shrink when the
+/// natural width would exceed `max_width`.
+fn render_content_sized_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    let col_count = headers
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if col_count == 0 {
+        return Vec::new();
+    }
+
+    let pad2 = TABLE_CELL_PAD * 2;
+    // Natural content width per column (no forced expansion).
+    let mut natural: Vec<usize> = (0..col_count)
+        .map(|c| {
+            let hw = headers
+                .get(c)
+                .map(|h| display_width(h.trim()))
+                .unwrap_or(0);
+            let rw = rows
+                .iter()
+                .filter_map(|r| r.get(c))
+                .map(|cell| display_width(cell.trim()))
+                .max()
+                .unwrap_or(0);
+            hw.max(rw).max(1)
+        })
+        .collect();
+
+    // Column outer widths include left+right cell padding.
+    let mut col_widths: Vec<usize> = natural.iter().map(|n| n + pad2).collect();
+
+    // Borders: one VLINE between cols + left/right → col_count + 1 chars.
+    let border_overhead = col_count + 1;
+    let natural_total: usize = col_widths.iter().sum::<usize>() + border_overhead;
+    let available = max_width.max(border_overhead + col_count * (pad2 + 1));
+
+    // Only shrink when table is wider than the viewport — never grow to fill it.
+    if natural_total > available {
+        let content_budget = available.saturating_sub(border_overhead + col_count * pad2);
+        let natural_sum: usize = natural.iter().sum::<usize>().max(1);
+        let mut allocated: Vec<usize> = natural
+            .iter()
+            .map(|n| ((*n as u64 * content_budget as u64) / natural_sum as u64).max(1) as usize)
+            .collect();
+        // Fix rounding so we don't exceed budget.
+        let mut used: usize = allocated.iter().sum();
+        while used > content_budget {
+            if let Some((i, _)) = allocated
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| **w > 1)
+                .max_by_key(|(_, w)| *w)
+            {
+                allocated[i] -= 1;
+                used -= 1;
+            } else {
+                break;
+            }
+        }
+        while used < content_budget {
+            if let Some((i, _)) = natural
+                .iter()
+                .enumerate()
+                .filter(|(i, n)| allocated[*i] < **n)
+                .max_by_key(|(_, n)| *n)
+            {
+                allocated[i] += 1;
+                used += 1;
+            } else {
+                break;
+            }
+        }
+        natural = allocated;
+        col_widths = natural.iter().map(|n| n + pad2).collect();
+    }
+
+    let border = Style::default().fg(theme::MD_MUTED);
+    let header_style = Style::default()
+        .fg(theme::MD_TEXT)
+        .add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(theme::MD_TEXT);
+
+    // Pre-wrap every cell to its content width.
+    let header_wrapped: Vec<Vec<String>> = (0..col_count)
+        .map(|c| {
+            let text = headers.get(c).map(|s| s.as_str()).unwrap_or("");
+            wrap_cell_text(text, natural[c])
+        })
+        .collect();
+    let rows_wrapped: Vec<Vec<Vec<String>>> = rows
+        .iter()
+        .map(|row| {
+            (0..col_count)
+                .map(|c| {
+                    let text = row.get(c).map(|s| s.as_str()).unwrap_or("");
+                    wrap_cell_text(text, natural[c])
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        table_hline(&col_widths, T_TL, T_TM, T_TR),
+        border,
+    )));
+
+    let push_row = |lines: &mut Vec<Line<'static>>,
+                    cells: &[Vec<String>],
+                    style: Style| {
+        let height = cells.iter().map(|c| c.len().max(1)).max().unwrap_or(1);
+        for li in 0..height {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled(T_VLINE.to_string(), border));
+            for c in 0..col_count {
+                let text = cells
+                    .get(c)
+                    .and_then(|lines| lines.get(li))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let tw = display_width(text);
+                let inner = natural[c];
+                let pad_right = inner.saturating_sub(tw);
+                let mut cell = String::new();
+                cell.push_str(&" ".repeat(TABLE_CELL_PAD));
+                cell.push_str(text);
+                cell.push_str(&" ".repeat(pad_right + TABLE_CELL_PAD));
+                // Guard: ensure we fill the column outer width.
+                let target = col_widths[c];
+                let cw = display_width(&cell);
+                if cw < target {
+                    cell.push_str(&" ".repeat(target - cw));
+                }
+                spans.push(Span::styled(cell, style));
+                spans.push(Span::styled(T_VLINE.to_string(), border));
+            }
+            lines.push(Line::from(spans));
+        }
+    };
+
+    push_row(&mut lines, &header_wrapped, header_style);
+    lines.push(Line::from(Span::styled(
+        table_hline(&col_widths, T_ML, T_X, T_MR),
+        border,
+    )));
+
+    for (ri, cells) in rows_wrapped.iter().enumerate() {
+        push_row(&mut lines, cells, cell_style);
+        let is_last = ri + 1 == rows_wrapped.len();
+        if is_last {
+            lines.push(Line::from(Span::styled(
+                table_hline(&col_widths, T_BL, T_BM, T_BR),
+                border,
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                table_hline(&col_widths, T_ML, T_X, T_MR),
+                border,
+            )));
+        }
+    }
+
+    // Header-only table (no data rows): still close with bottom border.
+    if rows_wrapped.is_empty() {
+        lines.push(Line::from(Span::styled(
+            table_hline(&col_widths, T_BL, T_BM, T_BR),
+            border,
+        )));
+    }
+
+    lines
 }
 
 /// Drop trailing empty lines from fence body (models often leave a blank
@@ -316,14 +597,34 @@ fn trim_code_fence_body(content: &str) -> &str {
 }
 
 fn code_bg_style() -> Style {
-    Style::default().bg(theme::CODE_BG)
+    Style::default().fg(theme::CODE_TEXT).bg(theme::CODE_BG)
+}
+
+/// True when a foreground is pure white (or unset → terminal white).
+fn is_harsh_white_fg(fg: Option<Color>) -> bool {
+    match fg {
+        None => true,
+        Some(Color::White) | Some(Color::Reset) => true,
+        Some(Color::Rgb(r, g, b)) if r >= 240 && g >= 240 && b >= 240 => true,
+        _ => false,
+    }
+}
+
+/// Ensure code spans never paint harsh white; plain tokens use soft `CODE_TEXT`.
+fn paint_code_span(style: Style) -> Style {
+    let with_fg = if is_harsh_white_fg(style.fg) {
+        style.fg(theme::CODE_TEXT)
+    } else {
+        style
+    };
+    with_fg.bg(theme::CODE_BG)
 }
 
 /// Mark every span with the code-block background so ThinkingCell can detect
 /// and expand the bar to full terminal width.
 fn apply_code_bg(mut line: Line<'static>) -> Line<'static> {
     for span in &mut line.spans {
-        span.style = span.style.bg(theme::CODE_BG);
+        span.style = paint_code_span(span.style);
     }
     if line.spans.is_empty() {
         // Keep a single space so the row is still classified as a code bar
@@ -356,7 +657,7 @@ fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
         if span.content.is_empty() {
             continue;
         }
-        span.style = span.style.bg(theme::CODE_BG);
+        span.style = paint_code_span(span.style);
         spans.push(span);
     }
     let used: usize = spans
@@ -404,7 +705,34 @@ fn push_code_block_rows(code_lines: Vec<Line<'static>>, width: u16, rows: &mut V
     rows.push(code_pad_row(width)); // bottom pad below last content
 }
 
+fn styled_heading(text: &str, color: Color, mods: Modifier) -> Line<'static> {
+    Line::from(Span::styled(
+        text.replace('\t', "    "),
+        Style::default().fg(color).add_modifier(mods),
+    ))
+}
+
 impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
+    fn heading1(&self, text: &str) -> Option<Line<'static>> {
+        Some(styled_heading(
+            text,
+            theme::MD_HEADING1,
+            Modifier::BOLD | Modifier::UNDERLINED,
+        ))
+    }
+
+    fn heading2(&self, text: &str) -> Option<Line<'static>> {
+        Some(styled_heading(text, theme::MD_HEADING2, Modifier::BOLD))
+    }
+
+    fn heading3(&self, text: &str) -> Option<Line<'static>> {
+        Some(styled_heading(text, theme::MD_HEADING3, Modifier::BOLD))
+    }
+
+    fn table(&self, headers: &[String], rows: &[Vec<String>]) -> Option<Vec<Line<'static>>> {
+        Some(render_content_sized_table(headers, rows, self.max_width))
+    }
+
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
         let content = trim_code_fence_body(content);
         let segments = TS_HIGHLIGHTER.highlight(lang, content);
@@ -413,7 +741,7 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
         lines.push(apply_code_bg(Line::default()));
 
         if segments.is_empty() {
-            let code_style = Style::default().fg(theme::TEXT_DIM).bg(theme::CODE_BG);
+            let code_style = code_bg_style();
             if content.is_empty() {
                 lines.push(apply_code_bg(Line::from(Span::styled(
                     CODE_BLOCK_INDENT.to_string(),
@@ -463,8 +791,7 @@ fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let mut blocks = renderer.parse(&src);
     join_paragraph_soft_breaks(&mut blocks);
     merge_orphan_punct_paragraphs(&mut blocks);
-    let mut theme = ThemeConfig::default();
-    theme.muted_text_color = Color::Rgb(160, 160, 160);
+    let theme = theme::markdown_theme();
     let lines = renderer.render(&blocks, &theme);
     compact_md_lines(lines)
 }
@@ -676,6 +1003,34 @@ pub struct ToolCallCell {
 }
 
 impl ToolCallCell {
+    /// Text shown inside the tool header parentheses, e.g. `Read(path:10-50)`.
+    fn header_arg_text(&self) -> String {
+        match self.tool_name.as_str() {
+            "edit" | "write" => self
+                .path
+                .as_deref()
+                .unwrap_or(self.args_preview.as_str())
+                .to_string(),
+            "read" => {
+                let path = self
+                    .path
+                    .as_deref()
+                    .unwrap_or(self.args_preview.as_str());
+                match (self.read_offset, self.read_limit) {
+                    (None, None) => path.to_string(),
+                    // offset is 1-based start line; limit is max lines to read.
+                    (Some(off), None) => format!("{path}:{off}-"),
+                    (None, Some(lim)) => format!("{path}:1-{lim}"),
+                    (Some(off), Some(lim)) => {
+                        let end = off.saturating_add(lim).saturating_sub(1);
+                        format!("{path}:{off}-{end}")
+                    }
+                }
+            }
+            _ => self.args_preview.clone(),
+        }
+    }
+
     pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
             ToolStatus::Running => ("▸", theme::ACCENT),
@@ -704,23 +1059,19 @@ impl ToolCallCell {
             Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
         ));
         
-        // For edit/write tools, show the file path; otherwise show args preview
-        let is_edit_write = self.tool_name == "edit" || self.tool_name == "write";
-        let display_text = if is_edit_write {
-            self.path.as_deref().unwrap_or(&self.args_preview).to_string()
-        } else {
-            self.args_preview.clone()
-        };
+        // edit/write: file path. read: path + line window. else: first-arg preview.
+        let display_text = self.header_arg_text();
         
         let max_display_len = 60;
-        let args_display = if display_text.len() > max_display_len {
-            let trimmed = &display_text[..max_display_len];
-            format!("{}...)", trimmed)
+        let truncated = display_text.chars().count() > max_display_len;
+        let args_display = if truncated {
+            let trimmed: String = display_text.chars().take(max_display_len).collect();
+            format!("{trimmed}...)")
         } else {
-            format!("{})", display_text)
+            format!("{display_text})")
         };
         
-        let args_style = if display_text.len() > max_display_len {
+        let args_style = if truncated {
             Style::default().fg(theme::TEXT_HINT) // Even dimmer for trimmed
         } else {
             Style::default().fg(theme::TEXT_DIM) // Dimmer white for normal args
@@ -986,19 +1337,26 @@ fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max
     let segments = TS_HIGHLIGHTER.highlight(lang, code);
     if segments.is_empty() {
         let style = if let Some(bg) = bg_override {
-            Style::default().fg(theme::DIFF_META).bg(bg)
+            Style::default().fg(theme::CODE_TEXT).bg(bg)
         } else {
-            Style::default().fg(theme::DIFF_META)
+            Style::default().fg(theme::CODE_TEXT)
         };
         return vec![Span::styled(code.to_string(), style)];
     }
     let mut spans = Vec::new();
     for seg in &segments {
-        let text: String = code.chars().skip(seg.start).take(seg.end - seg.start).collect();
+        // tree-sitter returns byte offsets; use bytes for slicing.
+        let end = seg.end.min(code.len());
+        let start = seg.start.min(end);
+        let text = code[start..end].to_string();
         if text.is_empty() {
             continue;
         }
-        let mut style = seg.style;
+        let mut style = if is_harsh_white_fg(seg.style.fg) {
+            seg.style.fg(theme::CODE_TEXT)
+        } else {
+            seg.style
+        };
         if let Some(bg) = bg_override {
             style = style.bg(bg);
         }
@@ -1458,6 +1816,62 @@ mod markdown_layout_tests {
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum()
+    }
+
+    #[test]
+    fn table_hugs_content_not_terminal_width() {
+        // Small table on a wide viewport must not stretch to full width.
+        let md = "\
+| A | B |
+| --- | --- |
+| x | y |
+";
+        let width = 100;
+        let lines = render_markdown(md, width);
+        assert!(
+            !lines.is_empty(),
+            "expected table lines, got: {:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+        let top = line_text(&lines[0]);
+        assert!(
+            top.starts_with('┌') && top.ends_with('┐'),
+            "top border: {top:?}"
+        );
+        let table_w = display_width(&top);
+        // Natural: │ A │ B │ → roughly a dozen columns, far under 100.
+        assert!(
+            table_w < 30,
+            "table should hug content (got width {table_w}, text {top:?})"
+        );
+        assert!(
+            table_w < width,
+            "table must not expand to full terminal width"
+        );
+        // Header row should contain the cells.
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains('A') && joined.contains('B'));
+        assert!(joined.contains('x') && joined.contains('y'));
+    }
+
+    #[test]
+    fn table_wraps_when_wider_than_viewport() {
+        let md = "\
+| LongHeaderOne | LongHeaderTwo |
+| --- | --- |
+| some fairly long cell value here | another long cell value too |
+";
+        let lines = render_markdown(md, 28);
+        let top = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.starts_with('┌'))
+            .expect("top border");
+        let table_w = display_width(&top);
+        assert!(
+            table_w <= 28,
+            "wide table must shrink to viewport (got {table_w}): {top:?}"
+        );
     }
 
     #[test]
