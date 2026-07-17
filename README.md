@@ -57,7 +57,13 @@ During setup, you'll be prompted for:
 ```bash
 # Launch the codex-like interactive coding agent
 xa
+
+# Force light or dark palette (default is auto-detect)
+xa --theme light
+xa --theme dark
 ```
+
+**Theme** (TUI only): CLI `--theme` overrides env `XA_THEME`, which overrides `theme` in `~/.config/xa/config.toml` (`auto` | `dark` | `light`). Auto mode uses `COLORFGBG` and an OSC 11 background query; if detection fails it falls back to dark.
 
 Inside the TUI:
 | Shortcut | Action |

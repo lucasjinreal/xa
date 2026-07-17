@@ -3406,6 +3406,7 @@ dependencies = [
  "dirs",
  "fuzzy-matcher",
  "indicatif",
+ "libc",
  "openai-api-rs",
  "ratatui",
  "ratatui-markdown",

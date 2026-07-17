@@ -6,6 +6,8 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
+use crate::tui::theme;
+
 /// Blend two 4-bit/truecolor `Color`s by `t` in [0,1] (1 => `to`).
 fn blend(base: Color, to: Color, t: f32) -> Color {
     let (br, bg, bb) = to_rgb(base);
@@ -48,7 +50,7 @@ fn ansi_approx(c: Color) -> (u8, u8, u8) {
 /// Render `text` as a moving shimmer highlight. `phase` is in [0,1); the
 /// highlight band sweeps left→right once per `period`.
 pub fn shimmer_spans(text: &str, base: Color, phase: f32) -> Vec<Span<'static>> {
-    shimmer_spans_to(text, base, Color::White, phase)
+    shimmer_spans_to(text, base, theme::t().shimmer_peak, phase)
 }
 
 /// Shimmer toward a specific peak color (e.g. bright orange).

@@ -8,6 +8,9 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub default_model: Option<String>,
+    /// TUI appearance: `auto` | `dark` | `light`. Omitted → auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 }
 
 impl Default for Config {
@@ -16,6 +19,7 @@ impl Default for Config {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "".to_string(),
             default_model: Some("gpt-4o-mini".to_string()),
+            theme: None,
         }
     }
 }
@@ -121,6 +125,7 @@ pub async fn configure_openai() -> Result<(), Box<dyn std::error::Error>> {
                     base_url,
                     api_key,
                     default_model: if selected_model.is_empty() { None } else { Some(selected_model) },
+                    theme: config.theme.clone(),
                 };
 
                 // Serialize and write to file
@@ -154,6 +159,7 @@ pub async fn configure_openai() -> Result<(), Box<dyn std::error::Error>> {
         base_url,
         api_key,
         default_model: if default_model.is_empty() { None } else { Some(default_model) },
+        theme: config.theme.clone(),
     };
 
     // Serialize and write to file
@@ -197,16 +203,26 @@ async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Box<
 }
 
 pub async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+    Ok(load_config_sync()?)
+}
+
+/// Synchronous config load (used for early theme resolution before the TUI).
+pub fn load_config_sync() -> Result<Config, Box<dyn std::error::Error>> {
     let config_dir = config_dir()
         .ok_or("Could not determine config directory")?
         .join("xa");
-    
+
     let config_file = config_dir.join("config.toml");
-    
+
     if !config_file.exists() {
         return Ok(Config::default());
     }
-    
+
     let content = fs::read_to_string(&config_file)?;
     Ok(toml::from_str(&content)?)
+}
+
+/// Optional `theme` string from config.toml (`auto` / `dark` / `light`).
+pub fn load_theme_setting() -> Option<String> {
+    load_config_sync().ok().and_then(|c| c.theme)
 }

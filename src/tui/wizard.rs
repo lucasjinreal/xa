@@ -24,15 +24,33 @@ use ratatui::{
 use crate::agent::{builtin_presets, Provider, ProviderPreset, ProvidersConfig};
 use crate::tui::theme;
 
-/// Accent + dim palette — gray + orange (shared with the rest of the TUI).
-const ACCENT: Color = theme::ACCENT;
-const DIM: Color = theme::TEXT_DIM;
-const PLAIN: Color = theme::TEXT;
-const SELECT_BG: Color = theme::SELECT_BG;
-/// The settings surface matches the composer and covers its full reserved area.
-const PANEL_BG: Color = theme::INPUT_BG;
-/// Slightly darker field strip for text inputs inside the modal.
-const FIELD_BG: Color = Color::Rgb(28, 28, 28);
+// Runtime palette (installed once at process start via `theme::init`).
+#[inline]
+fn accent() -> Color {
+    theme::t().accent
+}
+#[inline]
+fn dim() -> Color {
+    theme::t().text_dim
+}
+#[inline]
+fn plain() -> Color {
+    theme::t().text
+}
+#[inline]
+fn select_bg() -> Color {
+    theme::t().select_bg
+}
+/// Settings surface matches the composer.
+#[inline]
+fn panel_bg() -> Color {
+    theme::t().input_bg
+}
+/// Inset field strip for text inputs inside the modal.
+#[inline]
+fn field_bg() -> Color {
+    theme::t().field_bg
+}
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MODEL_WINDOW: usize = 10;
@@ -204,6 +222,9 @@ impl Wizard {
         use tokio::sync::mpsc;
 
         let mut stdout = stdout();
+        let surface_ct = theme::Theme::rgb(theme::t().surface)
+            .map(|(r, g, b)| CrosstermColor::Rgb { r, g, b })
+            .unwrap_or(CrosstermColor::Reset);
         execute!(
             stdout,
             EnterAlternateScreen,
@@ -212,7 +233,7 @@ impl Wizard {
             // `Clear` fills with the current terminal background. Give the
             // standalone screen the same surface as the wizard, including any
             // terminal cells that cannot safely be written at bottom-right.
-            SetBackgroundColor(CrosstermColor::Rgb { r: 36, g: 36, b: 36 }),
+            SetBackgroundColor(surface_ct),
             event::EnableBracketedPaste
         )?;
         let backend = CrosstermBackend::new(stdout);
@@ -591,7 +612,7 @@ impl Wizard {
             width: area.width,
             height,
         };
-        let panel_style = Style::default().bg(PANEL_BG).fg(PLAIN);
+        let panel_style = Style::default().bg(panel_bg()).fg(plain());
         // `set_style` only restyles existing glyphs; it does not erase them.
         // Clear the bounded panel first so underlying transcript text cannot
         // leak through its blank rows, without obscuring the rest of the view.
@@ -620,9 +641,9 @@ impl Wizard {
 
     fn row_style(selected: bool) -> Style {
         if selected {
-            Style::default().bg(SELECT_BG).fg(PLAIN)
+            Style::default().bg(select_bg()).fg(plain())
         } else {
-            Style::default().bg(PANEL_BG).fg(PLAIN)
+            Style::default().bg(panel_bg()).fg(plain())
         }
     }
 
@@ -632,11 +653,11 @@ impl Wizard {
         }
         self.draw_line(f, area, area.top(), Line::from(Span::styled(
             "Select Provider",
-            Style::default().fg(PLAIN).bg(PANEL_BG).add_modifier(Modifier::BOLD),
+            Style::default().fg(plain()).bg(panel_bg()).add_modifier(Modifier::BOLD),
         )));
         self.draw_line(f, area, area.top() + 1, Line::from(Span::styled(
             "Connect using a built-in provider or custom OpenAI-compatible endpoint",
-            Style::default().fg(DIM).bg(PANEL_BG),
+            Style::default().fg(dim()).bg(panel_bg()),
         )));
 
         let mut y = area.top() + 3;
@@ -651,19 +672,19 @@ impl Wizard {
                 spans.push(Span::styled(
                     " › ",
                     Style::default()
-                        .fg(ACCENT)
-                        .bg(SELECT_BG)
+                        .fg(accent())
+                        .bg(select_bg())
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
-                spans.push(Span::styled("   ", Style::default().bg(PANEL_BG)));
+                spans.push(Span::styled("   ", Style::default().bg(panel_bg())));
             }
             let label = src.label();
             spans.push(Span::styled(
                 format!("{:<12}", label),
                 Style::default()
-                    .fg(if sel { ACCENT } else { PLAIN })
-                    .bg(if sel { SELECT_BG } else { PANEL_BG })
+                    .fg(if sel { accent() } else { plain() })
+                    .bg(if sel { select_bg() } else { panel_bg() })
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
             let detail = match src {
@@ -674,8 +695,8 @@ impl Wizard {
             spans.push(Span::styled(
                 detail,
                 Style::default()
-                    .fg(if sel { PLAIN } else { DIM })
-                    .bg(if sel { SELECT_BG } else { PANEL_BG }),
+                    .fg(if sel { plain() } else { dim() })
+                    .bg(if sel { select_bg() } else { panel_bg() }),
             ));
             let note = match src {
                 Source::Existing(p) if p.endpoint.contains("localhost") || p.endpoint.contains("127.0.0.1") => Some("local"),
@@ -685,7 +706,7 @@ impl Wizard {
             if let Some(note) = note {
                 spans.push(Span::styled(
                     format!("   {note}"),
-                    Style::default().fg(DIM).bg(if sel { SELECT_BG } else { PANEL_BG }),
+                    Style::default().fg(dim()).bg(if sel { select_bg() } else { panel_bg() }),
                 ));
             }
             f.render_widget(
@@ -708,17 +729,17 @@ impl Wizard {
         if y >= area.bottom() {
             return;
         }
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(PANEL_BG)), Rect {
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(panel_bg())), Rect {
             x: area.left(), y, width: area.width, height: 1,
         });
     }
 
     fn key_hint(&self) -> Line<'static> {
         Line::from(vec![
-            Span::styled("Press enter", Style::default().fg(PLAIN).bg(PANEL_BG)),
-            Span::styled(" to confirm or ", Style::default().fg(DIM).bg(PANEL_BG)),
-            Span::styled("esc", Style::default().fg(PLAIN).bg(PANEL_BG)),
-            Span::styled(" to go back", Style::default().fg(DIM).bg(PANEL_BG)),
+            Span::styled("Press enter", Style::default().fg(plain()).bg(panel_bg())),
+            Span::styled(" to confirm or ", Style::default().fg(dim()).bg(panel_bg())),
+            Span::styled("esc", Style::default().fg(plain()).bg(panel_bg())),
+            Span::styled(" to go back", Style::default().fg(dim()).bg(panel_bg())),
         ])
     }
 
@@ -728,9 +749,9 @@ impl Wizard {
         f.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 self.text_label.clone(),
-                Style::default().fg(DIM).bg(PANEL_BG),
+                Style::default().fg(dim()).bg(panel_bg()),
             )]))
-            .style(Style::default().bg(PANEL_BG)),
+            .style(Style::default().bg(panel_bg())),
             Rect {
                 x: area.left(),
                 y,
@@ -751,19 +772,19 @@ impl Wizard {
             display = display.chars().skip(1).collect();
         }
         let input_line = Line::from(vec![
-            Span::styled(" ", Style::default().bg(FIELD_BG)),
+            Span::styled(" ", Style::default().bg(field_bg())),
             Span::styled(
                 display,
                 Style::default()
-                    .fg(PLAIN)
-                    .bg(FIELD_BG)
+                    .fg(plain())
+                    .bg(field_bg())
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
         if y + 2 < area.bottom() {
             // Spacer
             f.render_widget(
-                Paragraph::new("").style(Style::default().bg(PANEL_BG)),
+                Paragraph::new("").style(Style::default().bg(panel_bg())),
                 Rect {
                     x: area.left(),
                     y: y + 1,
@@ -772,7 +793,7 @@ impl Wizard {
                 },
             );
             f.render_widget(
-                Paragraph::new(input_line).style(Style::default().bg(FIELD_BG)),
+                Paragraph::new(input_line).style(Style::default().bg(field_bg())),
                 Rect {
                     x: area.left(),
                     y: y + 2,
@@ -785,9 +806,9 @@ impl Wizard {
                 f.render_widget(
                     Paragraph::new(Line::from(vec![Span::styled(
                         "  paste works here · Enter to continue · Esc back",
-                        Style::default().fg(DIM).bg(PANEL_BG),
+                        Style::default().fg(dim()).bg(panel_bg()),
                     )]))
-                    .style(Style::default().bg(PANEL_BG)),
+                    .style(Style::default().bg(panel_bg())),
                     Rect {
                         x: area.left(),
                         y: y + 4,
@@ -806,17 +827,17 @@ impl Wizard {
             Span::styled(
                 format!(" {frame} "),
                 Style::default()
-                    .fg(ACCENT)
-                    .bg(PANEL_BG)
+                    .fg(accent())
+                    .bg(panel_bg())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("Querying models at {}", self.draft.endpoint),
-                Style::default().fg(PLAIN).bg(PANEL_BG),
+                Style::default().fg(plain()).bg(panel_bg()),
             ),
         ]);
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(PANEL_BG)),
+            Paragraph::new(line).style(Style::default().bg(panel_bg())),
             Rect {
                 x: area.left(),
                 y: area.top(),
@@ -832,9 +853,9 @@ impl Wizard {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     format!(" ! {err}"),
-                    Style::default().fg(Color::Rgb(255, 180, 120)).bg(PANEL_BG),
+                    Style::default().fg(theme::t().accent_bright).bg(panel_bg()),
                 )]))
-                .style(Style::default().bg(PANEL_BG)),
+                .style(Style::default().bg(panel_bg())),
                 Rect {
                     x: area.left(),
                     y,
@@ -846,9 +867,9 @@ impl Wizard {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     "   Enter a model manually, or Esc to go back.",
-                    Style::default().fg(DIM).bg(PANEL_BG),
+                    Style::default().fg(dim()).bg(panel_bg()),
                 )]))
-                .style(Style::default().bg(PANEL_BG)),
+                .style(Style::default().bg(panel_bg())),
                 Rect {
                     x: area.left(),
                     y,
@@ -864,12 +885,12 @@ impl Wizard {
                 break;
             }
             let sel = i == self.model_idx;
-            let bg = if sel { SELECT_BG } else { PANEL_BG };
+            let bg = if sel { select_bg() } else { panel_bg() };
             let mut spans = Vec::new();
             spans.push(Span::styled(
                 if sel { " › " } else { "   " },
                 Style::default()
-                    .fg(if sel { ACCENT } else { DIM })
+                    .fg(if sel { accent() } else { dim() })
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -881,7 +902,7 @@ impl Wizard {
             spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(if sel { PLAIN } else { DIM })
+                    .fg(if sel { plain() } else { dim() })
                     .bg(bg)
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));

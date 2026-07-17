@@ -101,7 +101,7 @@ fn draw(
 ) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+    frame.render_widget(Block::default().style(Style::default().bg(theme::t().bg)), area);
     let rows = area.height.saturating_sub(7).max(1) as usize;
     let start = selected.saturating_sub(rows.saturating_sub(1));
     let end = (start + rows).min(sessions.len());
@@ -114,11 +114,11 @@ fn draw(
     let heading = Paragraph::new(vec![
         Line::from(Span::styled(
             "Resume a session",
-            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::t().text).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Select a previous conversation",
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme::t().text_dim),
         )),
     ]);
     frame.render_widget(heading, sections[0]);
@@ -137,14 +137,14 @@ fn draw(
             Span::styled(
                 format!("{prefix} {:<9}", session::relative_time(summary.updated)),
                 Style::default()
-                    .fg(if active { theme::ACCENT } else { theme::TEXT_DIM })
-                    .bg(if active { theme::SELECT_BG } else { theme::BG }),
+                    .fg(if active { theme::t().accent } else { theme::t().text_dim })
+                    .bg(if active { theme::t().select_bg } else { theme::t().bg }),
             ),
             Span::styled(
                 title.to_string(),
                 Style::default()
-                    .fg(theme::TEXT)
-                    .bg(if active { theme::SELECT_BG } else { theme::BG })
+                    .fg(theme::t().text)
+                    .bg(if active { theme::t().select_bg } else { theme::t().bg })
                     .add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
             ),
         ]));
@@ -153,7 +153,7 @@ fn draw(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑↓ navigate  ·  Enter resume  ·  d delete  ·  Esc cancel",
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme::t().text_dim),
         ))),
         sections[2],
     );
@@ -183,12 +183,12 @@ fn draw_delete_confirmation(frame: &mut ratatui::Frame, session: &SessionSummary
     frame.render_widget(Clear, dialog);
     frame.render_widget(
         Paragraph::new(text)
-            .style(Style::default().fg(theme::TEXT).bg(theme::BG))
+            .style(Style::default().fg(theme::t().text).bg(theme::t().bg))
             .block(
                 Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
                     .title(" Delete session ")
-                    .style(Style::default().fg(theme::ACCENT).bg(theme::BG)),
+                    .style(Style::default().fg(theme::t().accent).bg(theme::t().bg)),
             ),
         dialog,
     );

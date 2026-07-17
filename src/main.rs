@@ -37,6 +37,15 @@ struct Cli {
     #[arg(long = "debug", global = true)]
     debug: bool,
 
+    /// TUI color theme: auto (detect terminal), dark, or light
+    #[arg(
+        long = "theme",
+        global = true,
+        value_name = "MODE",
+        value_parser = ["auto", "dark", "light"]
+    )]
+    theme: Option<String>,
+
     /// Input text to process
     input: Option<String>,
 
@@ -131,6 +140,9 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Install TUI palette early (chat / resume / login all share it).
+    init_tui_theme(&cli);
 
     // Handle commands via subcommand matching
     match cli.command {
@@ -451,11 +463,13 @@ IN-TUI SLASH COMMANDS:
 OPTIONS:
     --no-stream                 Disable streaming (legacy prompt mode)
     --debug                     Print the filled prompt (legacy prompt mode)
+    --theme <MODE>              TUI theme: auto (default), dark, or light
     -h, --help                 Print help
 
 EXAMPLES:
     xa                                  # launch the agent TUI
     xa chat                            # launch the agent TUI
+    xa --theme light                  # force light terminal palette
     xa resume                         # choose a saved session
     xa resume ab12                    # resume a saved session directly
     xa gain                           # all-time token and tool-output gain
@@ -463,7 +477,47 @@ EXAMPLES:
     /login mygateway                  # inside TUI: point at any OpenAI-compatible endpoint
     /models gpt-4o                   # inside TUI: switch model
 
+Theme (TUI): CLI --theme > env XA_THEME > config.toml theme = \"auto|dark|light\" > auto-detect.
+
 For more information, visit the project repository."#.to_string()
+}
+
+/// Resolve theme preference: CLI `--theme` > `XA_THEME` > config.toml > auto.
+fn resolve_theme_preference(cli: &Cli) -> tui::ThemePreference {
+    if let Some(ref s) = cli.theme {
+        if let Some(pref) = tui::ThemePreference::parse(s) {
+            return pref;
+        }
+        eprintln!(
+            "Warning: unknown --theme '{s}', expected auto|dark|light; using auto"
+        );
+    }
+    if let Ok(s) = std::env::var("XA_THEME") {
+        if let Some(pref) = tui::ThemePreference::parse(&s) {
+            return pref;
+        }
+    }
+    if let Some(s) = config::load_theme_setting() {
+        if let Some(pref) = tui::ThemePreference::parse(&s) {
+            return pref;
+        }
+    }
+    tui::ThemePreference::Auto
+}
+
+fn init_tui_theme(cli: &Cli) {
+    let pref = resolve_theme_preference(cli);
+    let mode = tui::init_from_preference(pref);
+    if cli.debug {
+        eprintln!(
+            "[DEBUG] theme preference={} resolved={}",
+            pref.as_str(),
+            match mode {
+                tui::ColorMode::Dark => "dark",
+                tui::ColorMode::Light => "light",
+            }
+        );
+    }
 }
 
 /// `xa login [name]` — launch the codex-style interactive provider setup

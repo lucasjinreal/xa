@@ -13,7 +13,7 @@
 //! interactive wizard rendered above the composer — see [`wizard`].
 //!
 //! Module layout:
-//! - [`theme`]   — gray + orange palette (no purple)
+//! - [`theme`]   — dark/light gray + orange palette (auto-detectable)
 //! - [`shimmer`] — animated highlight helpers
 //! - [`cells`]   — the `HistoryCell` trait and concrete cell types
 //! - [`think`]   — stream phase + `<think>` filter
@@ -34,3 +34,4 @@ mod app;
 mod crash;
 
 pub use app::run;
+pub use theme::{init_from_preference, ColorMode, ThemePreference};

@@ -214,8 +214,8 @@ fn line_is_blank(l: &Line<'_>) -> bool {
 }
 
 /// Keep at most one blank line between content blocks; drop leading/trailing.
-/// Code-block rows (marked with [`theme::CODE_BG`]) are never treated as
-/// collapsible blanks — they form a solid full-width bar including pads.
+/// Code-block rows (marked with the theme code-block background) are never
+/// treated as collapsible blanks — they form a solid full-width bar including pads.
 fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut prev_blank = true; // suppress leading blanks
@@ -304,8 +304,8 @@ const CODE_BLOCK_INDENT: &str = "  ";
 /// Custom markdown hook for fenced code + content-sized tables.
 ///
 /// Layout for code: one blank line above, one blank line below, each content
-/// line prefixed with [`CODE_BLOCK_INDENT`]. Spans carry [`theme::CODE_BG`] so
-/// the AI cell can paint a full-width subtle bar behind the block.
+/// line prefixed with [`CODE_BLOCK_INDENT`]. Spans carry the theme code-block
+/// background so the AI cell can paint a full-width subtle bar behind the block.
 ///
 /// Tables size to their content instead of stretching to the terminal width;
 /// columns only shrink (and wrap) when the natural width exceeds `max_width`.
@@ -493,11 +493,11 @@ fn render_content_sized_table(
         col_widths = natural.iter().map(|n| n + pad2).collect();
     }
 
-    let border = Style::default().fg(theme::MD_MUTED);
+    let border = Style::default().fg(theme::t().md_muted);
     let header_style = Style::default()
-        .fg(theme::MD_TEXT)
+        .fg(theme::t().md_text)
         .add_modifier(Modifier::BOLD);
-    let cell_style = Style::default().fg(theme::MD_TEXT);
+    let cell_style = Style::default().fg(theme::t().md_text);
 
     // Pre-wrap every cell to its content width.
     let header_wrapped: Vec<Vec<String>> = (0..col_count)
@@ -597,7 +597,7 @@ fn trim_code_fence_body(content: &str) -> &str {
 }
 
 fn code_bg_style() -> Style {
-    Style::default().fg(theme::CODE_TEXT).bg(theme::CODE_BG)
+    Style::default().fg(theme::t().code_text).bg(theme::t().code_bg)
 }
 
 /// True when a foreground is pure white (or unset → terminal white).
@@ -613,11 +613,11 @@ fn is_harsh_white_fg(fg: Option<Color>) -> bool {
 /// Ensure code spans never paint harsh white; plain tokens use soft `CODE_TEXT`.
 fn paint_code_span(style: Style) -> Style {
     let with_fg = if is_harsh_white_fg(style.fg) {
-        style.fg(theme::CODE_TEXT)
+        style.fg(theme::t().code_text)
     } else {
         style
     };
-    with_fg.bg(theme::CODE_BG)
+    with_fg.bg(theme::t().code_bg)
 }
 
 /// Mark every span with the code-block background so ThinkingCell can detect
@@ -638,11 +638,11 @@ fn apply_code_bg(mut line: Line<'static>) -> Line<'static> {
 fn is_code_line(line: &Line<'_>) -> bool {
     line.spans
         .iter()
-        .any(|s| s.style.bg == Some(theme::CODE_BG))
+        .any(|s| s.style.bg == Some(theme::t().code_bg))
 }
 
 /// Full-width code body row: left think-indent + code spans + trailing spaces,
-/// all on [`theme::CODE_BG`], painted from column 0.
+/// all on the theme code-block background, painted from column 0.
 fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if THINK_INDENT > 0 {
@@ -716,17 +716,17 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
     fn heading1(&self, text: &str) -> Option<Line<'static>> {
         Some(styled_heading(
             text,
-            theme::MD_HEADING1,
+            theme::t().md_heading1,
             Modifier::BOLD | Modifier::UNDERLINED,
         ))
     }
 
     fn heading2(&self, text: &str) -> Option<Line<'static>> {
-        Some(styled_heading(text, theme::MD_HEADING2, Modifier::BOLD))
+        Some(styled_heading(text, theme::t().md_heading2, Modifier::BOLD))
     }
 
     fn heading3(&self, text: &str) -> Option<Line<'static>> {
-        Some(styled_heading(text, theme::MD_HEADING3, Modifier::BOLD))
+        Some(styled_heading(text, theme::t().md_heading3, Modifier::BOLD))
     }
 
     fn table(&self, headers: &[String], rows: &[Vec<String>]) -> Option<Vec<Line<'static>>> {
@@ -910,10 +910,10 @@ impl UserCell {
 
         // Grey lead on dim gray cell fill; text stays readable white-grey.
         let prompt_style = Style::default()
-            .fg(theme::USER_LEAD)
-            .bg(theme::USER_BG)
+            .fg(theme::t().user_lead)
+            .bg(theme::t().user_bg)
             .add_modifier(Modifier::BOLD);
-        let text_style = Style::default().fg(theme::TEXT).bg(theme::USER_BG);
+        let text_style = Style::default().fg(theme::t().text).bg(theme::t().user_bg);
 
         let mut rows = vec![Row::blank(width)]; // top padding
         for (i, l) in wrapped.into_iter().enumerate() {
@@ -959,7 +959,7 @@ impl HistoryCell for UserCell {
     }
     fn bg(&self) -> Option<Color> {
         // True neutral gray (R=G=B) — previous slate had a blue cast.
-        Some(theme::USER_BG)
+        Some(theme::t().user_bg)
     }
 }
 
@@ -1033,9 +1033,9 @@ impl ToolCallCell {
 
     pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
-            ToolStatus::Running => ("▸", theme::ACCENT),
-            ToolStatus::Success => ("▪", theme::TEXT),
-            ToolStatus::Failed => ("▪", theme::ERROR),
+            ToolStatus::Running => ("▸", theme::t().accent),
+            ToolStatus::Success => ("▪", theme::t().text),
+            ToolStatus::Failed => ("▪", theme::t().error),
         };
         
         let mut spans = vec![Span::styled(
@@ -1056,7 +1056,7 @@ impl ToolCallCell {
         
         spans.push(Span::styled(
             format!("{}(", tool_name_cap),
-            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::t().text).add_modifier(Modifier::BOLD),
         ));
         
         // edit/write: file path. read: path + line window. else: first-arg preview.
@@ -1072,9 +1072,9 @@ impl ToolCallCell {
         };
         
         let args_style = if truncated {
-            Style::default().fg(theme::TEXT_HINT) // Even dimmer for trimmed
+            Style::default().fg(theme::t().text_hint) // Even dimmer for trimmed
         } else {
-            Style::default().fg(theme::TEXT_DIM) // Dimmer white for normal args
+            Style::default().fg(theme::t().text_dim) // Dimmer white for normal args
         };
         
         match ctx {
@@ -1112,10 +1112,10 @@ impl ToolCallCell {
                         x,
                         w,
                         Line::from(vec![
-                            Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
                             Span::styled(
                                 format!("Read {} lines", line_count),
-                                Style::default().fg(theme::TEXT_DIM),
+                                Style::default().fg(theme::t().text_dim),
                             ),
                         ]),
                     ));
@@ -1138,10 +1138,10 @@ impl ToolCallCell {
                             x,
                             w,
                             Line::from(vec![
-                                Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
                                 Span::styled(
                                     format!("… +{} lines", shown.len() - limit),
-                                    Style::default().fg(theme::TEXT_HINT),
+                                    Style::default().fg(theme::t().text_hint),
                                 ),
                             ]),
                         ));
@@ -1166,10 +1166,10 @@ impl ToolCallCell {
                             x,
                             w,
                             Line::from(vec![
-                                Span::styled(prefix, Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled(prefix, Style::default().fg(theme::t().text_dim)),
                                 Span::styled(
                                     line.to_string(),
-                                    Style::default().fg(theme::TEXT_DIM),
+                                    Style::default().fg(theme::t().text_dim),
                                 ),
                             ]),
                         ));
@@ -1180,10 +1180,10 @@ impl ToolCallCell {
                             x,
                             w,
                             Line::from(vec![
-                                Span::styled("  ", Style::default().fg(theme::TEXT_DIM)),
+                                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
                                 Span::styled(
                                     format!("… +{} lines", lines.len() - max_lines),
-                                    Style::default().fg(theme::TEXT_HINT),
+                                    Style::default().fg(theme::t().text_hint),
                                 ),
                             ]),
                         ));
@@ -1195,10 +1195,10 @@ impl ToolCallCell {
                         x,
                         w,
                         Line::from(vec![
-                            Span::styled("└ ", Style::default().fg(theme::TEXT_DIM)),
+                            Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
                             Span::styled(
                                 summary,
-                                Style::default().fg(theme::TEXT_DIM),
+                                Style::default().fg(theme::t().text_dim),
                             ),
                         ]),
                     ));
@@ -1253,12 +1253,12 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option
             _ => {}
         }
         let (fg, bg) = match sign {
-            "-" => (theme::DIFF_DEL, theme::DIFF_DEL_BG),
-            "+" => (theme::DIFF_ADD, theme::DIFF_ADD_BG),
-            _ => (theme::DIFF_META, Color::Reset),
+            "-" => (theme::t().diff_del, theme::t().diff_del_bg),
+            "+" => (theme::t().diff_add, theme::t().diff_add_bg),
+            _ => (theme::t().diff_meta, Color::Reset),
         };
         let ln_style = if sign == " " || sign == "" {
-            Style::default().fg(theme::TEXT_HINT)
+            Style::default().fg(theme::t().text_hint)
         } else {
             Style::default().fg(fg).bg(bg)
         };
@@ -1284,7 +1284,7 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option
             line_spans.extend(hl_spans);
         } else {
             let content_style = if sign == " " || sign == "" {
-                Style::default().fg(theme::DIFF_META)
+                Style::default().fg(theme::t().diff_meta)
             } else {
                 Style::default().fg(fg).bg(bg)
             };
@@ -1337,9 +1337,9 @@ fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max
     let segments = TS_HIGHLIGHTER.highlight(lang, code);
     if segments.is_empty() {
         let style = if let Some(bg) = bg_override {
-            Style::default().fg(theme::CODE_TEXT).bg(bg)
+            Style::default().fg(theme::t().code_text).bg(bg)
         } else {
-            Style::default().fg(theme::CODE_TEXT)
+            Style::default().fg(theme::t().code_text)
         };
         return vec![Span::styled(code.to_string(), style)];
     }
@@ -1353,7 +1353,7 @@ fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max
             continue;
         }
         let mut style = if is_harsh_white_fg(seg.style.fg) {
-            seg.style.fg(theme::CODE_TEXT)
+            seg.style.fg(theme::t().code_text)
         } else {
             seg.style
         };
@@ -1364,9 +1364,9 @@ fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max
     }
     if spans.is_empty() {
         let style = if let Some(bg) = bg_override {
-            Style::default().fg(theme::DIFF_META).bg(bg)
+            Style::default().fg(theme::t().diff_meta).bg(bg)
         } else {
-            Style::default().fg(theme::DIFF_META)
+            Style::default().fg(theme::t().diff_meta)
         };
         spans.push(Span::styled(code.to_string(), style));
     }
@@ -1611,7 +1611,7 @@ impl ThinkingCell {
         if self.streaming {
             let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)));
             if !tail_is_tool {
-                let cursor = Span::styled("█", Style::default().fg(theme::ACCENT));
+                let cursor = Span::styled("█", Style::default().fg(theme::t().accent));
                 let mut glued = false;
                 if let Some(last) = rows.last_mut() {
                     if last.x == indent

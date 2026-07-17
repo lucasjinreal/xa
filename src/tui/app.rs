@@ -13,7 +13,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Terminal,
@@ -1141,9 +1141,9 @@ impl App {
 
         if area.width < 80 || area.height < 7 {
             let fallback = Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled("xa", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" (v{version})"), Style::default().fg(theme::TEXT_DIM)),
+                Span::styled("❯ ", Style::default().fg(theme::t().accent).add_modifier(Modifier::BOLD)),
+                Span::styled("xa", Style::default().fg(theme::t().text).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" (v{version})"), Style::default().fg(theme::t().text_dim)),
             ]);
             f.render_widget(Paragraph::new(fallback), area);
             return;
@@ -1168,7 +1168,7 @@ impl App {
         ];
 
         let logo_spans: Vec<Line> = logo_lines.iter().map(|line| {
-            Line::from(Span::styled(*line, Style::default().fg(theme::ACCENT)))
+            Line::from(Span::styled(*line, Style::default().fg(theme::t().accent)))
         }).collect();
 
         let logo = Paragraph::new(logo_spans);
@@ -1187,9 +1187,9 @@ impl App {
         ];
         let name_spans: Vec<Line> = name_lines.iter().map(|line| {
             if line.contains("XA Code Agent") {
-                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)))
+                Line::from(Span::styled(*line, Style::default().fg(theme::t().text).add_modifier(Modifier::BOLD)))
             } else if line.contains('v') && line.contains('.') {
-                Line::from(Span::styled(*line, Style::default().fg(theme::TEXT_DIM)))
+                Line::from(Span::styled(*line, Style::default().fg(theme::t().text_dim)))
             } else {
                 Line::from("")
             }
@@ -1229,9 +1229,9 @@ impl App {
             }
         };
 
-        let border_style = Style::default().fg(theme::BORDER);
-        let label_style = Style::default().fg(theme::TEXT_DIM);
-        let value_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
+        let border_style = Style::default().fg(theme::t().border);
+        let label_style = Style::default().fg(theme::t().text_dim);
+        let value_style = Style::default().fg(theme::t().text).add_modifier(Modifier::BOLD);
 
         let max_val_w = cw.saturating_sub(18);
         let model_display = truncate(&model, max_val_w);
@@ -1280,10 +1280,10 @@ impl App {
     /// Render the short codex-style tip line beneath the header box.
     fn draw_tip(&self, f: &mut ratatui::Frame, area: Rect) {
         let tip = Line::from(vec![
-            Span::styled("  Tip: ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("  Tip: ", Style::default().fg(theme::t().text_dim)),
             Span::styled(
                 "type `/` for the command menu, or just start chatting.",
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::t().text),
             ),
         ]);
         f.render_widget(Paragraph::new(tip), area);
@@ -1304,14 +1304,14 @@ impl App {
         };
 
         let base = match self.stream_phase {
-            StreamPhase::Error => theme::ERROR,
-            StreamPhase::Interrupted => theme::WARNING,
-            StreamPhase::Thinking => theme::TEXT_DIM,
-            StreamPhase::Responding => theme::TEXT_DIM,
-            StreamPhase::RunningTool => theme::WARNING,
-            StreamPhase::Retrying { .. } => theme::WARNING,
-            StreamPhase::Waiting => theme::TEXT_DIM,
-            StreamPhase::Idle => theme::TEXT_DIM,
+            StreamPhase::Error => theme::t().error,
+            StreamPhase::Interrupted => theme::t().warning,
+            StreamPhase::Thinking => theme::t().text_dim,
+            StreamPhase::Responding => theme::t().text_dim,
+            StreamPhase::RunningTool => theme::t().warning,
+            StreamPhase::Retrying { .. } => theme::t().warning,
+            StreamPhase::Waiting => theme::t().text_dim,
+            StreamPhase::Idle => theme::t().text_dim,
         };
 
         let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -1319,17 +1319,17 @@ impl App {
         let spinner_idx = ((elapsed_ms / 80.0) as usize) % spinner_frames.len();
         let spinner = spinner_frames[spinner_idx];
 
-        let mut spans = vec![Span::styled("  ", Style::default().fg(theme::TEXT_DIM))];
+        let mut spans = vec![Span::styled("  ", Style::default().fg(theme::t().text_dim))];
         // Live phases shimmer + spin; terminal phases (interrupted/error) are static.
         if self.stream_phase.is_active() && !self.stream_phase.is_terminal() {
             spans.push(Span::styled(
                 format!("{} ", spinner),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::t().text),
             ));
             spans.extend(shimmer_spans_to(
                 &label,
                 base,
-                Color::White,
+                theme::t().shimmer_peak,
                 phase,
             ));
         } else {
@@ -1338,13 +1338,13 @@ impl App {
         if self.stream_phase.is_active() {
             spans.push(Span::styled(
                 format!("  {}", self.phase_elapsed_label()),
-                Style::default().fg(theme::TEXT_DIM),
+                Style::default().fg(theme::t().text_dim),
             ));
         }
         if self.streaming {
             spans.push(Span::styled(
                 "  · esc to interrupt",
-                Style::default().fg(theme::TEXT_DIM),
+                Style::default().fg(theme::t().text_dim),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1524,7 +1524,7 @@ impl App {
         // Input composer: borderless grey block (DESIGN §4) with a `❯ ` lead
         // matching UserCell. Pad left enough for the icon so typed text lines
         // up under (and with) the transcript user messages.
-        let input_bg = theme::INPUT_BG;
+        let input_bg = theme::t().input_bg;
 
         // Fill entire input area with background (covers paste block rows too).
         f.buffer_mut()
@@ -1544,8 +1544,8 @@ impl App {
                 if line_count == 1 { "" } else { "s" }
             );
             let style = Style::default()
-                .fg(theme::ACCENT)
-                .bg(theme::SURFACE);
+                .fg(theme::t().accent)
+                .bg(theme::t().surface);
             let row_area = Rect {
                 x: input_area.left(),
                 y: row_y,
@@ -1581,8 +1581,8 @@ impl App {
         // Visible block cursor.
         wrapped.set_cursor_style(
             Style::default()
-                .fg(theme::BG)
-                .bg(theme::ACCENT)
+                .fg(theme::t().bg)
+                .bg(theme::t().accent)
                 .add_modifier(Modifier::BOLD),
         );
         wrapped.set_cursor_line_style(Style::default().bg(input_bg));
@@ -1592,7 +1592,7 @@ impl App {
             && self.paste_blocks.is_empty()
         {
             wrapped.set_placeholder_text("Type a message, or / for commands\u{2026}");
-            wrapped.set_placeholder_style(Style::default().fg(theme::TEXT_DIM).bg(input_bg));
+            wrapped.set_placeholder_style(Style::default().fg(theme::t().text_dim).bg(input_bg));
         }
         // Render the soft-wrapped copy (already built above) so long input
         // grows vertically instead of overflowing; the editable buffer itself
@@ -1603,7 +1603,7 @@ impl App {
         // (same glyph + style family as UserCell).
         if text_area.height >= 2 && text_area.width > 1 + USER_LEAD_COLS {
             let lead_style = Style::default()
-                .fg(theme::INPUT_LEAD)
+                .fg(theme::t().input_lead)
                 .bg(input_bg)
                 .add_modifier(Modifier::BOLD);
             f.buffer_mut().set_stringn(
@@ -1619,19 +1619,19 @@ impl App {
         let mut footer_spans = vec![
             Span::styled(
                 format!(" {}", self.provider.model),
-                Style::default().fg(theme::FOOTER),
+                Style::default().fg(theme::t().footer),
             ),
-            Span::styled(" • ", Style::default().fg(theme::FOOTER)),
+            Span::styled(" • ", Style::default().fg(theme::t().footer)),
             Span::styled(
                 self.provider.name.clone(),
-                Style::default().fg(theme::FOOTER),
+                Style::default().fg(theme::t().footer),
             ),
         ];
         if !self.queued_inputs.is_empty() {
-            footer_spans.push(Span::styled(" • ", Style::default().fg(theme::FOOTER)));
+            footer_spans.push(Span::styled(" • ", Style::default().fg(theme::t().footer)));
             footer_spans.push(Span::styled(
                 format!("{} queued", self.queued_inputs.len()),
-                Style::default().fg(theme::FOOTER),
+                Style::default().fg(theme::t().footer),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
@@ -1649,10 +1649,10 @@ impl App {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::ACCENT))
+                .border_style(Style::default().fg(theme::t().accent))
                 .title(Span::styled(
                     format!(" /{:<1$} ", self.slash_query, 10),
-                    Style::default().fg(theme::ACCENT),
+                    Style::default().fg(theme::t().accent),
                 ));
             let inner = block.inner(popup_area);
             f.render_widget(block, popup_area);
@@ -1664,11 +1664,11 @@ impl App {
                 let sel = i == self.slash_selected;
                 let style = if sel {
                     Style::default()
-                        .fg(theme::TEXT)
-                        .bg(theme::SELECT_BG)
+                        .fg(theme::t().text)
+                        .bg(theme::t().select_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::TEXT_DIM)
+                    Style::default().fg(theme::t().text_dim)
                 };
                 let line = Line::from(vec![
                     Span::styled(format!(" {:<10}", cmd.name), style),

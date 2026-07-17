@@ -55,6 +55,8 @@ ratatui-markdown = { version = "0.3", default-features = false, features = [
 regex = "1"
 unicode-width = "0.2"
 similar = "3.1.1"
+# Used by terminal light/dark detection (OSC 11 / termios on Unix).
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"
