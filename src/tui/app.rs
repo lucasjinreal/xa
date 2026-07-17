@@ -2038,6 +2038,12 @@ async fn run_inner(
                     i += 1;
                 }
                 "assistant" => {
+                    // Always consume the assistant message itself before
+                    // optionally consuming its following tool results. The
+                    // old code advanced only inside `tool_calls`, so a normal
+                    // assistant reply was reconstructed forever and exhausted
+                    // memory on resume.
+                    i += 1;
                     let mut tc = ThinkingCell::new();
                     if let Some(tool_calls) = &m.tool_calls {
                         for stc in tool_calls {
@@ -2061,7 +2067,6 @@ async fn run_inner(
                         }
                         // Consume following tool-result messages and attach their
                         // output to the matching tool card.
-                        i += 1;
                         while i < resumed.len() && resumed[i].role == "tool" {
                             let tool_msg = &resumed[i];
                             if let Some(tcid) = &tool_msg.tool_call_id {

@@ -150,6 +150,11 @@ pub fn load(id: &str) -> Option<Session> {
         })
 }
 
+/// Permanently remove a saved session by id.
+pub fn delete(id: &str) -> std::io::Result<()> {
+    fs::remove_file(path_for(id))
+}
+
 impl Session {
     /// A session becomes persistent only once the user has actually spoken.
     pub fn has_user_message(&self) -> bool {

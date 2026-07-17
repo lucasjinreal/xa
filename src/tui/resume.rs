@@ -31,7 +31,7 @@ pub fn pick_session() -> io::Result<Option<String>> {
 }
 
 fn pick_session_inner() -> io::Result<Option<String>> {
-    let sessions = session::list_summaries();
+    let mut sessions = session::list_summaries();
     if sessions.is_empty() {
         println!("No saved sessions yet.");
         return Ok(None);
@@ -42,7 +42,7 @@ fn pick_session_inner() -> io::Result<Option<String>> {
     terminal::enable_raw_mode()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_picker(&mut terminal, &sessions);
+    let result = run_picker(&mut terminal, &mut sessions);
 
     terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::cursor::Show)?;
@@ -52,28 +52,53 @@ fn pick_session_inner() -> io::Result<Option<String>> {
 
 fn run_picker(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    sessions: &[SessionSummary],
+    sessions: &mut Vec<SessionSummary>,
 ) -> io::Result<Option<String>> {
     let mut selected = 0usize;
+    let mut confirming_delete = false;
     loop {
-        terminal.draw(|frame| draw(frame, sessions, selected))?;
+        terminal.draw(|frame| draw(frame, sessions, selected, confirming_delete))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
         let Event::Key(key) = event::read()? else { continue };
+        if confirming_delete {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    session::delete(&sessions[selected].id)?;
+                    sessions.remove(selected);
+                    if sessions.is_empty() {
+                        return Ok(None);
+                    }
+                    selected = selected.min(sessions.len() - 1);
+                    confirming_delete = false;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    confirming_delete = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(sessions.len() - 1),
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = sessions.len() - 1,
             KeyCode::Enter => return Ok(Some(sessions[selected].id.clone())),
+            KeyCode::Char('d') => confirming_delete = true,
             KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
             _ => {}
         }
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, sessions: &[SessionSummary], selected: usize) {
+fn draw(
+    frame: &mut ratatui::Frame,
+    sessions: &[SessionSummary],
+    selected: usize,
+    confirming_delete: bool,
+) {
     let area = frame.area();
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
@@ -127,9 +152,44 @@ fn draw(frame: &mut ratatui::Frame, sessions: &[SessionSummary], selected: usize
     frame.render_widget(Paragraph::new(lines), sections[1]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ navigate  ·  Enter resume  ·  Esc cancel",
+            "↑↓ navigate  ·  Enter resume  ·  d delete  ·  Esc cancel",
             Style::default().fg(theme::TEXT_DIM),
         ))),
         sections[2],
+    );
+    if confirming_delete {
+        draw_delete_confirmation(frame, &sessions[selected]);
+    }
+}
+
+fn draw_delete_confirmation(frame: &mut ratatui::Frame, session: &SessionSummary) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(64).max(1);
+    let height = area.height.min(7).max(1);
+    let dialog = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let title = if session.title == "untitled" {
+        "Untitled session"
+    } else {
+        &session.title
+    };
+    let text = format!(
+        "Delete this session permanently?\n\n{title}\n\nEnter / y: delete   Esc / n: cancel"
+    );
+    frame.render_widget(Clear, dialog);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme::TEXT).bg(theme::BG))
+            .block(
+                Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title(" Delete session ")
+                    .style(Style::default().fg(theme::ACCENT).bg(theme::BG)),
+            ),
+        dialog,
     );
 }
