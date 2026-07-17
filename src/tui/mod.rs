@@ -29,6 +29,7 @@ mod think;
 mod slash;
 mod render;
 pub mod wizard;
+pub mod resume;
 mod app;
 
 pub use app::run;

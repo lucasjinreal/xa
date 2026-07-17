@@ -475,7 +475,14 @@ pub async fn run_conversation(
                     } else {
                         None
                     };
-                    let (mut output, is_error) = match crate::tools::call_tool(&tc.name, args, tools).await {
+                    let (mut output, is_error) = match crate::tools::call_tool(
+                        &tc.name,
+                        args,
+                        tools,
+                        cancel.clone(),
+                    )
+                    .await
+                    {
                         Ok(o) => (o, false),
                         Err(e) => (e, true),
                     };

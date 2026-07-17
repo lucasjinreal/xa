@@ -36,6 +36,16 @@ pub struct Session {
     pub messages: Vec<StoredMessage>,
 }
 
+/// Lightweight metadata used by session lists and the resume picker. Reading
+/// this avoids loading every saved conversation into memory just to display it.
+#[derive(Deserialize, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub model: String,
+    pub updated: i64,
+}
+
 fn sessions_dir() -> PathBuf {
     config_dir()
         .map(|d| d.join("xa").join("sessions"))
@@ -53,20 +63,17 @@ pub fn new_id() -> String {
     format!("{millis:x}-{pid:x}")
 }
 
-/// List all sessions, newest updated first.
-pub fn list() -> Vec<Session> {
+/// List session metadata newest first, without deserializing message bodies.
+pub fn list_summaries() -> Vec<SessionSummary> {
     let dir = sessions_dir();
-    if !dir.exists() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(&dir) {
+    let mut out: Vec<SessionSummary> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().map(|x| x == "json").unwrap_or(false) {
-                if let Ok(s) = fs::read_to_string(&p) {
-                    if let Ok(sess) = serde_json::from_str::<Session>(&s) {
-                        out.push(sess);
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                if let Ok(file) = fs::File::open(path) {
+                    if let Ok(summary) = serde_json::from_reader(file) {
+                        out.push(summary);
                     }
                 }
             }
@@ -74,6 +81,18 @@ pub fn list() -> Vec<Session> {
     }
     out.sort_by(|a, b| b.updated.cmp(&a.updated));
     out
+}
+
+/// Human-readable elapsed time for session metadata, e.g. `9m ago`.
+pub fn relative_time(timestamp_ms: i64) -> String {
+    let elapsed = (chrono::Utc::now().timestamp_millis() - timestamp_ms).max(0) / 1000;
+    match elapsed {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed / 86_400),
+        _ => format!("{}w ago", elapsed / 604_800),
+    }
 }
 
 /// Persist a session (creating the directory if needed).
@@ -94,15 +113,6 @@ pub fn load(id: &str) -> Option<Session> {
             session.remove_legacy_resume_duplicates();
             session
         })
-}
-
-/// Remove a session by id.
-pub fn remove(id: &str) -> std::io::Result<()> {
-    let p = path_for(id);
-    if p.exists() {
-        fs::remove_file(p)?;
-    }
-    Ok(())
 }
 
 impl Session {

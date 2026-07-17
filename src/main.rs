@@ -21,7 +21,7 @@ use session::Session;
 #[derive(Parser)]
 #[command(name = "xa")]
 #[command(about = "xa - a lightweight coding-agent CLI (like codex / claude-code)")]
-#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa session resume <id> (or xa session -r <id>)")]
+#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa resume [id]")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -102,32 +102,10 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Manage saved sessions (ls, show, rm)
-    Session {
-        #[command(subcommand)]
-        action: SessionAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionAction {
-    /// List all saved sessions
-    Ls,
-    /// Show a session's conversation
-    Show {
-        /// Session id
-        id: String,
-    },
-    /// Remove a saved session
-    Rm {
-        /// Session id
-        id: String,
-    },
-    /// Resume a session in the interactive TUI
-    #[command(short_flag = 'r')]
+    /// Resume a saved session, or choose one interactively
     Resume {
-        /// Session id
-        id: String,
+        /// Session id (opens the picker when omitted)
+        id: Option<String>,
     },
 }
 
@@ -219,8 +197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_login(name).await?;
             return Ok(());
         }
-        Some(Commands::Session { action }) => {
-            handle_session(action).await?;
+        Some(Commands::Resume { id }) => {
+            resume_session(id).await?;
             return Ok(());
         }
         None => {
@@ -435,11 +413,7 @@ USAGE:
 COMMANDS (agent):
     chat                        Start the interactive coding-agent TUI
     login [name]                Configure a provider (endpoint + key + model)
-    session ls                  List saved sessions
-    session show <id>           Show a saved session's conversation
-    session rm   <id>           Delete a saved session
-    session resume <id>          Resume a saved session
-    session -r <id>              Short form for resume
+    resume [id]                 Resume a session, or open the session picker
 
 IN-TUI SLASH COMMANDS:
     /login [name]               Set a provider (custom endpoint + key + model)
@@ -457,8 +431,8 @@ OPTIONS:
 EXAMPLES:
     xa                                  # launch the agent TUI
     xa chat                            # launch the agent TUI
-    xa session resume ab12             # resume a saved session
-    xa session ls                     # list saved sessions
+    xa resume                         # choose a saved session
+    xa resume ab12                    # resume a saved session directly
     /login mygateway                  # inside TUI: point at any OpenAI-compatible endpoint
     /models gpt-4o                   # inside TUI: switch model
 
@@ -477,49 +451,17 @@ async fn run_login(name: Option<String>) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Handle the `xa session <action>` subcommand.
-async fn handle_session(action: SessionAction) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        SessionAction::Ls => {
-            let sessions = session::list();
-            if sessions.is_empty() {
-                println!("No saved sessions.");
-                return Ok(());
-            }
-            for s in &sessions {
-                println!(
-                    "{}\t{}\tmodel:{}\tmsgs:{}",
-                    s.id,
-                    s.title,
-                    s.model,
-                    s.messages.len()
-                );
-            }
-        }
-        SessionAction::Show { id } => {
-            match session::load(&id) {
-                Some(s) => {
-                    for m in &s.messages {
-                        let who = if m.role == "user" { "You" } else { "Assistant" };
-                        println!("### {who}\n{}\n", m.content);
-                    }
-                }
-                None => {
-                    eprintln!("Session not found: {id}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        SessionAction::Rm { id } => {
-            session::remove(&id)?;
-            println!("Removed session: {id}");
-        }
-        SessionAction::Resume { id } => {
-            let session = session::load(&id)
-                .unwrap_or_else(|| Session::new("default", "gpt-4o-mini"));
-            let provider = agent::load_active_provider().await;
-            tui::run(provider, session).await?;
-        }
-    }
+/// Resume a named session, or open the session picker when no id was given.
+async fn resume_session(id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let id = match id {
+        Some(id) => id,
+        None => match tui::resume::pick_session()? {
+            Some(id) => id,
+            None => return Ok(()),
+        },
+    };
+    let session = session::load(&id).ok_or_else(|| format!("Session not found: {id}"))?;
+    let provider = agent::load_active_provider().await;
+    tui::run(provider, session).await?;
     Ok(())
 }

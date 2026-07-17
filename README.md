@@ -76,13 +76,11 @@ Inside the TUI:
 ### 3. Session Management
 
 ```bash
-# List sessions
-xa session ls
+# Choose a saved session
+xa resume
 
-# Resume a session
-xa session resume <id>
-# Short form
-xa session -r <id>
+# Resume a session directly
+xa resume <id>
 ```
 
 ## Architecture

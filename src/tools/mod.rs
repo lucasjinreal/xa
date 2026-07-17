@@ -5,13 +5,14 @@
 //! locally and feeds results back (role `tool`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use similar::TextDiff;
 
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 /// A local agent tool.
 pub trait Tool: Send + Sync {
@@ -66,22 +67,101 @@ impl Tool for BashTool {
         })
     }
     fn execute(&self, args: Value) -> Result<String, String> {
-        let cmd = arg_str(&args, "command")?;
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .map_err(|e| format!("failed to run command: {e}"))?;
-        let mut s = String::new();
-        s.push_str(&String::from_utf8_lossy(&out.stdout));
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.trim().is_empty() {
-            s.push_str("\n[stderr]\n");
-            s.push_str(&err);
-        }
-        s.push_str(&format!("\n[exit code {}]", out.status.code().unwrap_or(-1)));
-        Ok(s)
+        let _ = args;
+        Err("bash must be run through the async tool runner".into())
     }
+}
+
+const BASH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Keep only a small amount of each output stream in memory while still
+/// draining the pipe. The agent later applies its tighter 4k display/context cap.
+const BASH_STREAM_CAPTURE_LIMIT: usize = 32 * 1024;
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    discarded: usize,
+}
+
+async fn read_stream_capped<R>(mut reader: R) -> Result<CapturedStream, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(BASH_STREAM_CAPTURE_LIMIT);
+    let mut discarded = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("failed to read command output: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        let remaining = BASH_STREAM_CAPTURE_LIMIT.saturating_sub(bytes.len());
+        let kept = remaining.min(count);
+        bytes.extend_from_slice(&chunk[..kept]);
+        discarded = discarded.saturating_add(count - kept);
+    }
+    Ok(CapturedStream { bytes, discarded })
+}
+
+fn format_captured_stream(stream: CapturedStream) -> String {
+    let mut text = String::from_utf8_lossy(&stream.bytes).into_owned();
+    if stream.discarded > 0 {
+        text.push_str(&format!(
+            "\n… [truncated {} bytes of command output]",
+            stream.discarded
+        ));
+    }
+    text
+}
+
+async fn run_bash(command: String, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<String, String> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run command: {e}"))?;
+    let stdout = child.stdout.take().ok_or("could not capture command stdout")?;
+    let stderr = child.stderr.take().ok_or("could not capture command stderr")?;
+    let stdout_task = tokio::spawn(read_stream_capped(stdout));
+    let stderr_task = tokio::spawn(read_stream_capped(stderr));
+
+    let status = tokio::select! {
+        result = child.wait() => result.map_err(|e| format!("failed waiting for command: {e}"))?,
+        _ = tokio::time::sleep(BASH_TIMEOUT) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("bash command timed out after 120s and was stopped".into());
+        }
+        _ = async {
+            while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("bash command cancelled".into());
+        }
+    };
+
+    let stdout = stdout_task
+        .await
+        .map_err(|e| format!("stdout task failed: {e}"))??;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| format!("stderr task failed: {e}"))??;
+    let mut text = format_captured_stream(stdout);
+    let stderr = format_captured_stream(stderr);
+    if !stderr.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&stderr);
+    }
+    text.push_str(&format!("\n[exit code {}]", status.code().unwrap_or(-1)));
+    Ok(text)
 }
 
 // ===========================================================================
@@ -400,7 +480,11 @@ pub async fn call_tool(
     name: &str,
     args: Value,
     tools: &[Arc<dyn Tool>],
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
+    if name == "bash" {
+        return run_bash(arg_str(&args, "command")?.to_string(), cancel).await;
+    }
     let tool = find_tool(name, tools)
         .ok_or_else(|| format!("unknown tool: {name}"))?
         .clone();
@@ -409,5 +493,36 @@ pub async fn call_tool(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => Err(format!("tool panicked: {e}")),
         Err(_) => Err("tool timed out after 120s".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn bash_output_is_bounded_while_the_command_is_drained() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let output = run_bash("yes x | head -c 70000".into(), cancel)
+            .await
+            .expect("command should succeed");
+
+        assert!(output.contains("[truncated"));
+        assert!(output.len() < BASH_STREAM_CAPTURE_LIMIT + 512);
+    }
+
+    #[tokio::test]
+    async fn bash_cancellation_stops_the_child_process() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_bash("sleep 5".into(), cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled command should finish promptly")
+            .expect("task should not panic");
+        assert_eq!(result.unwrap_err(), "bash command cancelled");
     }
 }

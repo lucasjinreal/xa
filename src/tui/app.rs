@@ -1055,20 +1055,20 @@ impl App {
 
     fn list_sessions(&mut self) {
         let mut out = String::from("## Saved sessions\n\n");
-        let sessions = session::list();
+        let sessions = session::list_summaries();
         if sessions.is_empty() {
             out.push_str("_No saved sessions yet. Use `/save [title]` to store the current conversation._");
         } else {
             for s in &sessions {
                 out.push_str(&format!(
-                    "- **{}** — `{}` · model `{}` · {} msgs\n",
+                    "- **{}** — `{}` · model `{}` · {}\n",
                     s.title,
                     s.id,
                     s.model,
-                    s.messages.len()
+                    session::relative_time(s.updated)
                 ));
             }
-            out.push_str("\nResume with: `xa session resume <id>` (or `xa session -r <id>`)");
+            out.push_str("\nResume with: `xa resume [id]`");
         }
         self.system_msg(out);
     }
@@ -1759,9 +1759,8 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("  {GREY}Session:{RESET}          {}", summary.session_id);
     println!("  {GREY}Title:{RESET}            {title}");
     println!("\n{CYAN_BOLD}Resume this session{RESET}");
-    println!("  xa session resume {}", summary.session_id);
-    println!("  {GREY}or{RESET} xa session -r {}", summary.session_id);
-    println!("\n{GREY}List saved sessions:{RESET} xa session ls");
+    println!("  xa resume {}", summary.session_id);
+    println!("\n{GREY}Choose another saved session:{RESET} xa resume");
 }
 
 /// Handle one multiplexed app event. Returns `true` when the UI should exit.
