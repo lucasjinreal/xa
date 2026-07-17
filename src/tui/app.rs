@@ -742,7 +742,6 @@ impl App {
                 WizardAction::None => {}
                 WizardAction::Cancel => {
                     self.wizard = None;
-                    self.system_msg("provider setup cancelled");
                 }
                 WizardAction::StartFetch { endpoint, api_key } => {
                     self.start_wizard_fetch(endpoint, api_key);
