@@ -13,6 +13,10 @@ const MAX_CONTEXT_CHARS: usize = 4_000;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolOutputStats {
     pub tool: String,
+    /// A compact command signature (never arbitrary argument values) for
+    /// aggregate reporting without persisting secrets from shell commands.
+    #[serde(default)]
+    pub command: String,
     pub filter: String,
     pub raw_bytes: usize,
     pub returned_bytes: usize,
@@ -39,6 +43,7 @@ pub fn process(tool: &str, command: Option<&str>, raw: String) -> ProcessedOutpu
     ProcessedOutput {
         stats: ToolOutputStats {
             tool: tool.to_string(),
+            command: command_signature(tool, command),
             filter: filter.to_string(),
             raw_bytes,
             returned_bytes,
@@ -49,6 +54,19 @@ pub fn process(tool: &str, command: Option<&str>, raw: String) -> ProcessedOutpu
         },
         output,
     }
+}
+
+fn command_signature(tool: &str, command: Option<&str>) -> String {
+    let Some(command) = command else { return tool.to_string() };
+    let mut parts = Vec::new();
+    for part in command.split_whitespace().take(3) {
+        let sensitive = part.contains('=')
+            || part.to_ascii_lowercase().contains("token")
+            || part.to_ascii_lowercase().contains("secret")
+            || part.to_ascii_lowercase().contains("password");
+        parts.push(if sensitive { "<arg>" } else { part });
+    }
+    if parts.is_empty() { tool.to_string() } else { parts.join(" ") }
 }
 
 fn estimate_tokens(bytes: usize) -> usize {

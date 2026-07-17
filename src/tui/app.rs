@@ -78,6 +78,7 @@ struct ExitSummary {
     message_count: usize,
     output_savings: session::OutputSavings,
     output_savings_by_filter: Vec<session::OutputFilterSavings>,
+    api_token_usage: session::ApiTokenUsage,
 }
 
 pub struct App {
@@ -496,7 +497,13 @@ impl App {
                 }
                 self.dirty = true;
             }
-            StreamEvent::Usage { .. } => {}
+            StreamEvent::Usage {
+                prompt,
+                completion,
+                total,
+            } => {
+                self.session.record_api_token_usage(prompt, completion, total);
+            }
             StreamEvent::ToolCall { id, name, arguments } => {
                 let preview = args_preview(&arguments);
                 // Pull path / read window out of the args for the `← Edit` /
@@ -1111,6 +1118,7 @@ impl App {
             message_count: self.session.messages.len(),
             output_savings: self.session.output_savings(),
             output_savings_by_filter: self.session.output_savings_by_filter(),
+            api_token_usage: self.session.api_token_usage,
         }
     }
 
@@ -1781,6 +1789,12 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("  {GREY}Messages:{RESET}         {}", summary.message_count);
     println!("  {GREY}Session:{RESET}          {}", summary.session_id);
     println!("  {GREY}Title:{RESET}            {title}");
+    println!(
+        "  {GREY}API tokens:{RESET}       {} total ({} prompt · {} completion)",
+        summary.api_token_usage.total_tokens,
+        summary.api_token_usage.prompt_tokens,
+        summary.api_token_usage.completion_tokens,
+    );
     print_output_savings_table(
         summary.output_savings,
         &summary.output_savings_by_filter,

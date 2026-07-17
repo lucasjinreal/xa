@@ -11,6 +11,8 @@ mod tools;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use chrono::{Local, TimeZone};
+use std::collections::BTreeMap;
 use config::load_config;
 use prompt::{load_prompt_config, find_command, process_template_with_args};
 use llm::process_with_llm;
@@ -22,7 +24,7 @@ use session::Session;
 #[derive(Parser)]
 #[command(name = "xa")]
 #[command(about = "xa - a lightweight coding-agent CLI (like codex / claude-code)")]
-#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa resume [id]")]
+#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa resume [id]\nReview saved tool-output gains: xa gain [--daily|--weekly|--monthly|--all]")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -107,6 +109,22 @@ enum Commands {
     Resume {
         /// Session id (opens the picker when omitted)
         id: Option<String>,
+    },
+
+    /// Review saved tool-output and API token usage across sessions
+    Gain {
+        /// Break down totals by calendar day
+        #[arg(long)]
+        daily: bool,
+        /// Break down totals by ISO week
+        #[arg(long)]
+        weekly: bool,
+        /// Break down totals by calendar month
+        #[arg(long)]
+        monthly: bool,
+        /// Include all recorded sessions (the default is the all-time total)
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -200,6 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Resume { id }) => {
             resume_session(id).await?;
+            return Ok(());
+        }
+        Some(Commands::Gain { daily, weekly, monthly, all }) => {
+            print_gain(daily, weekly, monthly, all)?;
             return Ok(());
         }
         None => {
@@ -415,6 +437,8 @@ COMMANDS (agent):
     chat                        Start the interactive coding-agent TUI
     login [name]                Configure a provider (endpoint + key + model)
     resume [id]                 Resume a session, or open the session picker
+    gain [--daily|--weekly|--monthly|--all]
+                                Review saved token usage and tool-output gains
 
 IN-TUI SLASH COMMANDS:
     /login [name]               Set a provider (custom endpoint + key + model)
@@ -434,6 +458,8 @@ EXAMPLES:
     xa chat                            # launch the agent TUI
     xa resume                         # choose a saved session
     xa resume ab12                    # resume a saved session directly
+    xa gain                           # all-time token and tool-output gain
+    xa gain --weekly                  # weekly gain breakdown
     /login mygateway                  # inside TUI: point at any OpenAI-compatible endpoint
     /models gpt-4o                   # inside TUI: switch model
 
@@ -465,4 +491,157 @@ async fn resume_session(id: Option<String>) -> Result<(), Box<dyn std::error::Er
     let provider = agent::load_active_provider().await;
     tui::run(provider, session).await?;
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GainPeriod {
+    Overall,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+#[derive(Default)]
+struct GainTotals {
+    sessions: usize,
+    tool_calls: usize,
+    raw_bytes: usize,
+    returned_bytes: usize,
+    estimated_saved_tokens: usize,
+    api_requests: u64,
+    api_prompt_tokens: u64,
+    api_completion_tokens: u64,
+    api_total_tokens: u64,
+}
+
+impl GainTotals {
+    fn add_record(&mut self, record: &session::GainSessionRecord) {
+        self.sessions += 1;
+        self.api_requests += record.api_token_usage.requests;
+        self.api_prompt_tokens += record.api_token_usage.prompt_tokens;
+        self.api_completion_tokens += record.api_token_usage.completion_tokens;
+        self.api_total_tokens += record.api_token_usage.total_tokens;
+        for call in &record.output_filter_calls {
+            self.tool_calls += 1;
+            self.raw_bytes += call.raw_bytes;
+            self.returned_bytes += call.returned_bytes;
+            self.estimated_saved_tokens += call.estimated_tokens_saved;
+        }
+    }
+
+    fn add_call(&mut self, call: &crate::output_filter::ToolOutputStats) {
+        self.tool_calls += 1;
+        self.raw_bytes += call.raw_bytes;
+        self.returned_bytes += call.returned_bytes;
+        self.estimated_saved_tokens += call.estimated_tokens_saved;
+    }
+
+    fn bytes_saved(&self) -> usize {
+        self.raw_bytes.saturating_sub(self.returned_bytes)
+    }
+
+    fn savings_percent(&self) -> f64 {
+        if self.raw_bytes == 0 { 0.0 } else { self.bytes_saved() as f64 * 100.0 / self.raw_bytes as f64 }
+    }
+}
+
+/// Print the saved session-level accounting. This deliberately reads only the
+/// serialized aggregate fields, never a conversation's message content.
+fn print_gain(daily: bool, weekly: bool, monthly: bool, _all: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = [daily, weekly, monthly].into_iter().filter(|enabled| *enabled).count();
+    if requested > 1 {
+        return Err("choose only one of --daily, --weekly, or --monthly".into());
+    }
+    let period = if daily { GainPeriod::Daily } else if weekly { GainPeriod::Weekly } else if monthly { GainPeriod::Monthly } else { GainPeriod::Overall };
+    let records = session::gain_records();
+    if records.is_empty() {
+        println!("No saved session usage yet.");
+        return Ok(());
+    }
+
+    let mut overall = GainTotals::default();
+    let mut periods: BTreeMap<String, GainTotals> = BTreeMap::new();
+    let mut commands: BTreeMap<String, GainTotals> = BTreeMap::new();
+    for record in &records {
+        overall.add_record(record);
+        let key = gain_period_label(record.updated, period);
+        let bucket = periods.entry(key).or_default();
+        bucket.add_record(record);
+        for call in &record.output_filter_calls {
+            let label = if call.command.is_empty() {
+                format!("{}/{}", call.tool, call.filter)
+            } else {
+                call.command.clone()
+            };
+            commands.entry(label).or_default().add_call(call);
+        }
+    }
+
+    println!("\nTool output gain");
+    print_gain_totals("All time", &overall);
+    if period != GainPeriod::Overall {
+        println!("\nPeriod                 Calls    Saved bytes   Saved    Est. tokens");
+        for (label, totals) in periods {
+            println!(
+                "{label:<22} {:>5} {:>14} {:>6.1}% {:>14}",
+                totals.tool_calls,
+                format_count(totals.bytes_saved()),
+                totals.savings_percent(),
+                format!("~{}", format_count(totals.estimated_saved_tokens)),
+            );
+        }
+    }
+    if !commands.is_empty() {
+        let mut commands: Vec<_> = commands.into_iter().collect();
+        commands.sort_by(|(left_label, left), (right_label, right)| {
+            right.bytes_saved().cmp(&left.bytes_saved()).then_with(|| left_label.cmp(right_label))
+        });
+        println!("\nBy command              Calls    Saved bytes   Saved    Est. tokens");
+        for (command, totals) in commands.into_iter().take(12) {
+            println!(
+                "{:<22} {:>5} {:>14} {:>6.1}% {:>14}",
+                truncate_label(&command, 22),
+                totals.tool_calls,
+                format_count(totals.bytes_saved()),
+                totals.savings_percent(),
+                format!("~{}", format_count(totals.estimated_saved_tokens)),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_gain_totals(label: &str, totals: &GainTotals) {
+    println!("{label}");
+    println!("  Sessions:              {}", format_count(totals.sessions));
+    println!("  Tool output:           {} → {} bytes", format_count(totals.raw_bytes), format_count(totals.returned_bytes));
+    println!("  Tool output saved:     {} bytes ({:.1}%) · ~{} tokens across {} calls", format_count(totals.bytes_saved()), totals.savings_percent(), format_count(totals.estimated_saved_tokens), format_count(totals.tool_calls));
+    println!("  API token usage:       {} total ({} prompt · {} completion across {} requests)", format_count(totals.api_total_tokens as usize), format_count(totals.api_prompt_tokens as usize), format_count(totals.api_completion_tokens as usize), format_count(totals.api_requests as usize));
+}
+
+fn gain_period_label(timestamp_ms: i64, period: GainPeriod) -> String {
+    let time = Local.timestamp_millis_opt(timestamp_ms).single().unwrap_or_else(Local::now);
+    match period {
+        GainPeriod::Daily => time.format("%Y-%m-%d").to_string(),
+        GainPeriod::Weekly => time.format("%G-W%V").to_string(),
+        GainPeriod::Monthly => time.format("%Y-%m").to_string(),
+        GainPeriod::Overall => "all time".to_string(),
+    }
+}
+
+fn format_count(value: usize) -> String {
+    let text = value.to_string();
+    let mut formatted = String::with_capacity(text.len() + text.len() / 3);
+    for (index, ch) in text.chars().enumerate() {
+        if index > 0 && (text.len() - index) % 3 == 0 { formatted.push(','); }
+        formatted.push(ch);
+    }
+    formatted
+}
+
+fn truncate_label(label: &str, width: usize) -> String {
+    if label.chars().count() <= width { return label.to_string(); }
+    let mut output: String = label.chars().take(width.saturating_sub(1)).collect();
+    output.push('…');
+    output
 }

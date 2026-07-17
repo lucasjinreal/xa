@@ -39,6 +39,8 @@ pub struct Session {
     /// account of what was removed before sending tool output to the LLM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_filter_calls: Vec<crate::output_filter::ToolOutputStats>,
+    #[serde(default, skip_serializing_if = "ApiTokenUsage::is_empty")]
+    pub api_token_usage: ApiTokenUsage,
 }
 
 /// Lightweight metadata used by session lists and the resume picker. Reading
@@ -49,6 +51,16 @@ pub struct SessionSummary {
     pub title: String,
     pub model: String,
     pub updated: i64,
+}
+
+/// Session data used by `xa gain`; message bodies are intentionally omitted.
+#[derive(Deserialize)]
+pub struct GainSessionRecord {
+    pub updated: i64,
+    #[serde(default)]
+    pub output_filter_calls: Vec<crate::output_filter::ToolOutputStats>,
+    #[serde(default)]
+    pub api_token_usage: ApiTokenUsage,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -86,6 +98,24 @@ pub fn list_summaries() -> Vec<SessionSummary> {
     }
     out.sort_by(|a, b| b.updated.cmp(&a.updated));
     out
+}
+
+/// Read only aggregate fields for historical reporting, never session messages.
+pub fn gain_records() -> Vec<GainSessionRecord> {
+    let mut records = Vec::new();
+    if let Ok(entries) = fs::read_dir(sessions_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                if let Ok(file) = fs::File::open(path) {
+                    if let Ok(record) = serde_json::from_reader(file) {
+                        records.push(record);
+                    }
+                }
+            }
+        }
+    }
+    records
 }
 
 /// Human-readable elapsed time for session metadata, e.g. `9m ago`.
@@ -128,6 +158,13 @@ impl Session {
 
     pub fn record_output_filter_call(&mut self, stats: crate::output_filter::ToolOutputStats) {
         self.output_filter_calls.push(stats);
+    }
+
+    pub fn record_api_token_usage(&mut self, prompt: u32, completion: u32, total: u32) {
+        self.api_token_usage.requests += 1;
+        self.api_token_usage.prompt_tokens += u64::from(prompt);
+        self.api_token_usage.completion_tokens += u64::from(completion);
+        self.api_token_usage.total_tokens += u64::from(total);
     }
 
     pub fn output_savings(&self) -> OutputSavings {
@@ -207,12 +244,27 @@ impl Session {
             updated: now,
             messages: Vec::new(),
             output_filter_calls: Vec::new(),
+            api_token_usage: ApiTokenUsage::default(),
         }
     }
 
     /// Touch the `updated` timestamp.
     pub fn touch(&mut self) {
         self.updated = chrono::Utc::now().timestamp_millis();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ApiTokenUsage {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl ApiTokenUsage {
+    fn is_empty(&self) -> bool {
+        self.requests == 0 && self.total_tokens == 0
     }
 }
 
