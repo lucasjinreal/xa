@@ -21,14 +21,20 @@ reqwest = { version = "0.13.4", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio-util = { version = "0.7", features = ["codec"] }
-openai-api-rs = "10.0.1"
+# Use the same pure-Rust TLS backend as XA's direct HTTP client; the default
+# enables native-tls/OpenSSL as a second, otherwise unused TLS implementation.
+openai-api-rs = { version = "10.0.1", default-features = false, features = ["rustls"] }
 # `ratatui-markdown` 0.3 and `tui-textarea` 0.7 currently share the 0.29
 # Ratatui API. Keeping the direct dependency aligned prevents two incompatible
 # widget/type families from entering the TUI build.
 ratatui = "0.29.0"
 crossterm = "0.29"
 tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
-ratatui-markdown = { version = "0.3", features = [
+# Keep XA's markdown renderer and supported syntax highlighters, but omit
+# ratatui-markdown's unused image, Mermaid, viewer, preview, scroll, and tree
+# modules (all enabled by that crate's default feature set).
+ratatui-markdown = { version = "0.3", default-features = false, features = [
+    "markdown",
     "highlight-lang-rust",
     "highlight-lang-python",
     "highlight-lang-javascript",
@@ -49,3 +55,11 @@ ratatui-markdown = { version = "0.3", features = [
 regex = "1"
 unicode-width = "0.2"
 similar = "3.1.1"
+
+[profile.release]
+opt-level = "z"
+strip = true
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
