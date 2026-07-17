@@ -1,6 +1,6 @@
 [package]
 name = "xa"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs"
 authors = ["jinfagang19@163.com"]
@@ -10,19 +10,22 @@ license = "MIT"
 tokio = { version = "1.0", features = ["full", "signal"] }
 tokio-stream = "0.1"
 clap = { version = "4.0", features = ["derive"] }
-toml = "0.8"
-dirs = "5.0"
+toml = "1.1.3"
+dirs = "6.0"
 clipboard = "0.5"
-termimad = "0.28"
+termimad = "0.35.1"
 fuzzy-matcher = "0.3"
-indicatif = "0.17"
+indicatif = "0.18.6"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio-util = { version = "0.7", features = ["codec"] }
-openai-api-rs = "9.0.1"
-ratatui = "0.29"
+openai-api-rs = "10.0.1"
+# `ratatui-markdown` 0.3 and `tui-textarea` 0.7 currently share the 0.29
+# Ratatui API. Keeping the direct dependency aligned prevents two incompatible
+# widget/type families from entering the TUI build.
+ratatui = "0.29.0"
 crossterm = "0.29"
 tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
 ratatui-markdown = { version = "0.3", features = [

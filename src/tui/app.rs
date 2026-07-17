@@ -70,11 +70,13 @@ enum AppEvent {
 /// separate from the header makes the terminal handoff useful without turning
 /// the live UI into a session-management dashboard.
 struct ExitSummary {
+    saved: bool,
     model: String,
     directory: String,
     session_id: String,
     session_title: String,
     message_count: usize,
+    output_savings: session::OutputSavings,
 }
 
 pub struct App {
@@ -229,7 +231,7 @@ impl App {
     }
 
     /// Rebuild the persisted session from the current messages and save it.
-    fn sync_session(&mut self) {
+    fn sync_session(&mut self) -> bool {
         self.session.provider = self.provider.name.clone();
         self.session.model = self.provider.model.clone();
         let mut msgs = Vec::new();
@@ -293,6 +295,11 @@ impl App {
             }
         }
         self.session.messages = msgs;
+        // Do not create empty files merely because the user opened and closed
+        // the TUI. A session starts only once it has a real user turn.
+        if !self.session.has_user_message() {
+            return false;
+        }
         self.session.touch();
 
         // Auto-generate a session title from the first user message once
@@ -315,7 +322,7 @@ impl App {
             }
         }
 
-        let _ = session::save(&self.session);
+        session::save(&self.session).is_ok()
     }
 
     fn submit(&mut self, text: String) {
@@ -514,9 +521,11 @@ impl App {
             StreamEvent::ToolResult {
                 name,
                 output,
+                output_stats,
                 is_error,
                 diff,
             } => {
+                self.session.record_output_filter_call(output_stats);
                 // Update the most recent running tool card inside the active
                 // thinking cell.
                 let mut updated = false;
@@ -585,8 +594,11 @@ impl App {
                     self.pending = Pending::Save;
                 } else {
                     self.session.title = arg.to_string();
-                    self.sync_session();
-                    self.system_msg(format!("session saved as `{}` ({})", self.session.title, self.session.id));
+                    if self.sync_session() {
+                        self.system_msg(format!("session saved as `{}` ({})", self.session.title, self.session.id));
+                    } else {
+                        self.system_msg("nothing to save yet — send a message first");
+                    }
                 }
             }
             "/new" => self.new_session(),
@@ -1014,11 +1026,14 @@ impl App {
                 if !title.is_empty() {
                     self.session.title = title;
                 }
-                self.sync_session();
-                self.system_msg(format!(
-                    "session saved as `{}` ({})",
-                    self.session.title, self.session.id
-                ));
+                if self.sync_session() {
+                    self.system_msg(format!(
+                        "session saved as `{}` ({})",
+                        self.session.title, self.session.id
+                    ));
+                } else {
+                    self.system_msg("nothing to save yet — send a message first");
+                }
                 Ok(())
             }
         };
@@ -1085,13 +1100,15 @@ impl App {
     /// Save the conversation and collect the information needed for the
     /// post-TUI resume instructions.
     fn exit_summary(&mut self) -> ExitSummary {
-        self.sync_session();
+        let saved = self.sync_session();
         ExitSummary {
+            saved,
             model: self.provider.model.clone(),
             directory: display_directory(),
             session_id: self.session.id.clone(),
             session_title: self.session.title.clone(),
             message_count: self.session.messages.len(),
+            output_savings: self.session.output_savings(),
         }
     }
 
@@ -1739,6 +1756,10 @@ fn display_directory() -> String {
 }
 
 fn print_exit_summary(summary: &ExitSummary) {
+    if !summary.saved {
+        println!("\n\x1b[90mNo session saved — send a message to create one.\x1b[0m");
+        return;
+    }
     let title = if summary.session_title == "untitled" {
         "untitled (rename with /save <title>)".to_string()
     } else {
@@ -1756,6 +1777,12 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("  {GREY}Permission mode:{RESET}  workspace-write");
     println!("  {GREY}Context window:{RESET}   128k tokens");
     println!("  {GREY}Messages:{RESET}         {}", summary.message_count);
+    println!(
+        "  {GREY}Tool output saved:{RESET} ~{} tokens across {} calls ({} bytes)",
+        summary.output_savings.estimated_tokens_saved,
+        summary.output_savings.calls,
+        summary.output_savings.bytes_saved(),
+    );
     println!("  {GREY}Session:{RESET}          {}", summary.session_id);
     println!("  {GREY}Title:{RESET}            {title}");
     println!("\n{CYAN_BOLD}Resume this session{RESET}");

@@ -18,7 +18,7 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
         client = client.with_endpoint(&config.base_url);
     }
 
-    let mut client = client.build()?;
+    let client = client.build()?;
 
     let model = config.default_model.as_deref().unwrap_or("gpt-4o-mini").to_string();
 
@@ -53,6 +53,10 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
                         full_response.push_str(&content);
                     }
                 }
+                // v10 surfaces reasoning separately. Legacy prompt mode only
+                // returns user-visible completion text, so keep it out of the
+                // rendered response just as providers that embed reasoning do.
+                ChatCompletionStreamResponse::Reasoning(_) => {}
                 ChatCompletionStreamResponse::ToolCall(tool_calls) => {
                     // Handle tool calls if needed
                     eprintln!("Tool call received: {:?}", tool_calls);
@@ -90,8 +94,8 @@ pub async fn process_with_llm(config: &Config, prompt: &str, stream: bool) -> Re
 
         let result = client.chat_completion(req).await?;
 
-        let content = if !result.choices.is_empty() {
-            if let Some(content) = &result.choices[0].message.content {
+        let content = if !result.inner.choices.is_empty() {
+            if let Some(content) = &result.inner.choices[0].message.content {
                 content.clone()
             } else {
                 String::new()

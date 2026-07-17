@@ -137,6 +137,7 @@ pub enum StreamEvent {
     ToolResult {
         name: String,
         output: String,
+        output_stats: crate::output_filter::ToolOutputStats,
         is_error: bool,
         /// A colorful-free unified `git diff` when the tool edited/added a file.
         diff: Option<String>,
@@ -462,6 +463,10 @@ pub async fn run_conversation(
                         .await;
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                    let command = args
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
                     let path = args
                         .get("path")
                         .and_then(|v| v.as_str())
@@ -475,7 +480,7 @@ pub async fn run_conversation(
                     } else {
                         None
                     };
-                    let (mut output, is_error) = match crate::tools::call_tool(
+                    let (raw_output, is_error) = match crate::tools::call_tool(
                         &tc.name,
                         args,
                         tools,
@@ -486,9 +491,12 @@ pub async fn run_conversation(
                         Ok(o) => (o, false),
                         Err(e) => (e, true),
                     };
-                    // Cap what we feed back to the model (and the TUI) so a
-                    // chatty tool (grep/read/bash) can't blow the context window.
-                    output = cap_tool_output(output);
+                    let processed = crate::output_filter::process(
+                        &tc.name,
+                        command.as_deref(),
+                        raw_output,
+                    );
+                    let output = processed.output;
                     // For file-mutating tools, capture a minimal diff so the user
                     // sees exactly what changed — not the whole file.
                     let diff = if is_file_mut && !is_error {
@@ -504,6 +512,7 @@ pub async fn run_conversation(
                         .send(StreamEvent::ToolResult {
                             name: tc.name.clone(),
                             output: output.clone(),
+                            output_stats: processed.stats,
                             is_error,
                             diff,
                         })
@@ -715,27 +724,4 @@ async fn stream_completion(
 fn prune_calls(mut calls: Vec<ToolCallRepr>) -> Vec<ToolCallRepr> {
     calls.retain(|c| !c.name.is_empty());
     calls
-}
-
-/// Hard cap on tool output returned to the model. Keeps grep/read/bash from
-/// flooding the conversation history with thousands of lines. The TUI also
-/// receives the capped text, so it never has to render a giant blob.
-const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
-
-fn cap_tool_output(out: String) -> String {
-    if out.len() <= MAX_TOOL_OUTPUT_CHARS {
-        return out;
-    }
-    let lines = out.lines().count();
-    let mut end = MAX_TOOL_OUTPUT_CHARS;
-    while end > 0 && !out.is_char_boundary(end) {
-        end -= 1;
-    }
-    let cut = out[..end].lines().count();
-    let truncated = out[..end].to_string();
-    format!(
-        "{truncated}\n…(output truncated: {cut}/{lines} lines, {} of {} chars shown)",
-        truncated.len(),
-        out.len()
-    )
 }

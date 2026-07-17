@@ -34,6 +34,10 @@ pub struct Session {
     pub created: i64,
     pub updated: i64,
     pub messages: Vec<StoredMessage>,
+    /// Per-tool output reductions. Kept with the session for an auditable
+    /// account of what was removed before sending tool output to the LLM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_filter_calls: Vec<crate::output_filter::ToolOutputStats>,
 }
 
 /// Lightweight metadata used by session lists and the resume picker. Reading
@@ -116,6 +120,25 @@ pub fn load(id: &str) -> Option<Session> {
 }
 
 impl Session {
+    /// A session becomes persistent only once the user has actually spoken.
+    pub fn has_user_message(&self) -> bool {
+        self.messages.iter().any(|message| message.role == "user")
+    }
+
+    pub fn record_output_filter_call(&mut self, stats: crate::output_filter::ToolOutputStats) {
+        self.output_filter_calls.push(stats);
+    }
+
+    pub fn output_savings(&self) -> OutputSavings {
+        let mut totals = OutputSavings::default();
+        for call in &self.output_filter_calls {
+            totals.calls += 1;
+            totals.raw_bytes += call.raw_bytes;
+            totals.returned_bytes += call.returned_bytes;
+            totals.estimated_tokens_saved += call.estimated_tokens_saved;
+        }
+        totals
+    }
     /// Remove duplicate assistant entries written by xa versions that saved a
     /// tool-call response both with its tool calls and as a second plain reply.
     /// Those duplicates accumulated on every resume and could make a session
@@ -158,12 +181,27 @@ impl Session {
             created: now,
             updated: now,
             messages: Vec::new(),
+            output_filter_calls: Vec::new(),
         }
     }
 
     /// Touch the `updated` timestamp.
     pub fn touch(&mut self) {
         self.updated = chrono::Utc::now().timestamp_millis();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OutputSavings {
+    pub calls: usize,
+    pub raw_bytes: usize,
+    pub returned_bytes: usize,
+    pub estimated_tokens_saved: usize,
+}
+
+impl OutputSavings {
+    pub fn bytes_saved(self) -> usize {
+        self.raw_bytes.saturating_sub(self.returned_bytes)
     }
 }
 
@@ -203,5 +241,30 @@ mod tests {
         assert_eq!(session.messages[0].role, "assistant");
         assert_eq!(session.messages[1].role, "tool");
         assert_eq!(session.messages[2].role, "user");
+    }
+
+    #[test]
+    fn empty_sessions_are_not_conversations() {
+        let mut session = Session::new("test", "test");
+        assert!(!session.has_user_message());
+        session.messages.push(message("assistant", "welcome"));
+        assert!(!session.has_user_message());
+        session.messages.push(message("user", "hello"));
+        assert!(session.has_user_message());
+    }
+
+    #[test]
+    fn aggregates_persisted_output_savings() {
+        let mut session = Session::new("test", "test");
+        session.record_output_filter_call(crate::output_filter::ToolOutputStats {
+            raw_bytes: 400,
+            returned_bytes: 80,
+            estimated_tokens_saved: 80,
+            ..Default::default()
+        });
+        let totals = session.output_savings();
+        assert_eq!(totals.calls, 1);
+        assert_eq!(totals.bytes_saved(), 320);
+        assert_eq!(totals.estimated_tokens_saved, 80);
     }
 }

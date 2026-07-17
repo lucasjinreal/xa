@@ -5,6 +5,7 @@ mod output;
 mod utils;
 mod store;
 mod agent;
+mod output_filter;
 mod session;
 mod tools;
 mod tui;
