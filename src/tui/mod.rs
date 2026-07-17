@@ -10,7 +10,7 @@
 //! handled via a floating popup overlay driven by a fuzzy subsequence filter.
 //!
 //! The provider / model setup flow (`/login`, `/models`) is a codex-style
-//! interactive wizard rendered as a centered modal — see [`wizard`].
+//! interactive wizard rendered above the composer — see [`wizard`].
 //!
 //! Module layout:
 //! - [`theme`]   — gray + orange palette (no purple)
@@ -19,7 +19,7 @@
 //! - [`think`]   — stream phase + `<think>` filter
 //! - [`slash`]   — slash-command table + fuzzy filter
 //! - [`render`]  — shared per-frame [`render::RenderContext`]
-//! - [`wizard`]  — in-TUI provider / model selection modal
+//! - [`wizard`]  — in-TUI provider / model selection panel
 //! - [`app`]     — the `App` state machine, event handlers, draw, and `run`
 
 mod theme;

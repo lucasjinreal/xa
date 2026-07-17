@@ -1,6 +1,6 @@
 //! In-TUI provider / model setup wizard (codex-style interactive flow).
 //!
-//! Replaces the old `read_line_paused` line prompt with a clean modal overlay:
+//! Replaces the old `read_line_paused` line prompt with a clean bottom panel:
 //!   1. Select a provider (built-in presets, existing providers, or custom)
 //!   2. Optionally enter an API key
 //!   3. Models are auto-queried from the endpoint (spinner while loading)
@@ -14,10 +14,10 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Paragraph},
     Frame,
 };
 
@@ -29,13 +29,13 @@ const ACCENT: Color = theme::ACCENT;
 const DIM: Color = theme::TEXT_DIM;
 const PLAIN: Color = theme::TEXT;
 const SELECT_BG: Color = theme::SELECT_BG;
-const BORDER: Color = theme::BORDER;
-/// Solid modal surface — opaque so transcript doesn't show through.
+/// Solid settings surface — opaque so transcript doesn't show through.
 const PANEL_BG: Color = theme::SURFACE;
 /// Slightly darker field strip for text inputs inside the modal.
 const FIELD_BG: Color = Color::Rgb(28, 28, 28);
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const MODEL_WINDOW: usize = 10;
 
 /// Where the wizard collects its source list from.
 #[derive(Clone)]
@@ -79,7 +79,6 @@ pub enum WizardAction {
 }
 
 pub struct Wizard {
-    mode: WizardMode,
     step: Step,
     sources: Vec<Source>,
     source_idx: usize,
@@ -94,6 +93,7 @@ pub struct Wizard {
     models: Vec<String>,
     model_err: Option<String>,
     model_idx: usize,
+    model_scroll: usize,
     fetching: bool,
     created: Instant,
     message: Option<String>,
@@ -110,22 +110,30 @@ impl Wizard {
         let mut v = Vec::new();
         if include_existing {
             let cfg = ProvidersConfig::load();
-            for p in cfg.list() {
-                v.push(Source::Existing(p.clone()));
+            // A configured provider replaces its built-in counterpart instead
+            // of appearing as a duplicate. Extra custom providers follow the
+            // built-ins in a stable order.
+            let mut existing: Vec<Provider> = cfg.list().into_iter().cloned().collect();
+            existing.sort_by(|a, b| a.name.cmp(&b.name));
+            for preset in builtin_presets() {
+                if let Some(pos) = existing.iter().position(|p| p.name == preset.name) {
+                    v.push(Source::Existing(existing.remove(pos)));
+                } else {
+                    v.push(Source::Preset(preset));
+                }
             }
-        }
-        for p in builtin_presets() {
-            v.push(Source::Preset(p));
+            v.extend(existing.into_iter().map(Source::Existing));
+        } else {
+            v.extend(builtin_presets().into_iter().map(Source::Preset));
         }
         v.push(Source::Custom);
         v
     }
 
-    fn new(mode: WizardMode, preselect: Option<&str>) -> Self {
+    fn new(_mode: WizardMode, preselect: Option<&str>) -> Self {
         // Login mode still shows existing providers so you can update them.
         let sources = Self::build_sources(true);
         let mut w = Wizard {
-            mode,
             step: Step::Provider,
             sources,
             source_idx: 0,
@@ -136,6 +144,7 @@ impl Wizard {
             models: Vec::new(),
             model_err: None,
             model_idx: 0,
+            model_scroll: 0,
             fetching: false,
             created: Instant::now(),
             message: None,
@@ -176,16 +185,29 @@ impl Wizard {
             cursor::{Hide, Show},
             event::{self, Event},
             execute,
-            terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+            style::{Color as CrosstermColor, ResetColor, SetBackgroundColor},
+            terminal::{self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen},
         };
         use ratatui::{backend::CrosstermBackend, Terminal};
         use tokio::sync::mpsc;
 
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Hide,
+            DisableLineWrap,
+            // `Clear` fills with the current terminal background. Give the
+            // standalone screen the same surface as the wizard, including any
+            // terminal cells that cannot safely be written at bottom-right.
+            SetBackgroundColor(CrosstermColor::Rgb { r: 36, g: 36, b: 36 }),
+            event::EnableBracketedPaste
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal::enable_raw_mode()?;
+        terminal.clear()?;
+        terminal.hide_cursor()?;
 
         // Keyboard reader (mirrors `app.rs` `run`).
         let (tx, mut rx) = mpsc::channel::<Event>(64);
@@ -214,7 +236,7 @@ impl Wizard {
 
         loop {
             if dirty {
-                terminal.draw(|f| wizard.draw(f, f.area())).ok();
+                terminal.draw(|f| wizard.draw(f, f.area()))?;
                 dirty = false;
             }
             tokio::select! {
@@ -244,6 +266,14 @@ impl Wizard {
                             wizard.handle_paste(&text);
                             dirty = true;
                         }
+                        Event::Resize(_, _) => {
+                            // Some terminals report their final alternate-
+                            // screen height a moment after `xa login` starts.
+                            // Rebuild immediately so the panel is already
+                            // bottom-aligned before the first key press.
+                            terminal.autoresize()?;
+                            dirty = true;
+                        }
                         _ => {}
                     }
                 }
@@ -262,7 +292,14 @@ impl Wizard {
         }
 
         terminal::disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
+        execute!(
+            terminal.backend_mut(),
+            event::DisableBracketedPaste,
+            ResetColor,
+            EnableLineWrap,
+            LeaveAlternateScreen,
+            Show
+        )?;
         terminal.show_cursor()?;
 
         if let Some(p) = &result {
@@ -280,30 +317,22 @@ impl Wizard {
             Ok(models) if !models.is_empty() => {
                 self.models = models;
                 self.model_idx = 0;
+                self.model_scroll = 0;
                 self.message = None;
                 self.step = Step::Model;
             }
             Ok(_) => {
                 self.models = Vec::new();
+                self.model_scroll = 0;
                 self.model_err = Some("No models returned by this endpoint.".into());
                 self.step = Step::Model;
             }
             Err(e) => {
                 self.models = Vec::new();
+                self.model_scroll = 0;
                 self.model_err = Some(e);
                 self.step = Step::Model;
             }
-        }
-    }
-
-    fn title(&self) -> String {
-        match (self.mode, self.step) {
-            (_, Step::Provider) => " Select a provider ".into(),
-            (_, Step::CustomName) | (_, Step::CustomUrl) => " Custom provider ".into(),
-            (_, Step::ApiKey) => " API key ".into(),
-            (_, Step::Fetching) => " Loading models ".into(),
-            (_, Step::Model) => " Select a model ".into(),
-            (_, Step::CustomModel) => " Custom model ".into(),
         }
     }
 
@@ -482,12 +511,14 @@ impl Wizard {
                 if self.model_idx > 0 {
                     self.model_idx -= 1;
                 }
+                self.keep_selected_model_visible();
                 WizardAction::None
             }
             KeyCode::Down => {
                 if self.model_idx + 1 < total {
                     self.model_idx += 1;
                 }
+                self.keep_selected_model_visible();
                 WizardAction::None
             }
             KeyCode::Enter => {
@@ -518,74 +549,56 @@ impl Wizard {
         WizardAction::Done(p)
     }
 
+    fn keep_selected_model_visible(&mut self) {
+        let window = if self.model_err.is_some() {
+            MODEL_WINDOW.saturating_sub(2)
+        } else {
+            MODEL_WINDOW
+        };
+        if self.model_idx < self.model_scroll {
+            self.model_scroll = self.model_idx;
+        } else if self.model_idx >= self.model_scroll + window {
+            self.model_scroll = self.model_idx + 1 - window;
+        }
+    }
+
+    /// Draw a Codex-like settings panel anchored immediately above `area`'s
+    /// bottom edge. `App` passes the space above the composer, so opening the
+    /// chooser replaces that part of the transcript instead of floating in it.
     pub fn draw(&self, f: &mut Frame, area: Rect) {
-        let width = area.width.min(66).max(40);
-        let height = area.height.min(22).max(12);
-        let x = area.x + area.width.saturating_sub(width) / 2;
-        let y = area.y + area.height.saturating_sub(height) / 2;
-        let popup = Rect {
-            x,
-            y,
-            width,
+        let wanted_height = match self.step {
+            Step::Provider => self.sources.len() as u16 + 5,
+            Step::Model => self.models.len().min(10) as u16 + 7,
+            _ => 9,
+        };
+        // One blank row lives inside the panel above and below its content.
+        let height = wanted_height.saturating_add(2).min(area.height);
+        let panel = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(height),
+            width: area.width,
             height,
         };
-
-        // Wipe underlying cells so the modal is fully opaque.
-        f.render_widget(Clear, popup);
-
         let panel_style = Style::default().bg(PANEL_BG).fg(PLAIN);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT).bg(PANEL_BG))
-            .style(panel_style)
-            .title(Span::styled(
-                self.title(),
-                Style::default()
-                    .fg(ACCENT)
-                    .bg(PANEL_BG)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Line::from(vec![
-                Span::styled(" ↑/↓ ", Style::default().fg(ACCENT).bg(PANEL_BG)),
-                Span::styled("nav ", Style::default().fg(DIM).bg(PANEL_BG)),
-                Span::styled("Enter ", Style::default().fg(ACCENT).bg(PANEL_BG)),
-                Span::styled("select ", Style::default().fg(DIM).bg(PANEL_BG)),
-                Span::styled("Esc ", Style::default().fg(ACCENT).bg(PANEL_BG)),
-                Span::styled("back ", Style::default().fg(DIM).bg(PANEL_BG)),
-                Span::styled(
-                    if self.accepts_paste() {
-                        "· paste ok "
-                    } else {
-                        ""
-                    },
-                    Style::default().fg(DIM).bg(PANEL_BG),
-                ),
-            ]));
+        // Paint every cell explicitly: standalone alternate-screen draws can
+        // otherwise leave the terminal's bottom row in its old black style.
+        f.buffer_mut().set_style(panel, panel_style);
+        f.render_widget(Block::default().style(panel_style), panel);
 
-        let inner = block.inner(popup);
-        f.render_widget(block, popup);
-
-        // Paint inner body solid so list rows never show transcript through.
-        f.render_widget(
-            Block::default().style(Style::default().bg(PANEL_BG)),
-            inner,
-        );
-
-        // Content with a little horizontal padding.
         let body = Rect {
-            x: inner.x.saturating_add(1),
-            y: inner.y.saturating_add(0),
-            width: inner.width.saturating_sub(2),
-            height: inner.height.saturating_sub(0),
+            x: panel.x.saturating_add(2),
+            y: panel.y.saturating_add(1),
+            width: panel.width.saturating_sub(4),
+            height: panel.height.saturating_sub(2),
         };
 
         match self.step {
             Step::Provider => self.draw_provider(f, body),
             Step::CustomName | Step::CustomUrl | Step::ApiKey | Step::CustomModel => {
-                self.draw_text(f, body)
+                self.draw_text_panel(f, body)
             }
-            Step::Fetching => self.draw_fetching(f, body),
-            Step::Model => self.draw_model(f, body),
+            Step::Fetching => self.draw_fetching_panel(f, body),
+            Step::Model => self.draw_model_panel(f, body),
         }
     }
 
@@ -598,9 +611,22 @@ impl Wizard {
     }
 
     fn draw_provider(&self, f: &mut Frame, area: Rect) {
-        let mut y = area.top();
+        if area.height < 3 {
+            return;
+        }
+        self.draw_line(f, area, area.top(), Line::from(Span::styled(
+            "Select Provider",
+            Style::default().fg(PLAIN).bg(PANEL_BG).add_modifier(Modifier::BOLD),
+        )));
+        self.draw_line(f, area, area.top() + 1, Line::from(Span::styled(
+            "Connect using a built-in provider or custom OpenAI-compatible endpoint",
+            Style::default().fg(DIM).bg(PANEL_BG),
+        )));
+
+        let mut y = area.top() + 3;
         for (i, src) in self.sources.iter().enumerate() {
-            if y >= area.bottom() {
+            // Keep the key hint visible.
+            if y + 2 >= area.bottom() {
                 break;
             }
             let sel = i == self.source_idx;
@@ -625,12 +651,9 @@ impl Wizard {
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
             let detail = match src {
-                Source::Existing(p) => format!("{}  (current)", p.endpoint),
-                Source::Preset(p) => match p.note {
-                    Some(n) => format!("{}  ({})", p.base_url, n),
-                    None => p.base_url.to_string(),
-                },
-                Source::Custom => "your own OpenAI-compatible endpoint".into(),
+                Source::Existing(p) => endpoint_label(&p.endpoint),
+                Source::Preset(p) => endpoint_label(p.base_url),
+                Source::Custom => String::new(),
             };
             spans.push(Span::styled(
                 detail,
@@ -638,6 +661,17 @@ impl Wizard {
                     .fg(if sel { PLAIN } else { DIM })
                     .bg(if sel { SELECT_BG } else { PANEL_BG }),
             ));
+            let note = match src {
+                Source::Existing(p) if p.endpoint.contains("localhost") || p.endpoint.contains("127.0.0.1") => Some("local"),
+                Source::Preset(p) => p.note,
+                _ => None,
+            };
+            if let Some(note) = note {
+                spans.push(Span::styled(
+                    format!("   {note}"),
+                    Style::default().fg(DIM).bg(if sel { SELECT_BG } else { PANEL_BG }),
+                ));
+            }
             f.render_widget(
                 Paragraph::new(Line::from(spans)).style(Self::row_style(sel)),
                 Rect {
@@ -649,9 +683,30 @@ impl Wizard {
             );
             y += 1;
         }
+        if y + 1 < area.bottom() {
+            self.draw_line(f, area, y + 1, self.key_hint());
+        }
     }
 
-    fn draw_text(&self, f: &mut Frame, area: Rect) {
+    fn draw_line(&self, f: &mut Frame, area: Rect, y: u16, line: Line<'static>) {
+        if y >= area.bottom() {
+            return;
+        }
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(PANEL_BG)), Rect {
+            x: area.left(), y, width: area.width, height: 1,
+        });
+    }
+
+    fn key_hint(&self) -> Line<'static> {
+        Line::from(vec![
+            Span::styled("Press enter", Style::default().fg(PLAIN).bg(PANEL_BG)),
+            Span::styled(" to confirm or ", Style::default().fg(DIM).bg(PANEL_BG)),
+            Span::styled("esc", Style::default().fg(PLAIN).bg(PANEL_BG)),
+            Span::styled(" to go back", Style::default().fg(DIM).bg(PANEL_BG)),
+        ])
+    }
+
+    fn draw_text_panel(&self, f: &mut Frame, area: Rect) {
         let y = area.top();
         // Label line.
         f.render_widget(
@@ -728,7 +783,7 @@ impl Wizard {
         }
     }
 
-    fn draw_fetching(&self, f: &mut Frame, area: Rect) {
+    fn draw_fetching_panel(&self, f: &mut Frame, area: Rect) {
         let elapsed = self.created.elapsed().as_millis() as usize;
         let frame = SPINNER[(elapsed / 100) % SPINNER.len()];
         let line = Line::from(vec![
@@ -755,7 +810,7 @@ impl Wizard {
         );
     }
 
-    fn draw_model(&self, f: &mut Frame, area: Rect) {
+    fn draw_model_panel(&self, f: &mut Frame, area: Rect) {
         let mut y = area.top();
         if let Some(err) = &self.model_err {
             f.render_widget(
@@ -787,7 +842,8 @@ impl Wizard {
             );
             y += 1;
         }
-        for (i, m) in self.models.iter().enumerate() {
+        let total = self.models.len() + 1; // + custom entry
+        for i in self.model_scroll..total {
             if y >= area.bottom() {
                 break;
             }
@@ -801,8 +857,13 @@ impl Wizard {
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ));
+            let label = if i < self.models.len() {
+                self.models[i].clone()
+            } else {
+                "custom… (enter a model name)".to_string()
+            };
             spans.push(Span::styled(
-                m.clone(),
+                label,
                 Style::default()
                     .fg(if sel { PLAIN } else { DIM })
                     .bg(bg)
@@ -819,36 +880,22 @@ impl Wizard {
             );
             y += 1;
         }
-        // Custom model entry.
-        if y < area.bottom() {
-            let sel = self.model_idx == self.models.len();
-            let bg = if sel { SELECT_BG } else { PANEL_BG };
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        if sel { " › " } else { "   " },
-                        Style::default()
-                            .fg(if sel { ACCENT } else { DIM })
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "custom… (enter a model name)",
-                        Style::default().fg(if sel { PLAIN } else { DIM }).bg(bg),
-                    ),
-                ]))
-                .style(Self::row_style(sel)),
-                Rect {
-                    x: area.left(),
-                    y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-        }
     }
 }
 
 fn display_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Keep provider URLs compact and column-aligned in the picker. The full URL
+/// remains in the provider configuration; this is presentation only.
+fn endpoint_label(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(endpoint)
+        .to_string()
 }

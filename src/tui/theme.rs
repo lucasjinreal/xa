@@ -24,7 +24,6 @@ pub const TEXT_HINT: Color = Color::Rgb(110, 110, 110);
 /// True neutral grays (R=G=B) — avoid blue-shifted “slate” that reads purple.
 pub const BG: Color = Color::Rgb(22, 22, 22);
 /// Elevated surface (header box, cards, popups).
-#[allow(dead_code)]
 pub const SURFACE: Color = Color::Rgb(36, 36, 36);
 /// Subtle full-width bar behind fenced code in AI messages (just above BG).
 pub const CODE_BG: Color = Color::Rgb(28, 28, 30);

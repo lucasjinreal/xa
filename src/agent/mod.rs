@@ -189,6 +189,21 @@ pub struct ProviderPreset {
 pub fn builtin_presets() -> Vec<ProviderPreset> {
     vec![
         ProviderPreset {
+            name: "agnes",
+            base_url: "https://apihub.agnes-ai.com/v1",
+            note: None,
+        },
+        ProviderPreset {
+            name: "zenmux",
+            base_url: "https://zenmux.ai/api/v1",
+            note: None,
+        },
+        ProviderPreset {
+            name: "vllm",
+            base_url: "http://vllm.manaai.cn:8080/v1",
+            note: Some("local"),
+        },
+        ProviderPreset {
             name: "openai",
             base_url: "https://api.openai.com/v1",
             note: None,

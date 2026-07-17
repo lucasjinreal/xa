@@ -116,8 +116,8 @@ pub struct App {
     /// Width (columns) of the input composer area from the last frame, used to
     /// soft-wrap the typed text so it never overflows the box.
     input_area_width: u16,
-    /// Active provider/model setup wizard (codex-style modal). While set,
-    /// all keys are routed to it and it is drawn as a centered overlay.
+    /// Active provider/model setup wizard. While set, all keys are routed to
+    /// it and it replaces the space immediately above the composer.
     wizard: Option<Wizard>,
     /// Paste blocks: multi-line pasted text shown as compact inline blocks
     /// (opencode/codex-style), deletable with one backspace.
@@ -1633,10 +1633,16 @@ impl App {
             }
         }
 
-        // Setup wizard overlay (codex-style provider/model selection modal).
-        // Drawn last so it sits on top of everything.
+        // Provider/model settings occupy the space directly above the composer
+        // (like Codex's model picker), never a centered screen modal.
         if let Some(wizard) = &self.wizard {
-            wizard.draw(f, area);
+            let settings_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: input_area.y.saturating_sub(area.y),
+            };
+            wizard.draw(f, settings_area);
         }
     }
 }
