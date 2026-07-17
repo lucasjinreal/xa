@@ -3,6 +3,7 @@
 //! each session is a single JSON file under `config_dir()/xa/sessions`.
 
 use std::fs;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dirs::config_dir;
@@ -139,6 +140,30 @@ impl Session {
         }
         totals
     }
+
+    /// Group persisted call statistics for the exit report. Sorting by bytes
+    /// saved makes the highest-impact filters immediately visible.
+    pub fn output_savings_by_filter(&self) -> Vec<OutputFilterSavings> {
+        let mut grouped: BTreeMap<String, OutputFilterSavings> = BTreeMap::new();
+        for call in &self.output_filter_calls {
+            let label = format!("{}/{}", call.tool, call.filter);
+            let entry = grouped.entry(label.clone()).or_insert_with(|| OutputFilterSavings {
+                label,
+                ..Default::default()
+            });
+            entry.calls += 1;
+            entry.raw_bytes += call.raw_bytes;
+            entry.returned_bytes += call.returned_bytes;
+            entry.estimated_tokens_saved += call.estimated_tokens_saved;
+        }
+        let mut rows: Vec<_> = grouped.into_values().collect();
+        rows.sort_by(|a, b| {
+            b.bytes_saved()
+                .cmp(&a.bytes_saved())
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        rows
+    }
     /// Remove duplicate assistant entries written by xa versions that saved a
     /// tool-call response both with its tool calls and as a second plain reply.
     /// Those duplicates accumulated on every resume and could make a session
@@ -203,6 +228,37 @@ impl OutputSavings {
     pub fn bytes_saved(self) -> usize {
         self.raw_bytes.saturating_sub(self.returned_bytes)
     }
+
+    pub fn savings_percent(self) -> f64 {
+        if self.raw_bytes == 0 {
+            0.0
+        } else {
+            self.bytes_saved() as f64 * 100.0 / self.raw_bytes as f64
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OutputFilterSavings {
+    pub label: String,
+    pub calls: usize,
+    pub raw_bytes: usize,
+    pub returned_bytes: usize,
+    pub estimated_tokens_saved: usize,
+}
+
+impl OutputFilterSavings {
+    pub fn bytes_saved(&self) -> usize {
+        self.raw_bytes.saturating_sub(self.returned_bytes)
+    }
+
+    pub fn savings_percent(&self) -> f64 {
+        if self.raw_bytes == 0 {
+            0.0
+        } else {
+            self.bytes_saved() as f64 * 100.0 / self.raw_bytes as f64
+        }
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +322,25 @@ mod tests {
         assert_eq!(totals.calls, 1);
         assert_eq!(totals.bytes_saved(), 320);
         assert_eq!(totals.estimated_tokens_saved, 80);
+    }
+
+    #[test]
+    fn groups_output_savings_by_tool_and_filter() {
+        let mut session = Session::new("test", "test");
+        for (filter, raw_bytes, returned_bytes) in [("cargo", 800, 200), ("cargo", 400, 100), ("default", 300, 250)] {
+            session.record_output_filter_call(crate::output_filter::ToolOutputStats {
+                tool: "bash".into(),
+                filter: filter.into(),
+                raw_bytes,
+                returned_bytes,
+                ..Default::default()
+            });
+        }
+        let rows = session.output_savings_by_filter();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "bash/cargo");
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].bytes_saved(), 900);
+        assert!((rows[0].savings_percent() - 75.0).abs() < f64::EPSILON);
     }
 }

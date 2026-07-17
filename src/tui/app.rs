@@ -77,6 +77,7 @@ struct ExitSummary {
     session_title: String,
     message_count: usize,
     output_savings: session::OutputSavings,
+    output_savings_by_filter: Vec<session::OutputFilterSavings>,
 }
 
 pub struct App {
@@ -1109,6 +1110,7 @@ impl App {
             session_title: self.session.title.clone(),
             message_count: self.session.messages.len(),
             output_savings: self.session.output_savings(),
+            output_savings_by_filter: self.session.output_savings_by_filter(),
         }
     }
 
@@ -1777,17 +1779,84 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("  {GREY}Permission mode:{RESET}  workspace-write");
     println!("  {GREY}Context window:{RESET}   128k tokens");
     println!("  {GREY}Messages:{RESET}         {}", summary.message_count);
-    println!(
-        "  {GREY}Tool output saved:{RESET} ~{} tokens across {} calls ({} bytes)",
-        summary.output_savings.estimated_tokens_saved,
-        summary.output_savings.calls,
-        summary.output_savings.bytes_saved(),
-    );
     println!("  {GREY}Session:{RESET}          {}", summary.session_id);
     println!("  {GREY}Title:{RESET}            {title}");
+    print_output_savings_table(
+        summary.output_savings,
+        &summary.output_savings_by_filter,
+        GREY,
+        RESET,
+        CYAN_BOLD,
+    );
     println!("\n{CYAN_BOLD}Resume this session{RESET}");
     println!("  xa resume {}", summary.session_id);
     println!("\n{GREY}Choose another saved session:{RESET} xa resume");
+}
+
+/// Print the session's actual raw-to-context reduction and a small breakdown
+/// of the highest-impact filters. Percentages use exact byte counts; tokens
+/// remain an explicitly labelled estimate.
+fn print_output_savings_table(
+    totals: session::OutputSavings,
+    rows: &[session::OutputFilterSavings],
+    grey: &str,
+    reset: &str,
+    cyan_bold: &str,
+) {
+    println!("\n{cyan_bold}Tool output filtering{reset}");
+    println!("  {grey}Metric                 Raw → LLM context             Saved{reset}");
+    println!(
+        "  Calls                  {:>8}                         ",
+        format_count(totals.calls),
+    );
+    println!(
+        "  Bytes                  {:>10} → {:>10}   {:>10} ({:>5.1}%)",
+        format_count(totals.raw_bytes),
+        format_count(totals.returned_bytes),
+        format_count(totals.bytes_saved()),
+        totals.savings_percent(),
+    );
+    println!(
+        "  Estimated tokens       {:>8}                         ",
+        format!("~{}", format_count(totals.estimated_tokens_saved)),
+    );
+
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n  {grey}Filter                 Calls    Bytes saved   Saved    Tokens{reset}");
+    for row in rows.iter().take(6) {
+        println!(
+            "  {:<22} {:>5} {:>14} {:>6.1}% {:>9}",
+            row.label,
+            row.calls,
+            format_count(row.bytes_saved()),
+            row.savings_percent(),
+            format!("~{}", format_count(row.estimated_tokens_saved)),
+        );
+    }
+    if rows.len() > 6 {
+        let remaining_calls: usize = rows[6..].iter().map(|row| row.calls).sum();
+        let remaining_saved: usize = rows[6..].iter().map(|row| row.bytes_saved()).sum();
+        println!(
+            "  {grey}other {} filters{reset} {:>5} {:>14}",
+            rows.len() - 6,
+            remaining_calls,
+            format_count(remaining_saved),
+        );
+    }
+}
+
+fn format_count(value: usize) -> String {
+    let text = value.to_string();
+    let mut formatted = String::with_capacity(text.len() + text.len() / 3);
+    for (index, ch) in text.chars().enumerate() {
+        if index > 0 && (text.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
 }
 
 /// Handle one multiplexed app event. Returns `true` when the UI should exit.
