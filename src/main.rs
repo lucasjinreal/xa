@@ -21,7 +21,7 @@ use session::Session;
 #[derive(Parser)]
 #[command(name = "xa")]
 #[command(about = "xa - a lightweight coding-agent CLI (like codex / claude-code)")]
-#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa chat --session <id>")]
+#[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa session resume <id> (or xa session -r <id>)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -36,10 +36,6 @@ struct Cli {
 
     /// Input text to process
     input: Option<String>,
-
-    /// Resume an interactive session by id (e.g. `xa chat --session <id>`)
-    #[arg(long = "session", global = true)]
-    session: Option<String>,
 
     /// Additional arguments for the command
     #[arg(trailing_var_arg = true)]
@@ -128,7 +124,7 @@ enum SessionAction {
         id: String,
     },
     /// Resume a session in the interactive TUI
-    #[command(alias = "r")]
+    #[command(short_flag = 'r')]
     Resume {
         /// Session id
         id: String,
@@ -215,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Chat) => {
             let provider = agent::load_active_provider().await;
-            let session = resolve_session(&cli, &provider);
+            let session = Session::new(&provider.name, &provider.model);
             tui::run(provider, session).await?;
             return Ok(());
         }
@@ -234,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             } else {
                 let provider = agent::load_active_provider().await;
-                let session = resolve_session(&cli, &provider);
+                let session = Session::new(&provider.name, &provider.model);
                 tui::run(provider, session).await?;
             }
             return Ok(());
@@ -433,15 +429,17 @@ fn get_help_text() -> String {
 
 USAGE:
     xa [OPTIONS]                 Launch the interactive agent TUI
-    xa chat [--session <id>]    Launch the interactive agent TUI
+    xa chat                     Launch the interactive agent TUI
     xa <SUBCOMMAND> ...         Legacy prompt commands (translate, polish, ...)
 
 COMMANDS (agent):
-    chat [--session <id>]       Start the interactive coding-agent TUI
+    chat                        Start the interactive coding-agent TUI
     login [name]                Configure a provider (endpoint + key + model)
     session ls                  List saved sessions
     session show <id>           Show a saved session's conversation
     session rm   <id>           Delete a saved session
+    session resume <id>          Resume a saved session
+    session -r <id>              Short form for resume
 
 IN-TUI SLASH COMMANDS:
     /login [name]               Set a provider (custom endpoint + key + model)
@@ -452,7 +450,6 @@ IN-TUI SLASH COMMANDS:
     /clear /help /exit          Clear / help / quit
 
 OPTIONS:
-    --session <id>              Resume a saved session in the TUI
     --no-stream                 Disable streaming (legacy prompt mode)
     --debug                     Print the filled prompt (legacy prompt mode)
     -h, --help                 Print help
@@ -460,21 +457,12 @@ OPTIONS:
 EXAMPLES:
     xa                                  # launch the agent TUI
     xa chat                            # launch the agent TUI
-    xa chat --session ab12             # resume a saved session
+    xa session resume ab12             # resume a saved session
     xa session ls                     # list saved sessions
     /login mygateway                  # inside TUI: point at any OpenAI-compatible endpoint
     /models gpt-4o                   # inside TUI: switch model
 
 For more information, visit the project repository."#.to_string()
-}
-
-/// Build the session to launch the TUI with: resume an existing one if
-/// `--session <id>` was given, otherwise start a fresh session.
-fn resolve_session(cli: &Cli, provider: &agent::Provider) -> Session {
-    match &cli.session {
-        Some(id) => session::load(id).unwrap_or_else(|| Session::new(&provider.name, &provider.model)),
-        None => Session::new(&provider.name, &provider.model),
-    }
 }
 
 /// `xa login [name]` — launch the codex-style interactive provider setup

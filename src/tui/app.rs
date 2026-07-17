@@ -74,6 +74,7 @@ struct ExitSummary {
     directory: String,
     session_id: String,
     session_title: String,
+    message_count: usize,
 }
 
 pub struct App {
@@ -82,6 +83,10 @@ pub struct App {
     input: TextArea<'static>,
     scroll: u16,
     auto_scroll: bool,
+    /// Bottom-most transcript offset from the last rendered frame.  Input
+    /// events arrive before the next layout pass, so this lets a downward
+    /// scroll re-enable follow mode precisely when it reaches that bottom.
+    scroll_max: u16,
     streaming: bool,
     should_quit: bool,
     /// Footer / transient messages (queue, ctrl-c hint). Activity labels live
@@ -139,6 +144,7 @@ impl App {
             input: TextArea::default(),
             scroll: 0,
             auto_scroll: true,
+            scroll_max: 0,
             streaming: false,
             should_quit: false,
             status: String::new(),
@@ -269,6 +275,10 @@ impl App {
                                 tool_call_id: Some(stc.id.clone()),
                             });
                         }
+                        // The assistant message above already includes the
+                        // visible answer. Writing it again below made each
+                        // tool turn grow by one cell on every resume.
+                        continue;
                     }
                 }
                 let answer = tc.answer_text();
@@ -789,24 +799,16 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::PageUp => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_sub(5);
-                self.dirty = true;
+                self.scroll_up(5);
             }
             KeyCode::PageDown => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_add(5);
-                self.dirty = true;
+                self.scroll_down(5);
             }
             KeyCode::Up if self.input_is_empty() => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_sub(1);
-                self.dirty = true;
+                self.scroll_up(1);
             }
             KeyCode::Down if self.input_is_empty() => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_add(1);
-                self.dirty = true;
+                self.scroll_down(1);
             }
             KeyCode::Up if self.input.lines().len() <= 1 => self.recall_history(-1),
             KeyCode::Down if self.input.lines().len() <= 1 => self.recall_history(1),
@@ -963,17 +965,41 @@ impl App {
     fn handle_mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::ScrollUp => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_sub(3);
-                self.dirty = true;
+                self.scroll_up(3);
             }
             MouseEventKind::ScrollDown => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_add(3);
-                self.dirty = true;
+                self.scroll_down(3);
             }
             _ => {}
         }
+    }
+
+    /// Move away from the latest output.  When the transcript fits entirely
+    /// on screen, an upward gesture cannot move the viewport and should not
+    /// accidentally disable follow mode.
+    fn scroll_up(&mut self, rows: u16) {
+        if self.scroll == 0 {
+            return;
+        }
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_sub(rows);
+        self.dirty = true;
+    }
+
+    /// Move toward the latest output.  Reaching the bottom turns follow mode
+    /// back on, so streaming content stays visible just like a chat UI.
+    fn scroll_down(&mut self, rows: u16) {
+        if self.auto_scroll {
+            return;
+        }
+        let next = self.scroll.saturating_add(rows);
+        if next >= self.scroll_max {
+            self.auto_scroll = true;
+            self.scroll = u16::MAX; // sentinel: reconcile to the live bottom
+        } else {
+            self.scroll = next;
+        }
+        self.dirty = true;
     }
 
     async fn do_pending(
@@ -1042,7 +1068,7 @@ impl App {
                     s.messages.len()
                 ));
             }
-            out.push_str("\nResume with: `xa chat --session <id>`");
+            out.push_str("\nResume with: `xa session resume <id>` (or `xa session -r <id>`)");
         }
         self.system_msg(out);
     }
@@ -1065,6 +1091,7 @@ impl App {
             directory: display_directory(),
             session_id: self.session.id.clone(),
             session_title: self.session.title.clone(),
+            message_count: self.session.messages.len(),
         }
     }
 
@@ -1432,6 +1459,7 @@ impl App {
             self.scroll.min(max_scroll + pad)
         };
         self.scroll = scroll; // reconcile
+        self.scroll_max = max_scroll + pad;
 
         let mut y: i32 = -(scroll as i32);
         for (c, &h_u) in self.cells.iter().zip(heights.iter()) {
@@ -1717,17 +1745,23 @@ fn print_exit_summary(summary: &ExitSummary) {
         summary.session_title.clone()
     };
 
-    println!("\nSession saved");
-    println!("  Model:           {}", summary.model);
-    println!("  Directory:       {}", summary.directory);
-    println!("  Permission mode: workspace-write");
-    println!("  Context length:  128k tokens");
-    println!("  Session:         {}", summary.session_id);
-    println!("  Title:           {title}");
-    println!("\nResume this session next time:");
+    const RESET: &str = "\x1b[0m";
+    const GREY: &str = "\x1b[90m";
+    const GREEN: &str = "\x1b[32m";
+    const CYAN_BOLD: &str = "\x1b[1;36m";
+
+    println!("\n{GREEN}✓{RESET} {CYAN_BOLD}Session saved{RESET}");
+    println!("  {GREY}Model:{RESET}            {}", summary.model);
+    println!("  {GREY}Directory:{RESET}        {}", summary.directory);
+    println!("  {GREY}Permission mode:{RESET}  workspace-write");
+    println!("  {GREY}Context window:{RESET}   128k tokens");
+    println!("  {GREY}Messages:{RESET}         {}", summary.message_count);
+    println!("  {GREY}Session:{RESET}          {}", summary.session_id);
+    println!("  {GREY}Title:{RESET}            {title}");
+    println!("\n{CYAN_BOLD}Resume this session{RESET}");
     println!("  xa session resume {}", summary.session_id);
-    println!("  xa chat --session {}", summary.session_id);
-    println!("\nUse `xa session ls` to see saved sessions.");
+    println!("  {GREY}or{RESET} xa session -r {}", summary.session_id);
+    println!("\n{GREY}List saved sessions:{RESET} xa session ls");
 }
 
 /// Handle one multiplexed app event. Returns `true` when the UI should exit.

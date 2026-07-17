@@ -90,6 +90,10 @@ pub fn load(id: &str) -> Option<Session> {
     fs::read_to_string(path_for(id))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
+        .map(|mut session: Session| {
+            session.remove_legacy_resume_duplicates();
+            session
+        })
 }
 
 /// Remove a session by id.
@@ -102,6 +106,37 @@ pub fn remove(id: &str) -> std::io::Result<()> {
 }
 
 impl Session {
+    /// Remove duplicate assistant entries written by xa versions that saved a
+    /// tool-call response both with its tool calls and as a second plain reply.
+    /// Those duplicates accumulated on every resume and could make a session
+    /// consume unbounded memory when restored.
+    fn remove_legacy_resume_duplicates(&mut self) {
+        let mut cleaned = Vec::with_capacity(self.messages.len());
+        let mut i = 0;
+        while i < self.messages.len() {
+            let message = &self.messages[i];
+            cleaned.push(message.clone());
+            i += 1;
+
+            if message.role != "assistant" || message.tool_calls.is_none() {
+                continue;
+            }
+
+            while i < self.messages.len() && self.messages[i].role == "tool" {
+                cleaned.push(self.messages[i].clone());
+                i += 1;
+            }
+            while i < self.messages.len()
+                && self.messages[i].role == "assistant"
+                && self.messages[i].tool_calls.is_none()
+                && self.messages[i].content == message.content
+            {
+                i += 1;
+            }
+        }
+        self.messages = cleaned;
+    }
+
     /// Create a fresh, empty session bound to a provider/model.
     pub fn new(provider: &str, model: &str) -> Self {
         let now = chrono::Utc::now().timestamp_millis();
@@ -119,5 +154,44 @@ impl Session {
     /// Touch the `updated` timestamp.
     pub fn touch(&mut self) {
         self.updated = chrono::Utc::now().timestamp_millis();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn removes_all_legacy_tool_turn_duplicates() {
+        let mut session = Session::new("test", "test");
+        let mut call = message("assistant", "done");
+        call.tool_calls = Some(vec![StoredToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]);
+        session.messages = vec![
+            call,
+            message("tool", "file contents"),
+            message("assistant", "done"),
+            message("assistant", "done"),
+            message("user", "next"),
+        ];
+
+        session.remove_legacy_resume_duplicates();
+
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].role, "assistant");
+        assert_eq!(session.messages[1].role, "tool");
+        assert_eq!(session.messages[2].role, "user");
     }
 }

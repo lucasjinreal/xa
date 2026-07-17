@@ -17,7 +17,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Clear, Paragraph},
     Frame,
 };
 
@@ -29,8 +29,8 @@ const ACCENT: Color = theme::ACCENT;
 const DIM: Color = theme::TEXT_DIM;
 const PLAIN: Color = theme::TEXT;
 const SELECT_BG: Color = theme::SELECT_BG;
-/// Solid settings surface — opaque so transcript doesn't show through.
-const PANEL_BG: Color = theme::SURFACE;
+/// The settings surface matches the composer and covers its full reserved area.
+const PANEL_BG: Color = theme::INPUT_BG;
 /// Slightly darker field strip for text inputs inside the modal.
 const FIELD_BG: Color = Color::Rgb(28, 28, 28);
 
@@ -563,8 +563,8 @@ impl Wizard {
     }
 
     /// Draw a Codex-like settings panel anchored immediately above `area`'s
-    /// bottom edge. `App` passes the space above the composer, so opening the
-    /// chooser replaces that part of the transcript instead of floating in it.
+    /// bottom edge. It is sized to its content plus one padding row above and
+    /// below, so the remaining transcript area stays visible.
     pub fn draw(&self, f: &mut Frame, area: Rect) {
         let wanted_height = match self.step {
             Step::Provider => self.sources.len() as u16 + 5,
@@ -580,8 +580,12 @@ impl Wizard {
             height,
         };
         let panel_style = Style::default().bg(PANEL_BG).fg(PLAIN);
-        // Paint every cell explicitly: standalone alternate-screen draws can
-        // otherwise leave the terminal's bottom row in its old black style.
+        // `set_style` only restyles existing glyphs; it does not erase them.
+        // Clear the bounded panel first so underlying transcript text cannot
+        // leak through its blank rows, without obscuring the rest of the view.
+        f.render_widget(Clear, panel);
+        // Paint every panel cell explicitly too: standalone alternate-screen
+        // draws can otherwise leave the terminal's bottom row in an old style.
         f.buffer_mut().set_style(panel, panel_style);
         f.render_widget(Block::default().style(panel_style), panel);
 

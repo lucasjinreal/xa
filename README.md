@@ -76,14 +76,13 @@ Inside the TUI:
 ### 3. Session Management
 
 ```bash
-# Save current session
-xa --session save "My conversation"
-
 # List sessions
-xa --session ls
+xa session ls
 
 # Resume a session
-xa --session <id>
+xa session resume <id>
+# Short form
+xa session -r <id>
 ```
 
 ## Architecture
