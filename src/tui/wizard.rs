@@ -178,6 +178,18 @@ impl Wizard {
         mode: WizardMode,
         preselect: Option<&str>,
     ) -> Result<Option<Provider>, Box<dyn std::error::Error>> {
+        let _crash_guard = crate::tui::crash::TuiGuard::enter();
+        let result = Self::run_standalone_inner(mode, preselect).await;
+        if let Err(error) = &result {
+            crate::tui::crash::report_error(error.as_ref());
+        }
+        result
+    }
+
+    async fn run_standalone_inner(
+        mode: WizardMode,
+        preselect: Option<&str>,
+    ) -> Result<Option<Provider>, Box<dyn std::error::Error>> {
         use std::io::stdout;
         use std::time::Duration;
 

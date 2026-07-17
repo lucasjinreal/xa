@@ -22,6 +22,15 @@ use crate::tui::theme;
 
 /// Open the `xa resume` picker and return the selected session id.
 pub fn pick_session() -> io::Result<Option<String>> {
+    let _crash_guard = super::crash::TuiGuard::enter();
+    let result = pick_session_inner();
+    if let Err(error) = &result {
+        super::crash::report_error(error);
+    }
+    result
+}
+
+fn pick_session_inner() -> io::Result<Option<String>> {
     let sessions = session::list_summaries();
     if sessions.is_empty() {
         println!("No saved sessions yet.");

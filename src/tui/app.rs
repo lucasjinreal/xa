@@ -1958,6 +1958,18 @@ pub async fn run(
     provider: Provider,
     session: Session,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _crash_guard = super::crash::TuiGuard::enter();
+    let result = run_inner(provider, session).await;
+    if let Err(error) = &result {
+        super::crash::report_error(error.as_ref());
+    }
+    result
+}
+
+async fn run_inner(
+    provider: Provider,
+    session: Session,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;

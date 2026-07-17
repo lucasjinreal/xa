@@ -31,5 +31,6 @@ mod render;
 pub mod wizard;
 pub mod resume;
 mod app;
+mod crash;
 
 pub use app::run;
