@@ -2152,10 +2152,16 @@ async fn run_inner(
                 }
             }
             _ = tick.tick() => {
-                // Only redraw when something is animating (stream, shimmer,
-                // slash menu, or wizard). Sticky interrupted/error lines are
-                // static and must not force a 20fps repaint loop.
-                if app.streaming || app.slash_mode || app.wizard.is_some() {
+                // Keep the status indicator (spinner + shimmer + elapsed timer)
+                // animating on a steady clock whenever a live phase is active —
+                // independent of how fast the AI streams. A slow / high-latency
+                // API must never freeze the indicator; the animation is driven
+                // by wall-clock time, not by incoming stream deltas.
+                if app.stream_phase.is_active() && !app.stream_phase.is_terminal()
+                    || app.streaming
+                    || app.slash_mode
+                    || app.wizard.is_some()
+                {
                     app.dirty = true;
                 }
             }
