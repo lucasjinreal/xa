@@ -80,6 +80,7 @@ static TS_HIGHLIGHTER: std::sync::LazyLock<Arc<TreeSitterHighlighter>> =
 /// A single drawable row inside a cell. `x`/`w` are offsets relative to the
 /// cell's left edge (which is always the transcript's left edge), so the same
 /// row can be drawn no matter where the cell is positioned in the viewport.
+#[derive(Clone)]
 pub struct Row {
     pub x: u16,
     pub w: u16,
@@ -1494,6 +1495,42 @@ pub struct ThinkingCell {
     /// Bumped on content mutations so the layout cache invalidates.
     layout_gen: u64,
     layout: RefCell<Option<LayoutCache>>,
+    /// Per-block rendered rows. During streaming only the *last* (still-growing)
+    /// text block changes, so we reuse the rendered rows of every stable block
+    /// instead of re-running markdown + tree-sitter over the whole transcript on
+    /// every delta. Without this, a long generation re-highlights everything
+    /// that came before on each frame (O(n²)) and the whole TUI (scroll, status
+    /// animation) freezes.
+    rendered_blocks: RefCell<Vec<Option<Vec<Row>>>>,
+    /// Fingerprints mirror `rendered_blocks`; `None` means "not yet rendered".
+    block_sigs: RefCell<Vec<u64>>,
+    /// Last time the streaming cell was fully rebuilt, used to throttle the
+    /// (potentially expensive) rebuild so input/scroll stay responsive even
+    /// while the model streams a very large block of text.
+    last_stream_rebuild: RefCell<std::time::Instant>,
+}
+
+/// Cheap, stable signature of a block's rendered content at a given width.
+fn block_sig(b: &ThinkBlock, width: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut h);
+    match b {
+        ThinkBlock::Text(t) => {
+            b'N'.hash(&mut h);
+            t.hash(&mut h);
+        }
+        ThinkBlock::Tool(t) => {
+            b'T'.hash(&mut h);
+            t.tool_name.hash(&mut h);
+            (t.status as u8).hash(&mut h);
+            t.path.hash(&mut h);
+            t.output.hash(&mut h);
+            t.diff.hash(&mut h);
+            t.expanded.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 impl ThinkingCell {
@@ -1503,12 +1540,18 @@ impl ThinkingCell {
             streaming: true,
             layout_gen: 0,
             layout: RefCell::new(None),
+            rendered_blocks: RefCell::new(Vec::new()),
+            block_sigs: RefCell::new(Vec::new()),
+            last_stream_rebuild: RefCell::new(std::time::Instant::now()),
         }
     }
 
     fn bump_layout(&mut self) {
         self.layout_gen = self.layout_gen.wrapping_add(1);
         *self.layout.borrow_mut() = None;
+        // Invalidate per-block cache: drop everything so it rebuilds lazily.
+        *self.rendered_blocks.borrow_mut() = Vec::new();
+        *self.block_sigs.borrow_mut() = Vec::new();
     }
 
     fn fingerprint(&self) -> u64 {
@@ -1611,6 +1654,101 @@ impl ThinkingCell {
             .collect()
     }
 
+    /// Render a single text block's markdown into rows (no cursor/padding).
+    fn render_text_block(&self, text: &str, width: u16) -> Vec<Row> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let indent = THINK_INDENT;
+        let text_w = width
+            .saturating_sub(indent.saturating_add(THINK_RIGHT_PAD))
+            .max(1) as usize;
+        let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
+        let md_lines = render_markdown(text, text_w);
+        // Group consecutive code lines so each fence becomes one
+        // code background bar with a 1-line plain margin above/below.
+        let mut rows: Vec<Row> = Vec::new();
+        let mut code_buf: Vec<Line<'static>> = Vec::new();
+        let flush_code = |buf: &mut Vec<Line<'static>>, rows: &mut Vec<Row>| {
+            if !buf.is_empty() {
+                let chunk = std::mem::take(buf);
+                push_code_block_rows(chunk, width, rows);
+            }
+        };
+        for line in md_lines {
+            if is_code_line(&line) {
+                code_buf.push(line);
+            } else {
+                flush_code(&mut code_buf, &mut rows);
+                // Collapse a blank that would double the post-code margin.
+                if line_is_blank(&line)
+                    && rows.last().is_some_and(|r| line_is_blank(&r.line))
+                {
+                    continue;
+                }
+                rows.push(Row::new(indent, text_row_w, line));
+            }
+        }
+        flush_code(&mut code_buf, &mut rows);
+        rows
+    }
+
+    /// Render one block, reusing the per-block cache when its signature is
+    /// unchanged. During streaming only the trailing text block changes, so
+    /// every earlier block is served from cache without re-running markdown or
+    /// tree-sitter — this is what keeps scroll/animation responsive.
+    ///
+    /// `live_block` marks the single still-running tool card: its shimmer phase
+    /// is time-based and must be recomputed every frame, so it bypasses the
+    /// cache. Every *other* block stays cached even in live (shimmer) mode —
+    /// otherwise a long-running tool (e.g. `cargo build`) would re-highlight the
+    /// entire answer on every animation frame and freeze the whole TUI.
+    fn render_block_cached(
+        &self,
+        b: &ThinkBlock,
+        idx: usize,
+        width: u16,
+        ctx: Option<&RenderContext>,
+        live_block: bool,
+    ) -> Vec<Row> {
+        if live_block {
+            return match b {
+                ThinkBlock::Tool(t) => t.build(width, ctx),
+                ThinkBlock::Text(text) => self.render_text_block(text, width),
+            };
+        }
+        let sig = block_sig(b, width);
+        {
+            let sigs = self.block_sigs.borrow();
+            let cache = self.rendered_blocks.borrow();
+            if let (Some(stored_sig), Some(Some(rows))) = (sigs.get(idx), cache.get(idx)) {
+                if *stored_sig == sig {
+                    return rows.clone();
+                }
+            }
+        }
+        let rows = match b {
+            ThinkBlock::Tool(t) => t.build(width, ctx),
+            ThinkBlock::Text(text) => self.render_text_block(text, width),
+        };
+        let mut sigs = self.block_sigs.borrow_mut();
+        let mut cache = self.rendered_blocks.borrow_mut();
+        if sigs.len() <= idx {
+            sigs.resize(idx + 1, 0);
+            cache.resize(idx + 1, None);
+        }
+        sigs[idx] = sig;
+        cache[idx] = Some(rows.clone());
+        rows
+    }
+
+    /// Index of the single still-running tool card, if any.
+    fn running_tool_idx(&self) -> Option<usize> {
+        self.blocks
+            .iter()
+            .position(|b| matches!(b, ThinkBlock::Tool(t) if t.status == ToolStatus::Running))
+    }
+
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
         // Waiting / Thinking / Responding live in the activity strip above the
         // input bar (Claude Code style) — not inside the transcript cell.
@@ -1619,46 +1757,12 @@ impl ThinkingCell {
         }
 
         let indent = THINK_INDENT;
-        // Left indent + 1-col right pad for normal markdown text.
-        let text_w = width
-            .saturating_sub(indent.saturating_add(THINK_RIGHT_PAD))
-            .max(1) as usize;
         let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
+        let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
-        for b in &self.blocks {
-            match b {
-                ThinkBlock::Tool(t) => rows.extend(t.build(width, ctx)),
-                ThinkBlock::Text(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let md_lines = render_markdown(text, text_w);
-                    // Group consecutive code lines so each fence becomes one
-                    // code background bar with a 1-line plain margin above/below.
-                    let mut code_buf: Vec<Line<'static>> = Vec::new();
-                    let flush_code = |buf: &mut Vec<Line<'static>>, rows: &mut Vec<Row>| {
-                        if !buf.is_empty() {
-                            let chunk = std::mem::take(buf);
-                            push_code_block_rows(chunk, width, rows);
-                        }
-                    };
-                    for line in md_lines {
-                        if is_code_line(&line) {
-                            code_buf.push(line);
-                        } else {
-                            flush_code(&mut code_buf, &mut rows);
-                            // Collapse a blank that would double the post-code margin.
-                            if line_is_blank(&line)
-                                && rows.last().is_some_and(|r| line_is_blank(&r.line))
-                            {
-                                continue;
-                            }
-                            rows.push(Row::new(indent, text_row_w, line));
-                        }
-                    }
-                    flush_code(&mut code_buf, &mut rows);
-                }
-            }
+        for (idx, b) in self.blocks.iter().enumerate() {
+            let live_block = Some(idx) == live_idx;
+            rows.extend(self.render_block_cached(b, idx, width, ctx, live_block));
         }
         // Streaming cursor: append to the last text row so it sits at the end
         // of the answer (not on its own row, which looked like a stray glyph /
@@ -1697,6 +1801,40 @@ impl ThinkingCell {
             *self.layout.borrow_mut() = None;
             return cached_rows(&self.layout, width, self.fingerprint(), || {
                 self.build(width, ctx)
+            });
+        }
+        // While streaming a large answer, a single `build()` can be expensive
+        // (markdown + tree-sitter over thousands of lines). Rebuilding it on
+        // every delta would block scroll and the status animation. Throttle the
+        // expensive rebuild to ~15fps: between rebuilds we keep serving the
+        // last cached rows (the trailing cursor just lags by ≤~66ms), so input
+        // and scrolling stay responsive no matter how big the generation is.
+        if self.streaming {
+            let now = std::time::Instant::now();
+            let since = now.duration_since(*self.last_stream_rebuild.borrow());
+            const MIN_REBUILD: std::time::Duration = std::time::Duration::from_millis(66);
+            if since >= MIN_REBUILD {
+                *self.last_stream_rebuild.borrow_mut() = now;
+                *self.layout.borrow_mut() = None;
+                return cached_rows(&self.layout, width, self.fingerprint(), || {
+                    self.build(width, None)
+                });
+            }
+            // Within the throttle window: serve the cached rows as-is (do NOT
+            // recompute the fingerprint, which changes every delta). This is the
+            // whole point — skip the expensive rebuild so the UI stays live.
+            if let Some(cache) = self.layout.borrow().as_ref() {
+                if cache.width == width {
+                    return std::cell::Ref::map(self.layout.borrow(), |c| {
+                        &c.as_ref().expect("layout cache present").rows
+                    });
+                }
+            }
+            // No cached rows yet (first call, or width changed): build now.
+            *self.last_stream_rebuild.borrow_mut() = now;
+            *self.layout.borrow_mut() = None;
+            return cached_rows(&self.layout, width, self.fingerprint(), || {
+                self.build(width, None)
             });
         }
         cached_rows(&self.layout, width, self.fingerprint(), || {
