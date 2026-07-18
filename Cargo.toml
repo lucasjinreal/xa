@@ -1,6 +1,6 @@
 [package]
 name = "xa"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Execute Anything via LLM - A CLI tool for arbitrary text processing using LLMs"
 authors = ["jinfagang19@163.com"]
