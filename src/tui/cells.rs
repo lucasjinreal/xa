@@ -1107,6 +1107,16 @@ impl ToolCallCell {
             }
             _ => spans.push(Span::styled(args_display, args_style)),
         }
+
+        if matches!(self.tool_name.as_str(), "edit" | "write") {
+            if let Some(diff) = self.diff.as_deref() {
+                let (added, removed) = diff_change_counts(diff);
+                spans.push(Span::styled(
+                    format!(" (+{added} -{removed})"),
+                    Style::default().fg(theme::t().text_hint),
+                ));
+            }
+        }
         
         Line::from(spans)
     }
@@ -1154,22 +1164,28 @@ impl ToolCallCell {
                     };
                     let lang = self.path.as_deref().and_then(lang_from_path);
                     let mut shown = build_diff_rows(diff, x, w, label, lang);
-                    let limit = 10;
-                    if shown.len() > limit {
-                        shown.truncate(limit);
+                    const MAX_DIFF_ROWS: usize = 200;
+                    const DIFF_HEAD_ROWS: usize = MAX_DIFF_ROWS / 2;
+                    if shown.len() > MAX_DIFF_ROWS {
+                        let omitted = shown.len() - MAX_DIFF_ROWS;
+                        let mut tail = shown.split_off(shown.len() - DIFF_HEAD_ROWS);
+                        shown.truncate(DIFF_HEAD_ROWS);
+                        rows.append(&mut shown);
                         rows.push(Row::new(
                             x,
                             w,
                             Line::from(vec![
                                 Span::styled("  ", Style::default().fg(theme::t().text_dim)),
                                 Span::styled(
-                                    format!("… +{} lines", shown.len() - limit),
+                                    format!("… {omitted} diff lines omitted …"),
                                     Style::default().fg(theme::t().text_hint),
                                 ),
                             ]),
                         ));
+                        rows.append(&mut tail);
+                    } else {
+                        rows.append(&mut shown);
                     }
-                    rows.append(&mut shown);
                 }
             }
             _ => {
@@ -1428,11 +1444,22 @@ fn diff_is_new_file(diff: &str) -> bool {
     diff.contains("--- /dev/null") || diff.contains("new file mode")
 }
 
-/// Short summary of how many lines changed, for the collapsed tool header
-/// (e.g. "3 changed"). Counts added/removed lines; context lines are ignored.
+/// Count actual changed lines, excluding unified-diff file headers.
+fn diff_change_counts(diff: &str) -> (usize, usize) {
+    let added = diff
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let removed = diff
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    (added, removed)
+}
+
+/// Short summary of how many lines changed, for collapsed tool output.
 fn diff_change_summary(diff: &str) -> String {
-    let added = diff.lines().filter(|l| l.starts_with('+')).count();
-    let removed = diff.lines().filter(|l| l.starts_with('-')).count();
+    let (added, removed) = diff_change_counts(diff);
     if diff_is_new_file(diff) {
         format!("{added} new lines")
     } else if removed == 0 {
@@ -1738,6 +1765,12 @@ mod markdown_layout_tests {
             line_text(&lines[0]),
             "Hi! I'm xa, a coding agent. How can I help you today?"
         );
+    }
+
+    #[test]
+    fn diff_change_counts_ignore_file_headers() {
+        let diff = "--- a/example.rs\n+++ b/example.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n+added\n";
+        assert_eq!(diff_change_counts(diff), (2, 1));
     }
 
     #[test]
