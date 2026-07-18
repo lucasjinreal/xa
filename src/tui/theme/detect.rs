@@ -1,4 +1,4 @@
-//! Terminal light/dark detection (COLORFGBG + OSC 11).
+//! Terminal light/dark detection.
 
 use super::ColorMode;
 
@@ -62,20 +62,35 @@ pub fn mode_from_colorfgbg(value: &str) -> Option<ColorMode> {
 /// Accepts both BEL-terminated (`\x07`) and ST-terminated (`ESC \`) forms, and
 /// `rgb:rrrr/gggg/bbbb` with 1–4 hex digits per channel.
 pub fn parse_osc11_response(buf: &[u8]) -> Option<(u8, u8, u8)> {
-    let s = std::str::from_utf8(buf).ok()?;
+    let response = complete_osc11_response(buf)?;
+    let s = std::str::from_utf8(response).ok()?;
     // Find `rgb:` case-insensitively.
     let lower = s.to_ascii_lowercase();
     let idx = lower.find("rgb:")?;
     let rest = &s[idx + 4..];
-    let end = rest
-        .find(['\x07', '\x1b', '\x5c', ';', '\n', '\r'])
-        .unwrap_or(rest.len());
+    let end = rest.find(['\x07', '\x1b']).unwrap_or(rest.len());
     let body = rest[..end].trim();
     let mut parts = body.split('/');
     let r = parse_osc_component(parts.next()?)?;
     let g = parse_osc_component(parts.next()?)?;
     let b = parse_osc_component(parts.next()?)?;
     Some((r, g, b))
+}
+
+/// Return the complete OSC 11 response, including its terminator. An ESC byte
+/// alone is not a terminator: ST is the two-byte sequence `ESC \\`.
+fn complete_osc11_response(buf: &[u8]) -> Option<&[u8]> {
+    let start = buf.windows(5).position(|window| window == b"\x1b]11;")?;
+    for i in start + 5..buf.len() {
+        match buf[i] {
+            b'\x07' => return Some(&buf[start..=i]),
+            b'\x1b' if buf.get(i + 1) == Some(&b'\\') => {
+                return Some(&buf[start..=i + 1]);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_osc_component(hex: &str) -> Option<u8> {
@@ -130,27 +145,34 @@ fn query_osc11_bg() -> Option<(u8, u8, u8)> {
         return None;
     }
 
-    // Best-effort: temporarily put the tty into non-canonical mode so the
-    // response is available without a newline. Restore on exit.
-    let restored = TtyRawGuard::enter(fd);
+    // Temporarily put the tty into non-canonical mode so the response is
+    // available without a newline. Keeping this active until the queue is
+    // drained prevents replies from becoming application input.
+    let Some(restored) = TtyRawGuard::enter(fd) else {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        return None;
+    };
+
+    // Discard any stale terminal-control response before sending our query.
+    let _ = unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
 
     // Prefer ST terminator; many terminals accept either.
     let _ = tty.write_all(b"\x1b]11;?\x1b\\");
     let _ = tty.flush();
 
-    let deadline = Instant::now() + Duration::from_millis(80);
+    let deadline = Instant::now() + Duration::from_millis(250);
     let mut buf = Vec::with_capacity(64);
     let mut tmp = [0u8; 128];
+    let mut rgb = None;
 
     while Instant::now() < deadline {
         match tty.read(&mut tmp) {
-            Ok(0) => break,
+            Ok(0) => std::thread::sleep(Duration::from_millis(5)),
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if let Some(rgb) = parse_osc11_response(&buf) {
-                    drop(restored);
-                    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-                    return Some(rgb);
+                if let Some(found) = parse_osc11_response(&buf) {
+                    rgb = Some(found);
+                    break;
                 }
                 // Cap runaway buffers.
                 if buf.len() > 512 {
@@ -164,9 +186,13 @@ fn query_osc11_bg() -> Option<(u8, u8, u8)> {
         }
     }
 
+    // Consume the entire reply (or any late partial reply) before raw mode is
+    // restored. Otherwise an OSC response can show up in the TUI composer or
+    // in the shell after the TUI exits.
+    let _ = unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
     drop(restored);
     let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-    None
+    rgb
 }
 
 /// RAII restore of termios after briefly enabling non-canonical reads.

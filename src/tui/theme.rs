@@ -1,9 +1,9 @@
 //! TUI color themes: dark (default) and light, with auto detection.
 //!
-//! Surfaces stay neutral gray; brand emphasis is warm orange. Markdown body
-//! text is a soft warm gray (never pure white on dark). Syntax highlighting
-//! uses a calm, readable suite similar to GrokNight’s dark code blocks, or a
-//! deeper GitHub-light-inspired suite on light terminals.
+//! UI chrome keeps a warm orange brand accent. Assistant markdown follows a
+//! Grok/Codex-style minimal palette (soft body gray, blue/purple headings,
+//! restrained syntax, low-sat diffs). Light mode mirrors the same roles with
+//! darker inks on pale surfaces.
 //!
 //! Call [`init`] (or [`init_from_preference`]) once before any TUI draw. After
 //! that, every widget reads colors via [`t`].
@@ -129,122 +129,146 @@ impl Theme {
         }
     }
 
-    /// Gray + orange soft dark (historical default).
+    /// Dark theme: Grok/Codex-minimal markdown + warm orange UI chrome.
+    ///
+    /// Core assistant colors (~8): body `#C8C8C8`, blue `#7AA2F7`, purple
+    /// `#BB9AF7`, mid-gray `#707070`, cyan `#3A95AB`, gold `#E0AF68`,
+    /// code bg `#1C1C1C`, plus low-sat green/red for diffs.
     pub fn dark() -> Self {
-        let accent = Color::Rgb(217, 119, 87);
+        // Core markdown / syntax tokens.
+        let body = Color::Rgb(0xC8, 0xC8, 0xC8); // #C8C8C8
+        let blue = Color::Rgb(0x7A, 0xA2, 0xF7); // #7AA2F7
+        let purple = Color::Rgb(0xBB, 0x9A, 0xF7); // #BB9AF7
+        let mid = Color::Rgb(0x70, 0x70, 0x70); // #707070
+        let cyan = Color::Rgb(0x3A, 0x95, 0xAB); // #3A95AB
+        let gold = Color::Rgb(0xE0, 0xAF, 0x68); // #E0AF68
+        let code_bg = Color::Rgb(0x1C, 0x1C, 0x1C); // #1C1C1C
+        let code_plain = Color::Rgb(0xA8, 0xA8, 0xA8); // #A8A8A8
+        let accent = Color::Rgb(217, 119, 87); // UI brand (not markdown)
+
         Self {
             mode: ColorMode::Dark,
             accent,
             accent_dim: Color::Rgb(180, 100, 70),
             accent_bright: Color::Rgb(240, 150, 110),
-            text: Color::Rgb(225, 225, 225),
-            text_dim: Color::Rgb(145, 145, 145),
-            text_hint: Color::Rgb(110, 110, 110),
+            text: body,
+            text_dim: mid,
+            text_hint: mid,
             bg: Color::Rgb(22, 22, 22),
             surface: Color::Rgb(36, 36, 36),
-            code_bg: Color::Rgb(28, 28, 30),
-            code_text: Color::Rgb(168, 166, 158),
+            code_bg,
+            code_text: code_plain,
             user_bg: Color::Rgb(34, 34, 34),
             input_bg: Color::Rgb(30, 30, 30),
-            footer: Color::Rgb(130, 130, 130),
+            footer: mid,
             user_lead: Color::Rgb(150, 150, 150),
             input_lead: Color::Rgb(240, 240, 240),
             select_bg: Color::Rgb(70, 48, 28),
             border: Color::Rgb(72, 72, 72),
             field_bg: Color::Rgb(28, 28, 28),
             shimmer_peak: Color::Rgb(255, 255, 255),
-            success: Color::Rgb(120, 185, 105),
-            error: Color::Rgb(220, 95, 75),
-            warning: Color::Rgb(220, 170, 70),
-            diff_add: Color::Rgb(100, 185, 120),
-            diff_del: Color::Rgb(220, 115, 105),
-            diff_meta: Color::Rgb(120, 120, 120),
-            diff_add_bg: Color::Rgb(30, 50, 35),
-            diff_del_bg: Color::Rgb(55, 30, 28),
-            md_text: Color::Rgb(225, 225, 225),
-            md_heading1: accent,
-            md_heading2: Color::Rgb(214, 198, 178),
-            md_heading3: Color::Rgb(168, 148, 128),
-            md_muted: Color::Rgb(118, 114, 108),
-            md_inline_code: Color::Rgb(214, 176, 110),
-            md_link: Color::Rgb(224, 140, 100),
-            md_info: Color::Rgb(130, 165, 155),
-            syn_comment: Color::Rgb(110, 108, 102),
-            syn_keyword: Color::Rgb(214, 130, 110),
-            syn_string: Color::Rgb(152, 180, 130),
-            syn_string_escape: Color::Rgb(178, 198, 150),
-            syn_number: Color::Rgb(210, 170, 110),
-            syn_constant: Color::Rgb(200, 155, 130),
-            syn_function: Color::Rgb(130, 175, 190),
-            syn_type: Color::Rgb(145, 175, 160),
-            syn_variable: Color::Rgb(168, 166, 158),
-            syn_property: Color::Rgb(160, 170, 185),
-            syn_operator: Color::Rgb(150, 145, 140),
-            syn_punctuation: Color::Rgb(120, 118, 114),
-            syn_attribute: Color::Rgb(200, 170, 120),
-            syn_tag: Color::Rgb(130, 175, 190),
-            syn_label: Color::Rgb(200, 140, 130),
-            syn_error: Color::Rgb(220, 100, 90),
+            success: Color::Rgb(0x9E, 0xCE, 0x6A),
+            error: Color::Rgb(0xF7, 0x76, 0x8E),
+            warning: gold,
+            // Diff — low saturation (Edit tool).
+            diff_add: Color::Rgb(0x9E, 0xCE, 0x6A), // #9ECE6A
+            diff_del: Color::Rgb(0xF7, 0x76, 0x8E), // #F7768E
+            diff_meta: mid,
+            diff_add_bg: Color::Rgb(0x06, 0x38, 0x06), // #063806
+            diff_del_bg: Color::Rgb(0x42, 0x0E, 0x14), // #420E14
+            // Markdown
+            md_text: body,
+            md_heading1: blue,
+            md_heading2: purple,
+            md_heading3: purple,
+            md_muted: mid, // list bullets / rules / quotes
+            md_inline_code: cyan,
+            md_link: cyan,
+            md_info: cyan,
+            // Syntax — only a few semantic hues; everything else = body.
+            syn_comment: mid,
+            syn_keyword: purple,
+            syn_string: gold,
+            syn_string_escape: gold,
+            syn_number: gold,
+            syn_constant: gold,
+            syn_function: blue,
+            syn_type: code_plain,
+            syn_variable: code_plain,
+            syn_property: code_plain,
+            syn_operator: code_plain,
+            syn_punctuation: code_plain,
+            syn_attribute: cyan, // macros / attributes
+            syn_tag: cyan,
+            syn_label: cyan,
+            syn_error: Color::Rgb(0xF7, 0x76, 0x8E),
         }
     }
 
-    /// Soft light: dark text on near-white surfaces, deeper accent for contrast.
+    /// Light theme: same role mapping, darker inks on pale surfaces.
     pub fn light() -> Self {
+        let body = Color::Rgb(0x2A, 0x2A, 0x2A);
+        let blue = Color::Rgb(0x2E, 0x5C, 0xC7);
+        let purple = Color::Rgb(0x6B, 0x4F, 0xC7);
+        let mid = Color::Rgb(0x70, 0x70, 0x70);
+        let cyan = Color::Rgb(0x1F, 0x7A, 0x8C);
+        let gold = Color::Rgb(0xB0, 0x7D, 0x28);
+        let code_bg = Color::Rgb(0xEE, 0xEE, 0xEE);
         let accent = Color::Rgb(196, 95, 58);
+
         Self {
             mode: ColorMode::Light,
             accent,
             accent_dim: Color::Rgb(165, 85, 55),
             accent_bright: Color::Rgb(220, 120, 80),
-            text: Color::Rgb(32, 32, 32),
-            text_dim: Color::Rgb(100, 100, 100),
-            text_hint: Color::Rgb(130, 130, 130),
+            text: body,
+            text_dim: mid,
+            text_hint: mid,
             bg: Color::Rgb(248, 248, 248),
             surface: Color::Rgb(240, 240, 240),
-            code_bg: Color::Rgb(236, 236, 238),
-            code_text: Color::Rgb(55, 54, 50),
+            code_bg,
+            code_text: body,
             user_bg: Color::Rgb(234, 234, 234),
             input_bg: Color::Rgb(242, 242, 242),
-            footer: Color::Rgb(110, 110, 110),
+            footer: mid,
             user_lead: Color::Rgb(110, 110, 110),
             input_lead: Color::Rgb(40, 40, 40),
             select_bg: Color::Rgb(255, 228, 208),
             border: Color::Rgb(190, 190, 190),
             field_bg: Color::Rgb(255, 255, 255),
-            shimmer_peak: Color::Rgb(196, 95, 58),
-            success: Color::Rgb(40, 140, 60),
-            error: Color::Rgb(190, 55, 45),
-            warning: Color::Rgb(170, 120, 20),
-            diff_add: Color::Rgb(30, 130, 60),
-            diff_del: Color::Rgb(180, 50, 45),
-            diff_meta: Color::Rgb(120, 120, 120),
-            diff_add_bg: Color::Rgb(220, 245, 225),
-            diff_del_bg: Color::Rgb(255, 230, 228),
-            md_text: Color::Rgb(32, 32, 32),
-            md_heading1: accent,
-            md_heading2: Color::Rgb(90, 70, 50),
-            md_heading3: Color::Rgb(110, 90, 70),
-            md_muted: Color::Rgb(130, 125, 120),
-            md_inline_code: Color::Rgb(150, 95, 25),
-            md_link: Color::Rgb(185, 85, 50),
-            md_info: Color::Rgb(40, 110, 100),
-            // Deeper tokens for light code blocks (GitHub-light inspired).
-            syn_comment: Color::Rgb(110, 115, 120),
-            syn_keyword: Color::Rgb(175, 55, 45),
-            syn_string: Color::Rgb(40, 125, 55),
-            syn_string_escape: Color::Rgb(50, 140, 70),
-            syn_number: Color::Rgb(150, 95, 25),
-            syn_constant: Color::Rgb(160, 80, 50),
-            syn_function: Color::Rgb(30, 110, 150),
-            syn_type: Color::Rgb(40, 120, 105),
-            syn_variable: Color::Rgb(55, 54, 50),
-            syn_property: Color::Rgb(50, 90, 140),
-            syn_operator: Color::Rgb(90, 90, 90),
-            syn_punctuation: Color::Rgb(120, 120, 120),
-            syn_attribute: Color::Rgb(140, 100, 30),
-            syn_tag: Color::Rgb(30, 110, 150),
-            syn_label: Color::Rgb(160, 70, 60),
-            syn_error: Color::Rgb(190, 40, 40),
+            shimmer_peak: accent,
+            success: Color::Rgb(0x3D, 0x8B, 0x40),
+            error: Color::Rgb(0xC4, 0x3E, 0x55),
+            warning: gold,
+            diff_add: Color::Rgb(0x3D, 0x8B, 0x40),
+            diff_del: Color::Rgb(0xC4, 0x3E, 0x55),
+            diff_meta: mid,
+            diff_add_bg: Color::Rgb(0xE0, 0xF0, 0xE0),
+            diff_del_bg: Color::Rgb(0xF8, 0xE4, 0xE6),
+            md_text: body,
+            md_heading1: blue,
+            md_heading2: purple,
+            md_heading3: purple,
+            md_muted: mid,
+            md_inline_code: cyan,
+            md_link: cyan,
+            md_info: cyan,
+            syn_comment: mid,
+            syn_keyword: purple,
+            syn_string: gold,
+            syn_string_escape: gold,
+            syn_number: gold,
+            syn_constant: gold,
+            syn_function: blue,
+            syn_type: body,
+            syn_variable: body,
+            syn_property: body,
+            syn_operator: body,
+            syn_punctuation: body,
+            syn_attribute: cyan,
+            syn_tag: cyan,
+            syn_label: cyan,
+            syn_error: Color::Rgb(0xC4, 0x3E, 0x55),
         }
     }
 
@@ -403,6 +427,8 @@ mod tests {
             detect::parse_osc11_response(s2.as_bytes()),
             Some((0, 0, 0))
         );
+        let incomplete = b"\x1b]11;rgb:1212/1212/1212\x1b";
+        assert_eq!(detect::parse_osc11_response(incomplete), None);
         // 2-digit hex components
         let s3 = b"\x1b]11;rgb:ab/cd/ef\x07";
         let (r, g, b) = detect::parse_osc11_response(s3).unwrap();

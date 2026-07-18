@@ -1,25 +1,62 @@
-# xa — Fastest Coding-Agent CLI
+# xa — Blazing-Fast Coding Agent CLI
 
 > **Execute Anything.** Pure Rust. BYOK. Zero bloat.
 
-`xa` is a blazing-fast, pure-Rust coding agent CLI. It combines the power of LLM-driven automation with the raw performance of Rust — delivering the fastest possible response times, minimal token consumption, and complete flexibility in provider selection.
+`xa` is a lightning-fast, pure-Rust coding agent CLI. It combines LLM-driven automation with the raw performance of Rust — delivering sub-5ms startup, minimal token consumption via intelligent compression, and complete flexibility in provider selection.
 
 <div align="center">
-  <img src="assets/image.png" alt="xa" width="700" />
+  <img src="assets/image1.png" alt="xa" width="700" />
+  <img src="assets/image2.png" alt="xa" width="700" />
 </div>
 
+## ✨ Features
 
-## Why xa?
+### ⚡ Performance First
+- **~5ms launch time** — orders of magnitude faster than Python/Node alternatives
+- **~10MB memory footprint** — lightweight enough to leave running all day
+- **Pure Rust** — zero Python, zero Node.js, zero dependency overhead
 
-- 🚀 **Pure Rust** — Built entirely in Rust for extreme speed and zero dependency overhead. No Python, no Node.js, just native performance.
-- ⚡ **Fastest Speed** — Minimal latency from input to output. The lightweight architecture and efficient streaming ensure you get results faster than any web-based alternative.
-- 🔑 **BYOK (Bring Your Own Key)** — Full support for your own API keys. No vendor lock-in, no forced accounts.
-- 🌐 **Any Custom Endpoint** — Works with *any* OpenAI-compatible API: OpenAI, OpenRouter, vLLM, llama.cpp, Ollama, local gateways, or self-hosted models. Just plug in your endpoint.
-- 💰 **Minimal Token Usage** — Built-in RTK (Real-Time Knowledge) token minimization post-processing module strips unnecessary tokens from responses, reducing your API costs significantly.
-- 🖥️ **Interactive TUI** — Codex-style terminal UI with streaming markdown rendering, thinking indicators, slash commands, session management, and smart input handling.
-- 📋 **Command-Line Power** — One-liner text processing: translate, polish, summarize, rewrite — all from your terminal.
-- 🔍 **Fuzzy Command Matching** — Type partial commands and let `xa` figure out your intent.
-- 📎 **Clipboard Integration** — Results are automatically copied to your system clipboard.
+### 🔑 BYOK — Bring Your Own Key
+- No vendor lock-in, no forced accounts
+- Works with **any** OpenAI-compatible API: OpenAI, OpenRouter, vLLM, llama.cpp, Ollama, or any self-hosted endpoint
+- Multi-provider management — switch between providers seamlessly
+
+### 🧠 Smart Token Compression
+- **RTK (Real-Time Knowledge)** post-processing strips unnecessary tokens from responses, significantly reducing API costs
+- **Per-tool output filters** — `bash`, `git diff`, `python`, `cargo`, `system` commands each get smart, loss-aware processing that retains errors, summaries, and structural metadata while dropping noise
+- **Context cap** — long outputs are intelligently truncated before entering the model context
+
+### 🖥️ Rich Interactive TUI
+- Codex-style terminal interface with streaming markdown rendering
+- **Shimmer animation** over active streaming regions for visual clarity
+- **Thinking indicators** — `</think>`/`<think>` blocks are automatically filtered from the transcript; activity strip shows *Waiting → Thinking → Responding → Running tools* phases
+- Virtual scrolling, fuzzy input, and slash-command overlays
+- Auto-detecting dark/light theme (supports OSC 11 background query)
+
+### 💬 Session & Analytics
+- **`xa resume`** — pick or directly load a saved conversation session
+- **`xa gain`** — review token usage and tool-output statistics across sessions (daily / weekly / monthly breakdowns)
+- Sessions stored as individual JSON files for instant listing
+
+### 🛠️ Built-in Agent Tools
+- **Bash** — run shell commands with capped streaming output
+- **File read/write** — safely read and modify files
+- **Git operations** — diff, status, log, commit, and more
+- Results are automatically fed back into the conversation context
+
+### 📋 CLI One-Liners
+Process text from the command line without entering the TUI:
+```bash
+# Translate, polish, summarize, rewrite — all as one-liners
+echo "hello world" | xa translate en
+echo "my code" | xa polish
+cat main.rs | xa summarize
+```
+
+- **Fuzzy command matching** — type partial names and let `xa` figure out your intent
+- **Clipboard integration** — results are automatically copied to your system clipboard
+- **Secret management** — store and search secrets with natural language queries (`xa add-secret`, `xa search`)
+- **Custom prompt templates** — define and manage your own prompt configs
 
 ## Installation
 
@@ -39,55 +76,88 @@ cargo install --path .
 
 ## Quick Start
 
-### 1. Login / Configure Provider
+### 1. Configure Provider
 
 ```bash
 # Interactive login wizard (supports any OpenAI-compatible endpoint)
 xa login
-
+# or
+xa set openai
 ```
 
-During setup, you'll be prompted for:
-- **Endpoint URL** — e.g. `https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, or any custom endpoint
+You'll be prompted for:
+- **Endpoint URL** — e.g. `https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, or `http://localhost:11434/v1`
 - **API Key** — your own key (BYOK)
 - **Model** — choose from available models or specify a custom one
 
 ### 2. Chat (Interactive TUI)
 
 ```bash
-# Launch the codex-like interactive coding agent
+# Launch the coding agent (default command — just type `xa`)
 xa
 
-# Force light or dark palette (default is auto-detect)
+# Or explicitly
+xa chat
+
+# Force light or dark palette
 xa --theme light
 xa --theme dark
 ```
 
-**Theme** (TUI only): CLI `--theme` overrides env `XA_THEME`, which overrides `theme` in `~/.config/xa/config.toml` (`auto` | `dark` | `light`). Auto mode uses `COLORFGBG` and an OSC 11 background query; if detection fails it falls back to dark.
+**Inside the TUI**, use slash commands:
 
-Inside the TUI:
-| Shortcut | Action |
-|----------|--------|
-| `Enter` | Send message |
-| `Shift+Enter` | Newline |
-| `Ctrl+C` | Stop streaming |
-| `/login [name]` | Add/update a provider |
-| `/models [name]` | Switch provider or model |
+| Command | Action |
+|---------|--------|
+| `/login [name]` | Add or update a provider |
+| `/models [name]` | Switch provider or set model |
 | `/clear` | Clear conversation |
-| `/save [title]` | Save session |
+| `/save [title]` | Save current session |
 | `/sessions` | List saved sessions |
-| `/help` | Show all commands |
+| `/tools` | List available tools |
+| `/new` | Start a new session |
+| `/help` | Show help |
+| `/exit` | Quit |
 
-
-### 3. Session Management
+### 3. Resume a Session
 
 ```bash
-# Choose a saved session
+# Open the interactive session picker
 xa resume
 
-# Resume a session directly
-xa resume <id>
+# Jump directly to a session by ID
+xa resume <session-id>
 ```
+
+### 4. Review Usage Stats
+
+```bash
+# All-time totals
+xa gain
+
+# Breakdown by day / week / month
+xa gain --daily
+xa gain --weekly
+xa gain --monthly
+xa gain --all
+```
+
+### 5. One-Liner Mode
+
+```bash
+# Direct text processing without TUI
+echo "fix this bug" | xa polish
+cat error.log | xa summarize
+echo "translate to Japanese" | xa translate ja
+```
+
+## Configuration
+
+| File | Purpose |
+|------|---------|
+| `~/.config/xa/config.toml` | Default API settings (endpoint, key, model, theme) |
+| `~/.config/xa/providers.toml` | Multi-provider management |
+| `~/.config/xa/prompts.toml` | Custom prompt templates |
+| `~/.config/xa/sessions/` | Saved conversation sessions |
 
 ## Architecture
 
@@ -95,38 +165,32 @@ xa resume <id>
 ┌──────────────────────────────────────────────┐
 │                 xa CLI                        │
 │                                              │
-│  ┌───��──────┐  ┌──────────┐  ┌────────────┐ │
-│  │  TUI     │  │  LLM     │  │  Token     │ │
-│  │(ratatui) │→ │(stream)  │→ │(RTK filter)│ │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐ │
+│  │  TUI     │→ │  LLM     │→ │  Token     │ │
+│  │(ratatui) │  │(stream)  │  │(RTK filter)│ │
 │  └──────────┘  └──────────┘  └────────────┘ │
 │       ↓              ↓              ↓        │
 │  HistoryCells   Any Provider   Minimal Tokens│
 └──────────────────────────────────────────────┘
 ```
 
-- **TUI Layer**: Built on `ratatui` + `crossterm` with an Elm-style event loop. Virtual scrolling, markdown rendering, thinking indicators, and slash-command overlays.
-- **LLM Layer**: Abstraction over any OpenAI-compatible chat completions API. Streaming and non-streaming modes.
-- **Token Module**: Built-in RTK (Real-Time Knowledge) token minimization post-processing — strips verbose output, reduces token waste.
-
-## Configuration
-
-| File | Purpose |
-|------|---------|
-| `~/.config/xa/config.toml` | Default API settings |
-| `~/.config/xa/providers.toml` | Multi-provider management |
-| `~/.config/xa/prompts.toml` | Custom prompt templates |
-| `~/.config/xa/sessions/` | Saved conversation sessions |
+- **TUI Layer** — Built on `ratatui` + `crossterm` with virtual scrolling, markdown rendering, shimmer animations, and thinking-phase tracking
+- **Agent Layer** — Tool execution (bash, file, git) with streaming output capture and per-tool filtering
+- **LLM Layer** — Abstraction over any OpenAI-compatible chat completions API. Streaming and non-streaming modes
+- **Token Module** — RTK token minimization with per-tool filters (git, python, cargo, bash, system) and universal context capping
 
 ## Supported Providers
 
 `xa` works with **any** OpenAI-compatible endpoint:
 
-- **OpenAI** — `https://api.openai.com/v1`
-- **OpenRouter** — `https://openrouter.ai/api/v1`
-- **Ollama** — `http://localhost:11434/v1`
-- **vLLM** — custom deployment
-- **llama.cpp** — server mode
-- **Any custom endpoint** — just configure it
+| Provider | Endpoint |
+|----------|----------|
+| **OpenAI** | `https://api.openai.com/v1` |
+| **OpenRouter** | `https://openrouter.ai/api/v1` |
+| **Ollama** | `http://localhost:11434/v1` |
+| **vLLM** | custom deployment |
+| **llama.cpp** | server mode |
+| **Any custom endpoint** | just configure it |
 
 No hardcoded providers. No restrictions. Your model, your rules.
 

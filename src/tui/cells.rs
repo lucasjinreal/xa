@@ -215,7 +215,7 @@ fn line_is_blank(l: &Line<'_>) -> bool {
 
 /// Keep at most one blank line between content blocks; drop leading/trailing.
 /// Code-block rows (marked with the theme code-block background) are never
-/// treated as collapsible blanks — they form a solid full-width bar including pads.
+/// treated as collapsible blanks — they form a solid code background bar.
 fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut prev_blank = true; // suppress leading blanks
@@ -298,14 +298,20 @@ fn merge_orphan_punct_paragraphs(blocks: &mut Vec<MarkdownBlock>) {
     }
 }
 
-/// Horizontal indent for fenced code bodies (2-space "tab").
-const CODE_BLOCK_INDENT: &str = "  ";
+/// Fenced code background geometry: a two-column left margin, a four-column
+/// right margin, and no inner left padding.
+const CODE_BLOCK_LEFT_MARGIN: u16 = 2;
+const CODE_BLOCK_RIGHT_MARGIN: u16 = 4;
 
 /// Custom markdown hook for fenced code + content-sized tables.
 ///
-/// Layout for code: one blank line above, one blank line below, each content
-/// line prefixed with [`CODE_BLOCK_INDENT`]. Spans carry the theme code-block
-/// background so the AI cell can paint a full-width subtle bar behind the block.
+/// Code layout (Grok/Codex minimal):
+/// - vertical padding = 0 (no empty bg rows inside the block)
+/// - background starts after a 2-column left margin
+/// - left padding = 0; background ends before a 4-column right margin
+/// - no border / title / footer
+/// - surrounding top/bottom margin of 1 blank line is applied when the AI
+///   cell flushes the fence into the transcript
 ///
 /// Tables size to their content instead of stretching to the terminal width;
 /// columns only shrink (and wrap) when the natural width exceeds `max_width`.
@@ -641,16 +647,10 @@ fn is_code_line(line: &Line<'_>) -> bool {
         .any(|s| s.style.bg == Some(theme::t().code_bg))
 }
 
-/// Full-width code body row: left think-indent + code spans + trailing spaces,
-/// all on the theme code-block background, painted from column 0.
-fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
+/// Code body row: code spans + trailing background fill, between two-column
+/// outer margins. No extra vertical padding rows.
+fn code_body_row(line: Line<'static>, width: u16) -> Row {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if THINK_INDENT > 0 {
-        spans.push(Span::styled(
-            " ".repeat(THINK_INDENT as usize),
-            code_bg_style(),
-        ));
-    }
     for mut span in line.spans {
         // Keep indent/spaces that are part of the source line; only drop fully
         // empty markers (no content at all).
@@ -660,49 +660,45 @@ fn full_width_code_row(line: Line<'static>, width: u16) -> Row {
         span.style = paint_code_span(span.style);
         spans.push(span);
     }
+    if spans.is_empty() {
+        spans.push(Span::styled(" ", code_bg_style()));
+    }
     let used: usize = spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let w = width as usize;
+    let w = width
+        .saturating_sub(CODE_BLOCK_LEFT_MARGIN + CODE_BLOCK_RIGHT_MARGIN)
+        .max(1) as usize;
     if used < w {
         spans.push(Span::styled(" ".repeat(w - used), code_bg_style()));
     }
-    Row::new(0, width, Line::from(spans))
+    Row::new(CODE_BLOCK_LEFT_MARGIN, w as u16, Line::from(spans))
 }
 
-/// Empty full-width CODE_BG row used as the 1-line pad above/below code body.
-fn code_pad_row(width: u16) -> Row {
-    Row::new(
-        0,
-        width,
-        Line::from(Span::styled(
-            " ".repeat(width.max(1) as usize),
-            code_bg_style(),
-        )),
-    )
-}
-
-/// Emit a fenced code block with exactly one blank (bg) line above the first
-/// content line and one below the last — edge-to-edge CODE_BG bar.
+/// Emit a fenced code block body (no internal vertical padding). Surrounding
+/// 1-line margins are plain blanks (not code-bg), injected only when needed.
 fn push_code_block_rows(code_lines: Vec<Line<'static>>, width: u16, rows: &mut Vec<Row>) {
-    // Real body: non-whitespace text. Leading/trailing empty fence lines and
-    // markdown-side pad markers are stripped so we always own the pads here.
     let body: Vec<Line<'static>> = code_lines
         .into_iter()
         .filter(|l| !line_is_blank(l))
         .collect();
-
-    rows.push(code_pad_row(width)); // top pad above first content
     if body.is_empty() {
-        // Empty fence still shows a minimal bar (top pad + bottom pad).
-        rows.push(code_pad_row(width));
         return;
     }
-    for line in body {
-        rows.push(full_width_code_row(line, width));
+
+    // Top margin = 1 blank line between previous content and the code bar.
+    if rows
+        .last()
+        .is_some_and(|r| !line_is_blank(&r.line))
+    {
+        rows.push(Row::blank(width));
     }
-    rows.push(code_pad_row(width)); // bottom pad below last content
+    for line in body {
+        rows.push(code_body_row(line, width));
+    }
+    // Bottom margin = 1 blank line after the code bar.
+    rows.push(Row::blank(width));
 }
 
 fn styled_heading(text: &str, color: Color, mods: Modifier) -> Line<'static> {
@@ -712,13 +708,28 @@ fn styled_heading(text: &str, color: Color, mods: Modifier) -> Line<'static> {
     ))
 }
 
+/// Inline `` `code` `` is foreground-only and bold. Fenced code keeps its
+/// full-row background; links may share the same color but stay underlined.
+fn style_inline_code_spans(lines: &mut [Line<'static>]) {
+    let cyan = theme::t().md_inline_code;
+    for line in lines.iter_mut() {
+        if is_code_line(line) {
+            continue;
+        }
+        for span in &mut line.spans {
+            if span.style.fg == Some(cyan)
+                && !span.style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+                span.style.bg = None;
+            }
+        }
+    }
+}
+
 impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
     fn heading1(&self, text: &str) -> Option<Line<'static>> {
-        Some(styled_heading(
-            text,
-            theme::t().md_heading1,
-            Modifier::BOLD | Modifier::UNDERLINED,
-        ))
+        Some(styled_heading(text, theme::t().md_heading1, Modifier::BOLD))
     }
 
     fn heading2(&self, text: &str) -> Option<Line<'static>> {
@@ -733,33 +744,46 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
         Some(render_content_sized_table(headers, rows, self.max_width))
     }
 
+    /// Standalone `` `code` `` blocks (rare) — cyan + bold, no backticks.
+    fn inline_code(&self, code: &str) -> Option<Line<'static>> {
+        let style = Style::default()
+            .fg(theme::t().md_inline_code)
+            .add_modifier(Modifier::BOLD);
+        Some(Line::from(Span::styled(code.replace('\t', "    "), style)))
+    }
+
+    /// No language title / chrome on fenced blocks.
+    fn code_block_header(&self, _lang: &str) -> Option<Line<'static>> {
+        Some(Line::default())
+    }
+
+    fn code_block_footer(&self, _lang: &str, _content_line_count: usize) -> Option<Line<'static>> {
+        Some(Line::default())
+    }
+
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
         let content = trim_code_fence_body(content);
         let segments = TS_HIGHLIGHTER.highlight(lang, content);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        // 1 line top pad (marked as code so the bar includes breathing room)
-        lines.push(apply_code_bg(Line::default()));
+        // Body only — vertical padding = 0; margin applied at flush time.
 
         if segments.is_empty() {
             let code_style = code_bg_style();
             if content.is_empty() {
-                lines.push(apply_code_bg(Line::from(Span::styled(
-                    CODE_BLOCK_INDENT.to_string(),
-                    code_style,
-                ))));
+                lines.push(apply_code_bg(Line::from(Span::styled(" ", code_style))));
             } else {
                 for line in content.split('\n') {
-                    lines.push(apply_code_bg(Line::from(vec![
-                        Span::styled(CODE_BLOCK_INDENT.to_string(), code_style),
-                        Span::styled(line.to_string(), code_style),
-                    ])));
+                    lines.push(apply_code_bg(Line::from(Span::styled(
+                        line.to_string(),
+                        code_style,
+                    ))));
                 }
             }
         } else {
             let hl = segments_to_lines(
                 content,
                 &segments,
-                CODE_BLOCK_INDENT,
+                "",
                 code_bg_style(),
                 self.max_width,
             );
@@ -768,8 +792,6 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
             }
         }
 
-        // 1 line bottom pad
-        lines.push(apply_code_bg(Line::default()));
         Some(lines)
     }
 }
@@ -792,8 +814,9 @@ fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     join_paragraph_soft_breaks(&mut blocks);
     merge_orphan_punct_paragraphs(&mut blocks);
     let theme = theme::markdown_theme();
-    let lines = renderer.render(&blocks, &theme);
-    compact_md_lines(lines)
+    let mut lines = compact_md_lines(renderer.render(&blocks, &theme));
+    style_inline_code_spans(&mut lines);
+    lines
 }
 
 /// One self-contained transcript entry.
@@ -1584,8 +1607,7 @@ impl ThinkingCell {
                     }
                     let md_lines = render_markdown(text, text_w);
                     // Group consecutive code lines so each fence becomes one
-                    // full-width bar with a guaranteed 1-line top/bottom pad
-                    // around the body content.
+                    // code background bar with a 1-line plain margin above/below.
                     let mut code_buf: Vec<Line<'static>> = Vec::new();
                     let flush_code = |buf: &mut Vec<Line<'static>>, rows: &mut Vec<Row>| {
                         if !buf.is_empty() {
@@ -1598,6 +1620,12 @@ impl ThinkingCell {
                             code_buf.push(line);
                         } else {
                             flush_code(&mut code_buf, &mut rows);
+                            // Collapse a blank that would double the post-code margin.
+                            if line_is_blank(&line)
+                                && rows.last().is_some_and(|r| line_is_blank(&r.line))
+                            {
+                                continue;
+                            }
                             rows.push(Row::new(indent, text_row_w, line));
                         }
                     }
@@ -1723,35 +1751,33 @@ mod markdown_layout_tests {
 
     #[test]
     fn fenced_code_is_plain_and_indented() {
-        // Standalone fence keeps top/bottom code-pad rows (subtle bg bar) plus
-        // the 2-space-indented body line.
+        // Body only (vertical padding = 0), no inner left padding.
         let lines = render_markdown(
             "```bash\npython -m magnus.training.train_sarm --resume /tmp/checkpoint.pt\n```",
             100,
         );
-        assert_eq!(lines.len(), 3, "top pad + body + bottom pad");
+        assert_eq!(lines.len(), 1, "body only, no vertical pads");
         assert!(is_code_line(&lines[0]));
-        assert!(is_code_line(&lines[1]));
-        assert!(is_code_line(&lines[2]));
         assert_eq!(
-            line_text(&lines[1]).trim_end(),
-            "  python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
+            line_text(&lines[0]).trim_end(),
+            "python -m magnus.training.train_sarm --resume /tmp/checkpoint.pt"
         );
     }
 
     #[test]
-    fn fenced_code_has_pad_between_paragraphs() {
+    fn fenced_code_has_margin_between_paragraphs() {
         let lines = render_markdown("Before.\n\n```text\ncode line\n```\n\nAfter.", 100);
         let texts: Vec<_> = lines.iter().map(|l| line_text(l).trim_end().to_string()).collect();
-        // Paragraph blank + code top/bottom pads (code pads are " " with CODE_BG).
         assert!(texts.iter().any(|t| t == "Before."));
-        assert!(texts.iter().any(|t| t == "  code line"));
+        assert!(texts.iter().any(|t| t == "code line"));
         assert!(texts.iter().any(|t| t == "After."));
-        let code_idx = texts.iter().position(|t| t == "  code line").unwrap();
+        let code_idx = texts.iter().position(|t| t == "code line").unwrap();
         assert!(is_code_line(&lines[code_idx]));
-        // Immediate neighbors of the body are code pad rows with bg.
-        assert!(is_code_line(&lines[code_idx - 1]));
-        assert!(is_code_line(&lines[code_idx + 1]));
+        // Neighbors are plain blanks (margin), not code-bg pads.
+        assert!(line_is_blank(&lines[code_idx - 1]));
+        assert!(!is_code_line(&lines[code_idx - 1]));
+        assert!(line_is_blank(&lines[code_idx + 1]));
+        assert!(!is_code_line(&lines[code_idx + 1]));
     }
 
     #[test]
@@ -1760,17 +1786,17 @@ mod markdown_layout_tests {
             "```text\nUsage: `python -m magnus.training.train_sarm`\n\n\n```",
             100,
         );
-        // top pad + body + bottom pad (inner trailing fence blanks trimmed)
-        assert_eq!(lines.len(), 3);
+        // Body only (inner trailing fence blanks trimmed by render path)
+        assert_eq!(lines.len(), 1);
         assert_eq!(
-            line_text(&lines[1]).trim_end(),
-            "  Usage: `python -m magnus.training.train_sarm`"
+            line_text(&lines[0]).trim_end(),
+            "Usage: `python -m magnus.training.train_sarm`"
         );
         assert!(lines.iter().all(is_code_line));
     }
 
     #[test]
-    fn thinking_cell_code_bar_is_full_width() {
+    fn thinking_cell_code_bar_has_two_column_outer_margins() {
         let mut tc = ThinkingCell::new();
         tc.add_text("```text\nhello\n```");
         tc.streaming = false;
@@ -1780,35 +1806,49 @@ mod markdown_layout_tests {
             .iter()
             .filter(|r| is_code_line(&r.line))
             .collect();
-        // top pad + body + bottom pad
-        assert_eq!(code_rows.len(), 3, "expected top pad, body, bottom pad");
-        for r in &code_rows {
-            assert_eq!(r.x, 0, "code bar starts at left edge");
-            assert_eq!(r.w, width, "code bar spans full width");
-            assert_eq!(
-                line_display_width_for_test(&r.line),
-                width as usize,
-                "line is padded with CODE_BG spaces to full width"
-            );
-        }
-        // Pads are blank; middle row holds the body.
-        assert!(line_is_blank(&code_rows[0].line));
-        assert!(line_text(&code_rows[1].line).contains("hello"));
-        assert!(line_is_blank(&code_rows[2].line));
+        // Body only — no code-bg vertical pads.
+        assert_eq!(code_rows.len(), 1, "expected body only");
+        let r = code_rows[0];
+        assert_eq!(r.x, CODE_BLOCK_LEFT_MARGIN, "code bar has a 2-column left margin");
+        assert_eq!(
+            r.w,
+            width - CODE_BLOCK_LEFT_MARGIN - CODE_BLOCK_RIGHT_MARGIN,
+            "code bar leaves a 4-column right margin"
+        );
+        assert_eq!(
+            line_display_width_for_test(&r.line),
+            r.w as usize,
+            "line is padded with CODE_BG spaces to the row width"
+        );
+        assert!(line_text(&r.line).starts_with("hello"));
+        assert!(line_text(&r.line).ends_with("  "));
     }
 
     #[test]
-    fn thinking_cell_code_pad_around_multiline_body() {
+    fn thinking_cell_code_margin_around_multiline_body() {
         let mut tc = ThinkingCell::new();
-        tc.add_text("```text\nline1\nline2\n```");
+        tc.add_text("Before.\n\n```text\nline1\nline2\n```\n\nAfter.");
         tc.streaming = false;
         let rows = tc.build(40, None);
         let code_rows: Vec<_> = rows.iter().filter(|r| is_code_line(&r.line)).collect();
-        assert_eq!(code_rows.len(), 4); // pad + line1 + line2 + pad
-        assert!(line_is_blank(&code_rows[0].line));
-        assert!(line_text(&code_rows[1].line).contains("line1"));
-        assert!(line_text(&code_rows[2].line).contains("line2"));
-        assert!(line_is_blank(&code_rows[3].line));
+        assert_eq!(code_rows.len(), 2); // line1 + line2, no pads
+        assert!(line_text(&code_rows[0].line).contains("line1"));
+        assert!(line_text(&code_rows[1].line).contains("line2"));
+
+        // Find indices of code rows in full layout; neighbors should be blank margins.
+        let idxs: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_code_line(&r.line))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(idxs.len(), 2);
+        let first = idxs[0];
+        let last = idxs[1];
+        assert!(line_is_blank(&rows[first - 1].line));
+        assert!(!is_code_line(&rows[first - 1].line));
+        assert!(line_is_blank(&rows[last + 1].line));
+        assert!(!is_code_line(&rows[last + 1].line));
     }
 
     fn line_display_width_for_test(line: &Line<'_>) -> usize {
