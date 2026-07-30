@@ -5,3 +5,6 @@
 .agents/
 .claude/
 .codex/
+__pycache__/
+build/
+*.egg-info/

@@ -60,6 +60,50 @@ cat main.rs | xa summarize
 
 ## Installation
 
+### PyPI (recommended)
+
+Prebuilt native binaries are published to PyPI for Linux (x86_64, ARM64),
+macOS (Intel, Apple Silicon), and Windows (x86_64, ARM64). The package contains
+the Rust executable itself; it does not install a Python runtime wrapper.
+
+```bash
+# Recommended for a globally available CLI without modifying system Python
+pipx install xacli
+
+# Or install into the current Python environment / virtual environment
+python -m pip install xacli
+```
+
+After installation, run:
+
+```bash
+xa --help
+```
+
+`pip` installs the executable into that Python environment's scripts directory:
+typically `<venv>/bin`, `~/.local/bin`, or `Scripts\\` on Windows. Ensure that
+directory is on `PATH`. A hard-coded `/usr/local/xa` install location is not
+used so that virtual environments, permissions, and `pip uninstall xacli` all
+work correctly.
+
+### Maintainer release
+
+Pushing a `v*` tag starts the multi-platform wheel build in GitHub Actions.
+After it succeeds, publish all its artifacts from a machine that has your PyPI
+credentials configured for Twine:
+
+```bash
+scripts/publish-pypi-wheels.sh
+# Or publish one specific Actions run:
+scripts/publish-pypi-wheels.sh <run-id>
+```
+
+The script uses `gh` to download the six `wheel-*` artifacts and uses Twine's
+normal local authentication (`~/.pypirc` or keyring); it never reads or prints
+the token itself. Set `TWINE_REPOSITORY=testpypi` to target TestPyPI.
+
+### Build from source
+
 ```bash
 # Clone the repository
 git clone https://github.com/jinfagang/xa.git
