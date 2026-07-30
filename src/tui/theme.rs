@@ -62,6 +62,8 @@ pub struct Theme {
     pub accent: Color,
     pub accent_dim: Color,
     pub accent_bright: Color,
+    /// Six-row cyan-to-purple gradient used by the XA ASCII logo.
+    pub logo_gradient: [Color; 6],
 
     pub text: Color,
     pub text_dim: Color,
@@ -129,14 +131,17 @@ impl Theme {
         }
     }
 
-    /// Dark theme: Grok/Codex-minimal markdown + warm orange UI chrome.
+    /// Dark theme: Grok/Codex-minimal markdown + cyan UI chrome.
     ///
-    /// Core assistant colors (~8): body `#C8C8C8`, blue `#7AA2F7`, purple
+    /// Core assistant colors (~8): body uses the terminal's bright white,
+    /// blue `#7AA2F7`, purple
     /// `#BB9AF7`, mid-gray `#707070`, cyan `#3A95AB`, gold `#E0AF68`,
     /// code bg `#1C1C1C`, plus low-sat green/red for diffs.
     pub fn dark() -> Self {
         // Core markdown / syntax tokens.
-        let body = Color::Rgb(0xC8, 0xC8, 0xC8); // #C8C8C8
+        // ANSI white follows the terminal's configured color scheme rather
+        // than imposing another slightly-grey RGB foreground.
+        let body = Color::White;
         let blue = Color::Rgb(0x7A, 0xA2, 0xF7); // #7AA2F7
         let purple = Color::Rgb(0xBB, 0x9A, 0xF7); // #BB9AF7
         let mid = Color::Rgb(0x70, 0x70, 0x70); // #707070
@@ -144,13 +149,21 @@ impl Theme {
         let gold = Color::Rgb(0xE0, 0xAF, 0x68); // #E0AF68
         let code_bg = Color::Rgb(0x1C, 0x1C, 0x1C); // #1C1C1C
         let code_plain = Color::Rgb(0xA8, 0xA8, 0xA8); // #A8A8A8
-        let accent = Color::Rgb(217, 119, 87); // UI brand (not markdown)
+        let accent = Color::Rgb(34, 211, 238); // #22D3EE cyan UI brand
 
         Self {
             mode: ColorMode::Dark,
             accent,
-            accent_dim: Color::Rgb(180, 100, 70),
-            accent_bright: Color::Rgb(240, 150, 110),
+            accent_dim: Color::Rgb(14, 116, 144),
+            accent_bright: Color::Rgb(103, 232, 249),
+            logo_gradient: [
+                Color::Rgb(34, 211, 238),
+                Color::Rgb(56, 189, 248),
+                Color::Rgb(96, 165, 250),
+                Color::Rgb(129, 140, 248),
+                Color::Rgb(167, 139, 250),
+                Color::Rgb(192, 132, 252),
+            ],
             text: body,
             text_dim: mid,
             text_hint: mid,
@@ -163,7 +176,7 @@ impl Theme {
             footer: mid,
             user_lead: Color::Rgb(150, 150, 150),
             input_lead: Color::Rgb(240, 240, 240),
-            select_bg: Color::Rgb(70, 48, 28),
+            select_bg: Color::Rgb(20, 62, 76),
             border: Color::Rgb(72, 72, 72),
             field_bg: Color::Rgb(28, 28, 28),
             shimmer_peak: Color::Rgb(255, 255, 255),
@@ -207,20 +220,30 @@ impl Theme {
 
     /// Light theme: same role mapping, darker inks on pale surfaces.
     pub fn light() -> Self {
-        let body = Color::Rgb(0x2A, 0x2A, 0x2A);
+        // Counterpart to dark mode's ANSI white: retain full contrast on a
+        // light terminal while still honoring its ANSI palette.
+        let body = Color::Black;
         let blue = Color::Rgb(0x2E, 0x5C, 0xC7);
         let purple = Color::Rgb(0x6B, 0x4F, 0xC7);
         let mid = Color::Rgb(0x70, 0x70, 0x70);
         let cyan = Color::Rgb(0x1F, 0x7A, 0x8C);
         let gold = Color::Rgb(0xB0, 0x7D, 0x28);
         let code_bg = Color::Rgb(0xEE, 0xEE, 0xEE);
-        let accent = Color::Rgb(196, 95, 58);
+        let accent = Color::Rgb(8, 145, 178); // #0891B2 cyan UI brand
 
         Self {
             mode: ColorMode::Light,
             accent,
-            accent_dim: Color::Rgb(165, 85, 55),
-            accent_bright: Color::Rgb(220, 120, 80),
+            accent_dim: Color::Rgb(14, 116, 144),
+            accent_bright: Color::Rgb(6, 182, 212),
+            logo_gradient: [
+                Color::Rgb(8, 145, 178),
+                Color::Rgb(2, 132, 199),
+                Color::Rgb(37, 99, 235),
+                Color::Rgb(79, 70, 229),
+                Color::Rgb(124, 58, 237),
+                Color::Rgb(147, 51, 234),
+            ],
             text: body,
             text_dim: mid,
             text_hint: mid,
@@ -233,7 +256,7 @@ impl Theme {
             footer: mid,
             user_lead: Color::Rgb(110, 110, 110),
             input_lead: Color::Rgb(40, 40, 40),
-            select_bg: Color::Rgb(255, 228, 208),
+            select_bg: Color::Rgb(207, 250, 254),
             border: Color::Rgb(190, 190, 190),
             field_bg: Color::Rgb(255, 255, 255),
             shimmer_peak: accent,
@@ -291,6 +314,11 @@ impl Theme {
             label: self.syn_label,
             error: self.syn_error,
         }
+    }
+
+    /// Return a logo color for a row, clamping rows beyond the logo height.
+    pub fn logo_color(&self, row: usize) -> Color {
+        self.logo_gradient[row.min(self.logo_gradient.len() - 1)]
     }
 
     /// Full `ratatui-markdown` theme for assistant markdown rendering.
@@ -372,23 +400,15 @@ mod tests {
     }
 
     #[test]
-    fn light_text_darker_than_bg() {
+    fn light_mode_uses_terminal_black_for_body_text() {
         let th = Theme::light();
-        let (tr, tg, tb) = Theme::rgb(th.text).unwrap();
-        let (br, bg, bb) = Theme::rgb(th.bg).unwrap();
-        let text_l = (tr as u32 + tg as u32 + tb as u32) / 3;
-        let bg_l = (br as u32 + bg as u32 + bb as u32) / 3;
-        assert!(text_l < bg_l, "light theme body text should be darker than bg");
+        assert_eq!(th.text, Color::Black);
     }
 
     #[test]
-    fn dark_text_lighter_than_bg() {
+    fn dark_mode_uses_terminal_white_for_body_text() {
         let th = Theme::dark();
-        let (tr, tg, tb) = Theme::rgb(th.text).unwrap();
-        let (br, bg, bb) = Theme::rgb(th.bg).unwrap();
-        let text_l = (tr as u32 + tg as u32 + tb as u32) / 3;
-        let bg_l = (br as u32 + bg as u32 + bb as u32) / 3;
-        assert!(text_l > bg_l, "dark theme body text should be lighter than bg");
+        assert_eq!(th.text, Color::White);
     }
 
     #[test]

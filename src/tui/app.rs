@@ -66,6 +66,34 @@ enum AppEvent {
     Wizard(Result<Vec<String>, String>),
 }
 
+/// Truncate text by characters, never by UTF-8 bytes. Session titles often
+/// contain CJK text, where a byte offset can point into the middle of a glyph.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn title_truncation_preserves_utf8_boundaries() {
+        let title = format!("{}尾", "构".repeat(44));
+        assert_eq!(truncate_chars(&title, 44), format!("{}...", "构".repeat(44)));
+    }
+
+    #[test]
+    fn title_truncation_leaves_short_unicode_text_intact() {
+        assert_eq!(truncate_chars("中文标题", 44), "中文标题");
+    }
+}
+
 /// Information printed after leaving the alternate-screen TUI. Keeping this
 /// separate from the header makes the terminal handoff useful without turning
 /// the live UI into a session-management dashboard.
@@ -182,7 +210,10 @@ impl App {
         self.cells.push(cell);
         self.dirty = true;
         if self.auto_scroll {
-            self.scroll = u16::MAX; // sentinel: follow bottom
+            // `draw` derives the live bottom from the current layout. Keep a
+            // real offset here so an immediate scroll-up (before that draw)
+            // does not subtract from a sentinel and get clamped back down.
+            self.scroll = self.scroll_max;
         }
     }
 
@@ -313,11 +344,7 @@ impl App {
             if user_msgs.len() >= 2 {
                 let first = user_msgs[0];
                 let title = first.lines().next().unwrap_or("").trim();
-                let title = if title.len() > 44 {
-                    format!("{}...", &title[..44])
-                } else {
-                    title.to_string()
-                };
+                let title = truncate_chars(title, 44);
                 if !title.is_empty() {
                     self.session.title = title;
                 }
@@ -338,7 +365,6 @@ impl App {
         self.push_cell(Box::new(UserCell::new(text.clone())));
         self.input = TextArea::default();
         self.paste_blocks.clear();
-        self.scroll = u16::MAX;
         self.auto_scroll = true;
 
         {
@@ -369,7 +395,7 @@ impl App {
         tokio::spawn(async move {
             let (stx, mut srx) = mpsc::channel::<StreamEvent>(64);
             let fwd = event_tx.clone();
-            tokio::spawn(async move {
+            let forward = tokio::spawn(async move {
                 while let Some(se) = srx.recv().await {
                     if fwd.send(AppEvent::Stream(se)).await.is_err() {
                         break;
@@ -378,6 +404,10 @@ impl App {
             });
             let tools = crate::tools::all_tools();
             agent::run_conversation(&provider, agent_hist, stx, &tools, cancel).await;
+            // `run_conversation` owns the last sender, so the receiver closes
+            // once it returns. Waiting here preserves event ordering: a fast
+            // completion can no longer send Done ahead of its text deltas.
+            let _ = forward.await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::Done)).await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::InternalAssistIdx(assistant_idx))).await;
         });
@@ -998,10 +1028,16 @@ impl App {
     /// on screen, an upward gesture cannot move the viewport and should not
     /// accidentally disable follow mode.
     fn scroll_up(&mut self, rows: u16) {
-        if self.scroll == 0 {
+        if !self.auto_scroll && self.scroll == 0 {
             return;
         }
-        self.auto_scroll = false;
+        // Convert follow-bottom into the last measured concrete offset before
+        // moving. The former u16::MAX sentinel made the first upward gesture
+        // a no-op after the next render clamped it back to the bottom.
+        if self.auto_scroll {
+            self.auto_scroll = false;
+            self.scroll = self.scroll_max;
+        }
         self.scroll = self.scroll.saturating_sub(rows);
         self.dirty = true;
     }
@@ -1015,7 +1051,7 @@ impl App {
         let next = self.scroll.saturating_add(rows);
         if next >= self.scroll_max {
             self.auto_scroll = true;
-            self.scroll = u16::MAX; // sentinel: reconcile to the live bottom
+            self.scroll = self.scroll_max;
         } else {
             self.scroll = next;
         }
@@ -1167,9 +1203,16 @@ impl App {
             "  ╚═╝  ╚═╝╚═╝  ╚═╝",
         ];
 
-        let logo_spans: Vec<Line> = logo_lines.iter().map(|line| {
-            Line::from(Span::styled(*line, Style::default().fg(theme::t().accent)))
-        }).collect();
+        let logo_spans: Vec<Line> = logo_lines
+            .iter()
+            .enumerate()
+            .map(|(row, line)| {
+                Line::from(Span::styled(
+                    *line,
+                    Style::default().fg(theme::t().logo_color(row)),
+                ))
+            })
+            .collect();
 
         let logo = Paragraph::new(logo_spans);
         f.render_widget(logo, chunks[0]);
@@ -1578,6 +1621,10 @@ impl App {
             .style(Style::default().bg(input_bg));
         let mut wrapped = wrapped;
         wrapped.set_block(input_block);
+        // Match typed text to user messages and ordinary Markdown body text.
+        // `Theme::text` is ANSI white in dark mode / ANSI black in light mode,
+        // so it follows the terminal's selected color scheme.
+        wrapped.set_style(Style::default().fg(theme::t().text).bg(input_bg));
         // Visible block cursor.
         wrapped.set_cursor_style(
             Style::default()
