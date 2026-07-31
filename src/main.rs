@@ -22,7 +22,9 @@ use store::{add_secret_with_tag, search_secret};
 use session::Session;
 
 #[derive(Parser)]
-#[command(name = "xa")]
+// Clap reads this from Cargo's package metadata, so Cargo.toml remains the
+// single source of truth for the binary and CLI version.
+#[command(name = "xa", version)]
 #[command(about = "xa - a lightweight coding-agent CLI (like codex / claude-code)")]
 #[command(after_help = "Launch the agent with `xa` or `xa chat`. Configure a provider with `xa login`.\nInside the TUI use:\n  /login [name]  - set a provider (custom endpoint + key + model)\n  /models [name] - switch provider or set the model\n  /save [title]  - save the conversation as a session\n  /sessions      - list saved sessions\nResume a session: xa resume [id]\nReview saved tool-output gains: xa gain [--daily|--weekly|--monthly|--all]")]
 struct Cli {
@@ -139,6 +141,16 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Clap reserves `-V` for its built-in version flag.  XA also supports the
+    // conventional lowercase spelling requested by its CLI users.
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == std::ffi::OsStr::new("-v"))
+    {
+        println!("xa {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     // Install TUI palette early (chat / resume / login all share it).
