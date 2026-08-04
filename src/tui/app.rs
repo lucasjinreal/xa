@@ -1,6 +1,7 @@
 //! The interactive TUI application state and event loop logic.
 
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -29,6 +30,7 @@ use crate::tui::cells::{SystemCell, ThinkingCell, UserCell, USER_LEAD_COLS, USER
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::{shimmer_phase, shimmer_spans_to};
 use crate::tui::slash::{fuzzy_subseq, SlashCommand, SLASH_COMMANDS};
+use crate::tui::path::{collect_workspace_paths, fuzzy_paths, PathCandidate};
 use crate::tui::theme;
 use crate::tui::think::{StreamPhase, ThinkFilter};
 use crate::tui::wizard::{Wizard, WizardAction};
@@ -44,12 +46,12 @@ pub const HELP_TEXT: &str = r#"
 - `/exit` — quit
 
 Keys: `Enter` send · `Shift+Enter` newline · `PageUp/PageDown` scroll ·
-type `/` for the command menu · `Ctrl-C` quit.
+type `/` for the command menu · `@` to reference a workspace path · `Ctrl-C` quit.
 "#;
 
 /// Short codex-style tip shown when a fresh session opens.
 pub const WELCOME_TEXT: &str = r#"
-Tip: type `/` for the command menu, or just start chatting.
+Tip: type `/` for commands or `@` for workspace paths, or just start chatting.
      `/login [name]` to add a provider · `/models` to switch · `/help` for all commands.
 "#;
 
@@ -64,6 +66,14 @@ enum AppEvent {
     Stream(StreamEvent),
     /// Result of an async model-list fetch kicked off by the setup wizard.
     Wizard(Result<Vec<String>, String>),
+}
+
+/// The `@path` token surrounding the current composer cursor.
+struct PathToken {
+    row: usize,
+    start: usize,
+    end: usize,
+    query: String,
 }
 
 /// Truncate text by characters, never by UTF-8 bytes. Session titles often
@@ -149,6 +159,11 @@ pub struct App {
     slash_mode: bool,
     slash_query: String,
     slash_selected: usize,
+    /// Workspace candidates cached when `@` opens the path completion menu.
+    workspace_paths: Vec<PathCandidate>,
+    workspace_root: PathBuf,
+    path_completion_open: bool,
+    path_selected: usize,
     queued_inputs: std::collections::VecDeque<String>,
     /// Width (columns) of the input composer area from the last frame, used to
     /// soft-wrap the typed text so it never overflows the box.
@@ -198,6 +213,10 @@ impl App {
             slash_mode: false,
             slash_query: String::new(),
             slash_selected: 0,
+            workspace_paths: Vec::new(),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            path_completion_open: false,
+            path_selected: 0,
             queued_inputs: std::collections::VecDeque::new(),
             input_area_width: 80,
             wizard: None,
@@ -355,6 +374,7 @@ impl App {
     }
 
     fn submit(&mut self, text: String) {
+        self.path_completion_open = false;
         if text.starts_with('/') {
             self.handle_slash(&text);
             self.input = TextArea::default();
@@ -681,6 +701,7 @@ impl App {
                 self.dirty = true;
             }
         } else if !text.is_empty() {
+            let refresh = text.contains('@');
             for c in text.chars() {
                 self.input.input(Input {
                     key: Key::Char(c),
@@ -689,6 +710,7 @@ impl App {
                     shift: false,
                 });
             }
+            self.update_path_completion(refresh);
             self.dirty = true;
         }
     }
@@ -834,12 +856,16 @@ impl App {
             self.last_ctrl_c = Some(now);
             self.input = TextArea::default();
             self.paste_blocks.clear();
+            self.path_completion_open = false;
             self.status = "press Ctrl-C again to exit".into();
             self.dirty = true;
             return Ok(false);
         }
         if self.slash_mode {
             return self.handle_slash_key(key);
+        }
+        if self.path_completion_open {
+            return self.handle_path_key(key);
         }
         match key.code {
             KeyCode::Esc if self.streaming => {
@@ -866,6 +892,7 @@ impl App {
                 && self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) =>
             {
                 self.slash_mode = true;
+                self.path_completion_open = false;
                 self.slash_query.clear();
                 self.slash_selected = 0;
                 self.paste_blocks.clear();
@@ -915,7 +942,9 @@ impl App {
             _ => {
                 self.history_idx = None;
                 if let Some(input) = map_key(key) {
+                    let refresh = matches!(key.code, KeyCode::Char('@'));
                     self.input.input(input);
+                    self.update_path_completion(refresh);
                     self.dirty = true;
                 }
             }
@@ -978,6 +1007,115 @@ impl App {
                 .filter(|c| fuzzy_subseq(&self.slash_query, c.name))
                 .collect()
         }
+    }
+
+    /// Return the `@path` token at the cursor, if the cursor is currently in
+    /// one. The editor reports cursor columns in characters, not bytes.
+    fn path_token(&self) -> Option<PathToken> {
+        let (row, cursor_col) = self.input.cursor();
+        let line = self.input.lines().get(row)?;
+        let chars: Vec<char> = line.chars().collect();
+        let cursor_col = cursor_col.min(chars.len());
+        let mut start = cursor_col;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        if chars.get(start) != Some(&'@') {
+            return None;
+        }
+        let mut end = cursor_col;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        Some(PathToken {
+            row,
+            start,
+            end,
+            query: chars[start + 1..cursor_col].iter().collect(),
+        })
+    }
+
+    fn filtered_paths(&self) -> Vec<PathCandidate> {
+        self.path_token()
+            .map(|token| fuzzy_paths(&self.workspace_paths, &token.query))
+            .unwrap_or_default()
+    }
+
+    fn refresh_path_candidates(&mut self) {
+        self.workspace_paths = collect_workspace_paths(&self.workspace_root);
+    }
+
+    /// Sync completion visibility after text edits. Refreshing only at `@`
+    /// keeps every subsequent fuzzy-sort keystroke instantaneous.
+    fn update_path_completion(&mut self, refresh: bool) {
+        if self.path_token().is_some() {
+            if refresh {
+                self.refresh_path_candidates();
+            }
+            self.path_completion_open = true;
+            self.path_selected = 0;
+        } else {
+            self.path_completion_open = false;
+            self.path_selected = 0;
+        }
+    }
+
+    fn insert_path_completion(&mut self, path: &str) {
+        let Some(token) = self.path_token() else {
+            return;
+        };
+        let mut lines: Vec<String> = self.input.lines().iter().cloned().collect();
+        let chars: Vec<char> = lines[token.row].chars().collect();
+        let mut replacement = String::new();
+        replacement.extend(chars[..token.start].iter());
+        replacement.push('@');
+        replacement.push_str(path);
+        replacement.extend(chars[token.end..].iter());
+        lines[token.row] = replacement;
+        let new_col = token.start + 1 + path.chars().count();
+        self.input = TextArea::new(lines);
+        self.input
+            .move_cursor(CursorMove::Jump(token.row as u16, new_col as u16));
+        self.path_completion_open = false;
+        self.path_selected = 0;
+    }
+
+    fn handle_path_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.path_completion_open = false;
+                self.dirty = true;
+            }
+            KeyCode::Up => {
+                if self.path_selected > 0 {
+                    self.path_selected -= 1;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Down => {
+                let count = self.filtered_paths().len();
+                if count > 0 && self.path_selected + 1 < count {
+                    self.path_selected += 1;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Tab | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Some(candidate) = self.filtered_paths().get(self.path_selected).cloned() {
+                    self.insert_path_completion(&candidate.path);
+                }
+                self.dirty = true;
+            }
+            _ => {
+                self.history_idx = None;
+                if let Some(input) = map_key(key) {
+                    let refresh = matches!(key.code, KeyCode::Char('@'));
+                    self.input.input(input);
+                    self.update_path_completion(refresh);
+                    self.dirty = true;
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Recall a previous submitted input (codex-like Up/Down on a single line).
@@ -1411,6 +1549,18 @@ impl App {
         // Thinking / Responding. Footer under the input keeps model meta.
         let show_activity = self.stream_phase.is_active() || !self.status.is_empty();
         let activity_h: u16 = if show_activity { 1 } else { 0 };
+        // Unlike the slash menu, path suggestions reserve real layout space
+        // *below* the composer. This keeps the text being typed unobscured.
+        let path_matches = if self.path_completion_open {
+            self.filtered_paths()
+        } else {
+            Vec::new()
+        };
+        let path_popup_h = if self.path_completion_open && self.path_token().is_some() {
+            (path_matches.len() as u16 + 1).clamp(2, 11)
+        } else {
+            0
+        };
 
         // Pre-compute the layout with a provisional height so we know the input
         // width available for soft-wrapping.
@@ -1422,6 +1572,7 @@ impl App {
                 Constraint::Length(activity_h),
                 Constraint::Length(1),  // padding below activity
                 Constraint::Length(3),
+                Constraint::Length(path_popup_h),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -1443,6 +1594,7 @@ impl App {
                 Constraint::Length(activity_h),
                 Constraint::Length(1),  // padding below activity
                 Constraint::Length(input_h),
+                Constraint::Length(path_popup_h),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -1451,7 +1603,8 @@ impl App {
         let view = chunks[0];
         let activity_area = chunks[2];
         let input_area = chunks[4];
-        let footer_area = chunks[5];
+        let path_popup_area = chunks[5];
+        let footer_area = chunks[6];
         let ctx = RenderContext {
             shimmer_phase: shimmer_phase(self.shimmer_start, 1.8),
         };
@@ -1638,7 +1791,7 @@ impl App {
             && !self.streaming
             && self.paste_blocks.is_empty()
         {
-            wrapped.set_placeholder_text("Type a message, or / for commands\u{2026}");
+            wrapped.set_placeholder_text("Type a message, @ for paths, or / for commands\u{2026}");
             wrapped.set_placeholder_style(Style::default().fg(theme::t().text_dim).bg(input_bg));
         }
         // Render the soft-wrapped copy (already built above) so long input
@@ -1660,6 +1813,66 @@ impl App {
                 USER_PROMPT.chars().count(),
                 lead_style,
             );
+        }
+
+        // Path completion deliberately follows the input in the vertical
+        // layout. It consumes its own rows instead of floating above the
+        // composer, which is essential when the user has already typed a
+        // multi-line prompt.
+        if path_popup_h > 0 {
+            let query = self.path_token().map(|token| token.query).unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("  @{}  paths", query),
+                    Style::default().fg(theme::t().accent),
+                ))),
+                Rect {
+                    x: path_popup_area.x,
+                    y: path_popup_area.y,
+                    width: path_popup_area.width,
+                    height: 1,
+                },
+            );
+            let inner = Rect {
+                x: path_popup_area.x,
+                y: path_popup_area.y.saturating_add(1),
+                width: path_popup_area.width,
+                height: path_popup_area.height.saturating_sub(1),
+            };
+            if path_matches.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        " No matching workspace paths",
+                        Style::default().fg(theme::t().text_dim),
+                    ))),
+                    inner,
+                );
+            } else {
+                for (i, candidate) in path_matches.iter().enumerate() {
+                    let y = inner.top() + i as u16;
+                    if y >= inner.bottom() {
+                        break;
+                    }
+                    let selected = i == self.path_selected;
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme::t().text)
+                            .bg(theme::t().select_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else if candidate.is_dir {
+                        Style::default().fg(theme::t().accent)
+                    } else {
+                        Style::default().fg(theme::t().text_dim)
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            format!(" {}", candidate.path),
+                            style,
+                        ))),
+                        Rect { x: inner.left(), y, width: inner.width, height: 1 },
+                    );
+                }
+            }
         }
 
         // Footer: dim grey throughout, segments split with • .

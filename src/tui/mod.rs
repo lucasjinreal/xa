@@ -27,6 +27,7 @@ mod shimmer;
 mod cells;
 mod think;
 mod slash;
+mod path;
 mod render;
 pub mod wizard;
 pub mod resume;
