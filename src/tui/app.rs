@@ -1908,7 +1908,7 @@ impl App {
                 height: popup_h,
             };
             let block = Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::NONE)
                 .border_style(Style::default().fg(theme::t().accent))
                 .title(Span::styled(
                     format!(" /{:<1$} ", self.slash_query, 10),
