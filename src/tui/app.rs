@@ -30,7 +30,7 @@ use crate::tui::cells::{SystemCell, ThinkingCell, UserCell, USER_LEAD_COLS, USER
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::{shimmer_phase, shimmer_spans_to};
 use crate::tui::slash::{fuzzy_subseq, SlashCommand, SLASH_COMMANDS};
-use crate::tui::path::{collect_workspace_paths, fuzzy_paths, PathCandidate};
+use crate::tui::path::{collect_foreign_paths, collect_workspace_paths, fuzzy_paths, PathCandidate};
 use crate::tui::theme;
 use crate::tui::think::{StreamPhase, ThinkFilter};
 use crate::tui::wizard::{Wizard, WizardAction};
@@ -1036,9 +1036,38 @@ impl App {
     }
 
     fn filtered_paths(&self) -> Vec<PathCandidate> {
-        self.path_token()
-            .map(|token| fuzzy_paths(&self.workspace_paths, &token.query))
-            .unwrap_or_default()
+        let Some(token) = self.path_token() else {
+            return Vec::new();
+        };
+        // Absolute or home-relative path outside the workspace → scan on the fly.
+        // Depth 3 / 500 candidates keeps the scan fast even on large trees.
+        const FOREIGN_MAX_CANDIDATES: usize = 500;
+        const FOREIGN_MAX_DEPTH: u32 = 3;
+        if token.query.starts_with('/') || token.query.starts_with("~/") || token.query == "~" {
+            let scan_root = if token.query.starts_with("~/") {
+                dirs::home_dir().unwrap_or_default().join(&token.query["~".len()..])
+            } else {
+                // e.g. `/home` from `@/home/…` — keep components until the
+                // query diverges from an existing absolute path prefix.
+                let mut components = token.query.split('/').filter(|s| !s.is_empty());
+                let mut root = PathBuf::from("/");
+                for comp in components {
+                    let next = root.join(comp);
+                    if next.exists() {
+                        root = next;
+                    } else {
+                        break;
+                    }
+                }
+                root
+            };
+            if scan_root.is_dir() && scan_root.exists() {
+                let candidates =
+                    collect_foreign_paths(&scan_root, FOREIGN_MAX_CANDIDATES, FOREIGN_MAX_DEPTH);
+                return fuzzy_paths(&candidates, &token.query);
+            }
+        }
+        fuzzy_paths(&self.workspace_paths, &token.query)
     }
 
     fn refresh_path_candidates(&mut self) {

@@ -22,6 +22,63 @@ pub fn collect_workspace_paths(root: &Path) -> Vec<PathCandidate> {
     paths
 }
 
+/// Collect paths starting from `root`, skipping generated/VCS metadata.
+/// `max_depth` caps how deep we descend (0 = root only, 1 = root + one level, …);
+/// `max_candidates` caps the total number returned.
+pub fn collect_foreign_paths(root: &Path, max_candidates: usize, max_depth: u32) -> Vec<PathCandidate> {
+    let mut paths = Vec::new();
+    if !root.exists() || !root.is_dir() {
+        return paths;
+    }
+    collect_from(root, root, &mut paths, max_candidates, max_depth);
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    paths
+}
+
+fn collect_from(root: &Path, dir: &Path, paths: &mut Vec<PathCandidate>, max: usize, depth: u32) {
+    if paths.len() >= max || depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if paths.len() >= max {
+            break;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | ".DS_Store"
+        ) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = kind.is_dir();
+        let mut display = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/").to_string());
+        if is_dir {
+            display.push('/');
+        }
+        paths.push(PathCandidate {
+            path: display,
+            is_dir,
+        });
+        if is_dir {
+            collect_from(root, &path, paths, max, depth - 1);
+        }
+    }
+}
+
 fn collect(root: &Path, dir: &Path, paths: &mut Vec<PathCandidate>, max: usize) {
     if paths.len() >= max {
         return;
