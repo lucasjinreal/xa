@@ -1,0 +1,2 @@
+error: HTTP 400 Bad Request: {"error":{"message":".BadRequestError: OpenAIException - {\"object\":\"error\",\"message\":\"Assistant tool call          
+  .arguments must be valid JSON.\",\"type\":\"BadRequest\",\"param\":null,\"code\":400}","type":"upstream_error","param":"","code":"400"}}
