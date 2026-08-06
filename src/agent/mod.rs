@@ -369,10 +369,15 @@ fn messages_to_json(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
                         let arr = tcs
                             .iter()
                             .map(|tc| {
+                                // Never round-trip malformed `arguments` (empty,
+                                // truncated by a cut-off stream, or object deltas
+                                // some providers emit) — the API rejects them with
+                                // "Assistant tool call arguments must be valid JSON".
+                                let arguments = sanitize_arguments(&tc.arguments);
                                 serde_json::json!({
                                     "id": tc.id,
                                     "type": "function",
-                                    "function": { "name": tc.name, "arguments": tc.arguments }
+                                    "function": { "name": tc.name, "arguments": arguments }
                                 })
                             })
                             .collect::<Vec<_>>();
@@ -720,8 +725,34 @@ async fn stream_completion(
     Ok((text, prune_calls(calls)))
 }
 
-/// Drop incomplete tool calls (those without a name).
+/// Normalize a tool call's `arguments` string for round-tripping through the
+/// API: empty -> `{}`, and anything that isn't valid JSON (a stream cut off
+/// mid-argument) -> `{}`. The API rejects non-JSON `arguments` with HTTP 400.
+fn sanitize_arguments(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return "{}".into();
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+        return "{}".into();
+    }
+    trimmed.to_string()
+}
+
+/// Drop tool calls that can't be executed or re-sent: those without a name, or
+/// whose accumulated `arguments` are not valid JSON. Empty arguments (some
+/// providers emit no `arguments` delta, or emit it as a JSON object rather than
+/// a string) are normalized to `{}` so the API doesn't reject them.
 fn prune_calls(mut calls: Vec<ToolCallRepr>) -> Vec<ToolCallRepr> {
-    calls.retain(|c| !c.name.is_empty());
+    calls.retain_mut(|c| {
+        if c.name.is_empty() {
+            return false;
+        }
+        if c.arguments.trim().is_empty() {
+            c.arguments = "{}".into();
+            return true;
+        }
+        serde_json::from_str::<serde_json::Value>(&c.arguments).is_ok()
+    });
     calls
 }

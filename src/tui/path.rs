@@ -1,7 +1,7 @@
 //! Workspace-path completion for `@` references in the composer.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
@@ -33,6 +33,71 @@ pub fn collect_foreign_paths(root: &Path, max_candidates: usize, max_depth: u32)
     collect_from(root, root, &mut paths, max_candidates, max_depth);
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     paths
+}
+
+/// Resolve an `@`-typed foreign path and return completions as **absolute**
+/// paths ready to insert.
+///
+/// Supports absolute paths (`@/usr/…`) and home-relative ones (`@~/…`, `@~`).
+/// It expands `~`, walks down the deepest *existing* ancestor (so a partially
+/// typed query still lists a real directory), fuzzy-matches only the residual
+/// fragment beyond that ancestor against its contents, and prefixes each hit
+/// back with the ancestor so insertion yields a fully expanded path.
+pub fn foreign_match(query: &str, home: &Path) -> Vec<PathCandidate> {
+    const MAX_CANDIDATES: usize = 500;
+    const MAX_DEPTH: u32 = 3;
+
+    // Build the absolute path the query points toward as a string so we avoid
+    // `PathBuf::join`, which silently discards the parent path when given an
+    // absolute (…"/…") component — the classic `~/` → `/` footgun.
+    let home_str = home.to_string_lossy();
+    let abs_str = if query == "~" || query.starts_with("~/") {
+        if query == "~" {
+            home_str.to_string()
+        } else {
+            format!("{}{}", home_str, &query[1..])
+        }
+    } else if query.starts_with('/') {
+        query.to_string()
+    } else {
+        return Vec::new();
+    };
+
+    // Narrow to the deepest existing ancestor directory so a partial path such
+    // as `/home/lumos1/wor` still scans `/home/lumos1` instead of failing.
+    let mut so_far = PathBuf::from("/");
+    for comp in PathBuf::from(&abs_str).components().skip(1) {
+        let next = so_far.join(comp.as_os_str());
+        if next.is_dir() {
+            so_far = next;
+        } else {
+            break;
+        }
+    }
+    let root_str = so_far.to_string_lossy().to_string();
+    if !so_far.is_dir() {
+        return Vec::new();
+    }
+
+    // The residual to fuzzy-match = whatever the user typed beyond `so_far`.
+    let residual = abs_str
+        .strip_prefix(&root_str)
+        .map(|rest| rest.trim_start_matches('/'))
+        .unwrap_or("");
+
+    let candidates = collect_foreign_paths(&so_far, MAX_CANDIDATES, MAX_DEPTH);
+    let filtered = fuzzy_paths(&candidates, residual);
+
+    // Prefix hits back with the scanned root so the inserted text is a complete
+    // absolute path.
+    let separator = if root_str.ends_with('/') { "" } else { "/" };
+    filtered
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.path = format!("{root_str}{separator}{}", candidate.path);
+            candidate
+        })
+        .collect()
 }
 
 fn collect_from(root: &Path, dir: &Path, paths: &mut Vec<PathCandidate>, max: usize, depth: u32) {
@@ -159,7 +224,8 @@ pub fn fuzzy_paths(candidates: &[PathCandidate], query: &str) -> Vec<PathCandida
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_paths, PathCandidate};
+    use super::{foreign_match, fuzzy_paths, PathCandidate};
+    use std::path::Path;
 
     fn candidate(path: &str, is_dir: bool) -> PathCandidate {
         PathCandidate {
@@ -191,5 +257,63 @@ mod tests {
             "app",
         );
         assert_eq!(results[0].path, "src/tui/app.rs");
+    }
+
+    fn tmp_home(dir: &Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn tmp_home3(name: &str) -> std::path::PathBuf {
+        tmp_home(&std::env::temp_dir(), name)
+    }
+
+    #[test]
+    fn foreign_tilde_lists_home_contents() {
+        let home = tmp_home3("xa_foreign_home");
+        std::fs::create_dir_all(home.join("work/scripts")).unwrap();
+        std::fs::write(home.join("notes.md"), "x").unwrap();
+        let results = foreign_match("~/", &home);
+        let paths: Vec<_> = results.iter().map(|c| c.path.clone()).collect();
+        assert!(paths.contains(&format!("{}/work/", home.display())));
+        assert!(paths.contains(&format!("{}/notes.md", home.display())));
+        assert!(paths.iter().all(|p| p.starts_with(home.to_str().unwrap())));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn foreign_tilde_fuzzy_matches_residual_only() {
+        let home = tmp_home3("xa_foreign_home2");
+        std::fs::create_dir_all(home.join("work/xa")).unwrap();
+        let results = foreign_match("~/wor", &home);
+        assert!(
+            results
+                .iter()
+                .any(|c| c.path == format!("{}/work/", home.display())),
+            "expected home/work/ in {:?}",
+            results
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn foreign_absolute_walks_existing_ancestor() {
+        let home = tmp_home3("xa_foreign_home3");
+        let base = home.join("tree");
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/main.rs"), "fn main() {}").unwrap();
+        let root = base.to_str().unwrap();
+        let results = foreign_match(&format!("{root}/sr"), &home);
+        assert!(
+            results.iter().any(|c| c.path.ends_with("/src/")),
+            "expected {}",
+            results
+                .iter()
+                .map(|c| c.path.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

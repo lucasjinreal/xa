@@ -30,7 +30,9 @@ use crate::tui::cells::{SystemCell, ThinkingCell, UserCell, USER_LEAD_COLS, USER
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::{shimmer_phase, shimmer_spans_to};
 use crate::tui::slash::{fuzzy_subseq, SlashCommand, SLASH_COMMANDS};
-use crate::tui::path::{collect_foreign_paths, collect_workspace_paths, fuzzy_paths, PathCandidate};
+use crate::tui::path::{
+    collect_workspace_paths, foreign_match, fuzzy_paths, PathCandidate,
+};
 use crate::tui::theme;
 use crate::tui::think::{StreamPhase, ThinkFilter};
 use crate::tui::wizard::{Wizard, WizardAction};
@@ -1039,32 +1041,13 @@ impl App {
         let Some(token) = self.path_token() else {
             return Vec::new();
         };
-        // Absolute or home-relative path outside the workspace → scan on the fly.
-        // Depth 3 / 500 candidates keeps the scan fast even on large trees.
-        const FOREIGN_MAX_CANDIDATES: usize = 500;
-        const FOREIGN_MAX_DEPTH: u32 = 3;
-        if token.query.starts_with('/') || token.query.starts_with("~/") || token.query == "~" {
-            let scan_root = if token.query.starts_with("~/") {
-                dirs::home_dir().unwrap_or_default().join(&token.query["~".len()..])
-            } else {
-                // e.g. `/home` from `@/home/…` — keep components until the
-                // query diverges from an existing absolute path prefix.
-                let mut components = token.query.split('/').filter(|s| !s.is_empty());
-                let mut root = PathBuf::from("/");
-                for comp in components {
-                    let next = root.join(comp);
-                    if next.exists() {
-                        root = next;
-                    } else {
-                        break;
-                    }
-                }
-                root
-            };
-            if scan_root.is_dir() && scan_root.exists() {
-                let candidates =
-                    collect_foreign_paths(&scan_root, FOREIGN_MAX_CANDIDATES, FOREIGN_MAX_DEPTH);
-                return fuzzy_paths(&candidates, &token.query);
+        // Absolute (`@/…`) or home-relative (`@~/…`, `@~`) path outside the
+        // workspace → scan on the fly. `foreign_match` expands `~`, walks to the
+        // deepest existing ancestor and returns absolute-path completions.
+        if token.query.starts_with('/') || token.query == "~" || token.query.starts_with("~/") {
+            let matches = foreign_match(&token.query, &dirs::home_dir().unwrap_or_default());
+            if !matches.is_empty() {
+                return matches;
             }
         }
         fuzzy_paths(&self.workspace_paths, &token.query)
@@ -1877,8 +1860,15 @@ impl App {
                     inner,
                 );
             } else {
-                for (i, candidate) in path_matches.iter().enumerate() {
-                    let y = inner.top() + i as u16;
+                // Keep the highlight visible: when selection moves beyond the
+                // visible window, shift the window so the selected row is shown.
+                let rows = inner.height as usize;
+                let scroll = self
+                    .path_selected
+                    .saturating_sub(rows.saturating_sub(1))
+                    .min(path_matches.len().saturating_sub(rows));
+                for (i, candidate) in path_matches.iter().enumerate().skip(scroll) {
+                    let y = inner.top() + i as u16 - scroll as u16;
                     if y >= inner.bottom() {
                         break;
                     }
@@ -2096,9 +2086,9 @@ fn print_exit_summary(summary: &ExitSummary) {
     println!("\n{GREY}Choose another saved session:{RESET} xa resume");
 }
 
-/// Print the session's actual raw-to-context reduction and a small breakdown
-/// of the highest-impact filters. Percentages use exact byte counts; tokens
-/// remain an explicitly labelled estimate.
+/// Print the session's output-token reduction and a small breakdown of the
+/// highest-impact filters. Savings are reported in tokens (ChatGPT-style
+/// estimate of ~4 chars/token); a `↓` marks the amount kept out of context.
 fn print_output_savings_table(
     totals: session::OutputSavings,
     rows: &[session::OutputFilterSavings],
@@ -2106,46 +2096,64 @@ fn print_output_savings_table(
     reset: &str,
     cyan_bold: &str,
 ) {
+    let raw_tokens = totals.raw_bytes.div_ceil(4);
+    let saved_tokens = totals.estimated_tokens_saved;
+    let pct = if raw_tokens == 0 {
+        0.0
+    } else {
+        saved_tokens as f64 * 100.0 / raw_tokens as f64
+    };
     println!("\n{cyan_bold}Tool output filtering{reset}");
-    println!("  {grey}Metric                 Raw → LLM context             Saved{reset}");
     println!(
-        "  Calls                  {:>8}                         ",
+        "  ↓ {}{} tokens saved{reset} across {} calls ({:.1}% of ~{} raw)",
+        grey,
+        format_count(saved_tokens),
         format_count(totals.calls),
-    );
-    println!(
-        "  Bytes                  {:>10} → {:>10}   {:>10} ({:>5.1}%)",
-        format_count(totals.raw_bytes),
-        format_count(totals.returned_bytes),
-        format_count(totals.bytes_saved()),
-        totals.savings_percent(),
-    );
-    println!(
-        "  Estimated tokens       {:>8}                         ",
-        format!("~{}", format_count(totals.estimated_tokens_saved)),
+        pct,
+        format_count(raw_tokens),
     );
 
     if rows.is_empty() {
         return;
     }
-    println!("\n  {grey}Filter                 Calls    Bytes saved   Saved    Tokens{reset}");
+    println!(
+        "{grey}  {:<22} {:>5} {:>15} {:>6}{reset}",
+        "Filter", "Calls", "↓ Saved tokens", "Saved",
+    );
     for row in rows.iter().take(6) {
+        let row_raw = row.raw_bytes.div_ceil(4);
+        let row_saved = row.estimated_tokens_saved;
+        let row_pct = if row_raw == 0 {
+            0.0
+        } else {
+            row_saved as f64 * 100.0 / row_raw as f64
+        };
         println!(
-            "  {:<22} {:>5} {:>14} {:>6.1}% {:>9}",
+            "  {:<22} {:>5} {:>15} {:>6.1}%",
             row.label,
             row.calls,
-            format_count(row.bytes_saved()),
-            row.savings_percent(),
-            format!("~{}", format_count(row.estimated_tokens_saved)),
+            format!("↓ {}", format_count(row_saved)),
+            row_pct,
         );
     }
     if rows.len() > 6 {
         let remaining_calls: usize = rows[6..].iter().map(|row| row.calls).sum();
-        let remaining_saved: usize = rows[6..].iter().map(|row| row.bytes_saved()).sum();
+        let remaining_saved: usize = rows[6..]
+            .iter()
+            .map(|row| row.estimated_tokens_saved)
+            .sum();
+        let remaining_raw: usize = rows[6..].iter().map(|row| row.raw_bytes.div_ceil(4)).sum();
+        let remaining_pct = if remaining_raw == 0 {
+            0.0
+        } else {
+            remaining_saved as f64 * 100.0 / remaining_raw as f64
+        };
         println!(
-            "  {grey}other {} filters{reset} {:>5} {:>14}",
+            "  {grey}other {} filters{reset} {:>5} {:>15} {:>6.1}%",
             rows.len() - 6,
             remaining_calls,
-            format_count(remaining_saved),
+            format!("↓ {}", format_count(remaining_saved)),
+            remaining_pct,
         );
     }
 }
