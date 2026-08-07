@@ -148,6 +148,9 @@ pub enum StreamEvent {
     Usage { prompt: u32, completion: u32, total: u32 },
     /// A transient error occurred; the agent is retrying automatically.
     Retrying { attempt: u32, max: u32, reason: String },
+    /// The upstream stream dropped without a clean `[DONE]` (empty or truncated
+    /// output); the agent automatically re-prompted with a "continue" turn.
+    AutoContinue { step: u32, max: u32, reason: String },
     /// Internal: marks the assistant cell at `0` as no longer streaming.
     InternalAssistIdx(u32),
 }
@@ -394,7 +397,9 @@ fn messages_to_json(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Run a full agentic turn loop against `provider`.
+/// Drive a full agentic turn loop against `provider`. Wraps the loop body in
+/// `MAX_AUTO_CONTINUE` rounds of automatic "continue" re-prompts when the
+/// upstream stream drops without a clean `[DONE]`.
 ///
 /// Streams text deltas; when the model emits tool calls, executes them
 /// locally (`tools`), feeds the results back, and loops until a turn
@@ -406,6 +411,9 @@ pub async fn run_conversation(
     tools: &[std::sync::Arc<dyn crate::tools::Tool>],
     cancel: Arc<AtomicBool>,
 ) {
+    // Auto-continue budget for this turn. The model keeps re-prompting with a
+    // plain "continue" until the stream ends cleanly or the budget runs out.
+    let mut auto_continues: u32 = 0;
     loop {
         if cancel.load(Ordering::SeqCst) {
             let _ = tx.send(StreamEvent::Done).await;
@@ -436,10 +444,46 @@ pub async fn run_conversation(
             );
         }
         match stream_completion_with_retry(provider, &snapshot, tools, &tx, cancel.clone()).await {
-            Ok((text, calls)) => {
+            Ok(outcome) => {
+                let StreamOutcome { text, calls, clean } = outcome;
                 if cancel.load(Ordering::SeqCst) {
                     let _ = tx.send(StreamEvent::Done).await;
                     return;
+                }
+                // Silent drop detection: the stream ended without `[DONE]` (no
+                // output at all, or truncated mid-answer). The HTTP retry layer
+                // above can't catch this because the connection "succeeded" —
+                // so re-prompt with a plain "continue" turn to recover it.
+                if !clean && auto_continues < MAX_AUTO_CONTINUE {
+                    auto_continues += 1;
+                    let reason = if text.trim().is_empty() {
+                        "no output".to_string()
+                    } else {
+                        "stream cut off".to_string()
+                    };
+                    let _ = tx
+                        .send(StreamEvent::AutoContinue {
+                            step: auto_continues,
+                            max: MAX_AUTO_CONTINUE,
+                            reason,
+                        })
+                        .await;
+                    // Persist any partial text so the follow-up continues it,
+                    // then nudge the model to finish the turn.
+                    if !text.trim().is_empty() {
+                        history.lock().unwrap().push(ChatMessage {
+                            role: "assistant".into(),
+                            content: text,
+                            tool_calls: None,
+                            ..Default::default()
+                        });
+                    }
+                    history.lock().unwrap().push(ChatMessage {
+                        role: "user".into(),
+                        content: "continue".into(),
+                        ..Default::default()
+                    });
+                    continue;
                 }
                 if calls.is_empty() {
                     // Final answer (text already streamed) — signal completion.
@@ -546,6 +590,18 @@ pub async fn run_conversation(
 }
 
 const MAX_RETRIES: u32 = 3;
+/// Bounded automatic "continue" re-prompts after a silently dropped stream.
+const MAX_AUTO_CONTINUE: u32 = 2;
+
+/// A single completion turn, along with whether the upstream stream signaled a
+/// clean end. A stream that just ends (connection drop, gateway timeout) never
+/// emits `[DONE]` — that's the empty/truncated "silent drop" we detect below.
+struct StreamOutcome {
+    text: String,
+    calls: Vec<ToolCallRepr>,
+    /// `true` only when the SSE stream ended with a proper `data: [DONE]`.
+    clean: bool,
+}
 
 /// Wrap `stream_completion` with automatic retry on transient HTTP errors
 /// (429 rate-limit, 500+ server errors, 404 not-found). Sends `Retrying`
@@ -556,14 +612,14 @@ async fn stream_completion_with_retry(
     tools: &[std::sync::Arc<dyn crate::tools::Tool>],
     tx: &mpsc::Sender<StreamEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<(String, Vec<ToolCallRepr>), String> {
+) -> Result<StreamOutcome, String> {
     let mut last_err = String::new();
     for attempt in 0..MAX_RETRIES {
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
         match stream_completion(provider, messages, tools, tx, cancel.clone()).await {
-            Ok(result) => return Ok(result),
+            Ok(outcome) => return Ok(outcome),
             Err(e) => {
                 let is_retryable = e.contains("HTTP 429")
                     || e.contains("HTTP 500")
@@ -603,7 +659,7 @@ async fn stream_completion(
     tools: &[std::sync::Arc<dyn crate::tools::Tool>],
     tx: &mpsc::Sender<StreamEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<(String, Vec<ToolCallRepr>), String> {
+) -> Result<StreamOutcome, String> {
     let client = reqwest::Client::new();
 
     let mut body = serde_json::json!({
@@ -649,10 +705,13 @@ async fn stream_completion(
     let mut text = String::new();
     // Tool calls accumulate per `index` (OpenAI streams them by index).
     let mut calls: Vec<ToolCallRepr> = Vec::new();
+    // Becomes `true` once the SSE stream signals a proper end with `[DONE]`.
+    // A dropped/truncated connection returns below with `clean == false`.
+    let mut clean = false;
 
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::SeqCst) {
-            return Ok((text, prune_calls(calls)));
+            return Ok(StreamOutcome { text, calls: prune_calls(calls), clean });
         }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -665,7 +724,8 @@ async fn stream_completion(
                 continue;
             }
             if line == "data: [DONE]" {
-                return Ok((text, prune_calls(calls)));
+                clean = true;
+                return Ok(StreamOutcome { text, calls: prune_calls(calls), clean });
             }
             if let Some(rest) = line.strip_prefix("data:") {
                 let rest = rest.trim();
@@ -688,7 +748,7 @@ async fn stream_completion(
                                 if !d.is_empty() {
                                     text.push_str(d);
                                     if tx.send(StreamEvent::Delta(d.to_string())).await.is_err() {
-                                        return Ok((text, prune_calls(calls)));
+                                        return Ok(StreamOutcome { text, calls: prune_calls(calls), clean });
                                     }
                                 }
                             }
@@ -722,7 +782,7 @@ async fn stream_completion(
             }
         }
     }
-    Ok((text, prune_calls(calls)))
+    Ok(StreamOutcome { text, calls: prune_calls(calls), clean })
 }
 
 /// Normalize a tool call's `arguments` string for round-tripping through the

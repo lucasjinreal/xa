@@ -136,6 +136,9 @@ pub struct App {
     /// Footer / transient messages (queue, ctrl-c hint). Activity labels live
     /// in [`stream_phase`] above the input bar.
     status: String,
+    /// Notice that the API stream dropped and the agent auto-continued. Rendered
+    /// at the end of the footer, after the provider/model segments.
+    auto_continue_notice: Option<String>,
     /// Claude-Code-style activity above the input (Waiting / Thinking / …).
     stream_phase: StreamPhase,
     /// When the current [`stream_phase`] began (timer restarts on phase change).
@@ -197,6 +200,7 @@ impl App {
             streaming: false,
             should_quit: false,
             status: String::new(),
+            auto_continue_notice: None,
             stream_phase: StreamPhase::Idle,
             phase_started: Instant::now(),
             phase_elapsed_frozen: None,
@@ -407,6 +411,7 @@ impl App {
         self.cancel_flag.store(false, Ordering::SeqCst);
         self.set_stream_phase(StreamPhase::Waiting);
         self.status.clear();
+        self.auto_continue_notice = None;
         self.dirty = true;
 
         let provider = self.provider.clone();
@@ -546,6 +551,19 @@ impl App {
                 if !self.stream_phase.is_terminal() {
                     self.set_stream_phase(StreamPhase::Retrying { attempt, max });
                     self.status = format!("retry {attempt}/{max}: {reason}");
+                }
+                self.dirty = true;
+            }
+            StreamEvent::AutoContinue { step, max, reason } => {
+                // Show the auto-recovery in the footer, after provider/model,
+                // so the user knows the API dropped and xa re-prompted.
+                self.auto_continue_notice = Some(format!(
+                    "api {} auto continue · {reason} ({step}/{max})",
+                    self.provider.name
+                ));
+                if !self.stream_phase.is_terminal() {
+                    self.set_stream_phase(StreamPhase::Retrying { attempt: step, max });
+                    self.status = format!("auto continue {step}/{max}: {reason}");
                 }
                 self.dirty = true;
             }
@@ -1911,6 +1929,14 @@ impl App {
             footer_spans.push(Span::styled(
                 format!("{} queued", self.queued_inputs.len()),
                 Style::default().fg(theme::t().footer),
+            ));
+        }
+        // Silent-drop auto-recovery notice, shown last after provider/model.
+        if let Some(notice) = &self.auto_continue_notice {
+            footer_spans.push(Span::styled(" • ", Style::default().fg(theme::t().footer)));
+            footer_spans.push(Span::styled(
+                notice.clone(),
+                Style::default().fg(theme::t().warning),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
