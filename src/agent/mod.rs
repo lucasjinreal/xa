@@ -450,11 +450,14 @@ pub async fn run_conversation(
                     let _ = tx.send(StreamEvent::Done).await;
                     return;
                 }
-                // Silent drop detection: the stream ended without `[DONE]` (no
-                // output at all, or truncated mid-answer). The HTTP retry layer
-                // above can't catch this because the connection "succeeded" —
-                // so re-prompt with a plain "continue" turn to recover it.
-                if !clean && auto_continues < MAX_AUTO_CONTINUE {
+                // Silent-drop detection: either the stream ended without a
+                // `[DONE]` (dropped / truncated connection, timeout) — which the
+                // HTTP retry layer can't catch because the request "succeeded" —
+                // or it "completed" cleanly but produced nothing at all (a MoE
+                // dropout can make the model emit an empty completion). Both
+                // re-prompt with a plain "continue" turn to recover.
+                let no_output = text.trim().is_empty() && calls.is_empty();
+                if calls.is_empty() && (no_output || !clean) && auto_continues < MAX_AUTO_CONTINUE {
                     auto_continues += 1;
                     let reason = if text.trim().is_empty() {
                         "no output".to_string()
@@ -486,8 +489,19 @@ pub async fn run_conversation(
                     continue;
                 }
                 if calls.is_empty() {
-                    // Final answer (text already streamed) — signal completion.
-                    let _ = tx.send(StreamEvent::Done).await;
+                    if no_output {
+                        // Auto-continues all exhausted and the API still gave us
+                        // nothing. Surface it so the user isn't left guessing
+                        // (their complaint: "no error, no output, restart works").
+                        let _ = tx
+                            .send(StreamEvent::Error(format!(
+                                "API returned no output after {auto_continues} auto-continue(s) — start a new session if this persists"
+                            )))
+                            .await;
+                    } else {
+                        // Final answer (text already streamed) — signal completion.
+                        let _ = tx.send(StreamEvent::Done).await;
+                    }
                     return;
                 }
                 // Record the assistant message (with its tool calls) in history.
@@ -592,6 +606,21 @@ pub async fn run_conversation(
 const MAX_RETRIES: u32 = 3;
 /// Bounded automatic "continue" re-prompts after a silently dropped stream.
 const MAX_AUTO_CONTINUE: u32 = 2;
+/// Max time to establish the connection and receive response headers. reqwest's
+/// default `Client::new()` has no total timeout, so a gateway that accepts the
+/// TCP connection but never replies with headers would block `.send()` forever —
+/// the classic "no error, no output" hang.
+const HTTP_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Max time to read the body of a non-success (error) response.
+const HTTP_ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Max time to wait for the stream's very first byte. Generous enough for slow
+/// schedulers / reasoning models, but a dropout hang must not block the turn
+/// forever. On expiry the turn is treated as a "no output" drop (auto-continue).
+const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Max silence between consecutive stream chunks. A connection that stays open
+/// but sends nothing (MoE expert dropout, overloaded gateway) surfaces here as
+/// a drop instead of spinning "Waiting" indefinitely.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A single completion turn, along with whether the upstream stream signaled a
 /// clean end. A stream that just ends (connection drop, gateway timeout) never
@@ -686,17 +715,26 @@ async fn stream_completion(
         body["tool_choice"] = "auto".into();
     }
 
-    let res = client
-        .post(provider.chat_url())
-        .bearer_auth(&provider.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let res = tokio::time::timeout(
+        HTTP_RESPONSE_TIMEOUT,
+        client
+            .post(provider.chat_url())
+            .bearer_auth(&provider.api_key)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| "request timed out".to_string())?
+    .map_err(|e| format!("request failed: {e}"))?;
 
     if !res.status().is_success() {
         let status = res.status();
-        let txt = res.text().await.unwrap_or_default();
+        // The error body read must also be bounded — some gateways send an
+        // error status and then stall on the body.
+        let txt = match tokio::time::timeout(HTTP_ERROR_BODY_TIMEOUT, res.text()).await {
+            Ok(Ok(t)) => t,
+            _ => String::new(),
+        };
         return Err(format!("HTTP {status}: {txt}"));
     }
 
@@ -709,10 +747,31 @@ async fn stream_completion(
     // A dropped/truncated connection returns below with `clean == false`.
     let mut clean = false;
 
-    while let Some(chunk) = stream.next().await {
+    // First byte gets a longer budget than later idle gaps. Even so, a silent
+    // hang (dropout, dead gateway) is bounded instead of blocking the TUI.
+    let mut first_chunk = true;
+    loop {
         if cancel.load(Ordering::SeqCst) {
             return Ok(StreamOutcome { text, calls: prune_calls(calls), clean });
         }
+        let wait = if first_chunk {
+            FIRST_BYTE_TIMEOUT
+        } else {
+            STREAM_IDLE_TIMEOUT
+        };
+        first_chunk = false;
+        let chunk = match tokio::time::timeout(wait, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            // No more chunks (no `[DONE]`) or nothing arrived in time — both
+            // are silent drops, never a hard error the HTTP retry layer sees.
+            Ok(None) | Err(_) => {
+                return Ok(StreamOutcome {
+                    text,
+                    calls: prune_calls(calls),
+                    clean: false,
+                });
+            }
+        };
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -782,7 +841,6 @@ async fn stream_completion(
             }
         }
     }
-    Ok(StreamOutcome { text, calls: prune_calls(calls), clean })
 }
 
 /// Normalize a tool call's `arguments` string for round-tripping through the

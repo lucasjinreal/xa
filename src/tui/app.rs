@@ -57,9 +57,48 @@ Tip: type `/` for commands or `@` for workspace paths, or just start chatting.
      `/login [name]` to add a provider · `/models` to switch · `/help` for all commands.
 "#;
 
+/// Safety net: if `streaming` stays `true` with no stream event for this long,
+/// the turn is considered wedged and is force-recovered so the user can send
+/// again. Generous — the agent pipeline already bounds every request/stream, so
+/// a real turn must never get this far. Only fires on an unforeseen stall.
+const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 enum Pending {
     None,
     Save,
+}
+
+/// Sends a terminal `StreamEvent::Error` to the UI when dropped while still
+/// armed. This is the panic-proof backstop for the spawned agent task: if
+/// [`agent::run_conversation`] panics or the task is aborted mid-turn, the
+/// lines after the `.await` in [`App::submit`] never run — without this guard
+/// the TUI's `streaming` flag would stay `true` forever and every Enter would
+/// just queue input, which is exactly the "no error, no output, can't send
+/// anymore" stuck state.
+struct TerminalEventGuard {
+    tx: mpsc::Sender<AppEvent>,
+    armed: bool,
+}
+
+impl TerminalEventGuard {
+    fn new(tx: mpsc::Sender<AppEvent>) -> Self {
+        TerminalEventGuard { tx, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalEventGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .tx
+                .blocking_send(AppEvent::Stream(StreamEvent::Error(
+                    "internal error: the agent task ended unexpectedly".into(),
+                )));
+        }
+    }
 }
 
 /// Events multiplexed into the single TUI loop.
@@ -181,6 +220,9 @@ pub struct App {
     paste_blocks: Vec<String>,
     /// Shared flag checked by the agent loop to support ESC-to-interrupt.
     cancel_flag: Arc<AtomicBool>,
+    /// Last time any stream event arrived. The stall watchdog in the UI loop
+    /// force-recovers a turn that somehow never delivers a terminal event.
+    last_stream_activity: Instant,
 }
 
 impl App {
@@ -228,6 +270,7 @@ impl App {
             wizard: None,
             paste_blocks: Vec::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_stream_activity: Instant::now(),
         }
     }
 
@@ -430,17 +473,22 @@ impl App {
                 }
             });
             let tools = crate::tools::all_tools();
+            // If the agent loop panics or is aborted, this guard still delivers
+            // a terminal Error so `streaming` resets and the input bar recovers.
+            let mut terminal = TerminalEventGuard::new(event_tx.clone());
             agent::run_conversation(&provider, agent_hist, stx, &tools, cancel).await;
             // `run_conversation` owns the last sender, so the receiver closes
             // once it returns. Waiting here preserves event ordering: a fast
             // completion can no longer send Done ahead of its text deltas.
             let _ = forward.await;
+            terminal.disarm();
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::Done)).await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::InternalAssistIdx(assistant_idx))).await;
         });
     }
 
     fn handle_stream(&mut self, se: StreamEvent) {
+        self.last_stream_activity = Instant::now();
         match se {
             StreamEvent::Delta(s) => {
                 // Strip `<think>`…`</think>` from the transcript; drive phase.
@@ -642,6 +690,36 @@ impl App {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Last-resort recovery when a turn never delivers a terminal event
+    /// (should be unreachable after the agent-side timeouts and the
+    /// [`TerminalEventGuard`], but a stuck `streaming` flag is the worst state
+    /// to be in — the user can't send anything). Force-resets streaming and
+    /// surfaces an error in the transcript so the turn ends visibly.
+    fn force_unstick_stream(&mut self) {
+        if !self.streaming {
+            return;
+        }
+        self.streaming = false;
+        if !self.stream_phase.is_terminal() {
+            self.set_stream_phase(StreamPhase::Error);
+        }
+        self.status.clear();
+        let idx = if let Some(i) = self.active_think {
+            i
+        } else {
+            self.cells.push(Box::new(ThinkingCell::new()));
+            let i = self.cells.len() - 1;
+            self.active_think = Some(i);
+            i
+        };
+        if let Some(tc) = self.cells[idx].as_any_mut().downcast_mut::<ThinkingCell>() {
+            tc.add_text("\n\n**error:** stream stalled — the connection was reset");
+            tc.streaming = false;
+        }
+        self.active_think = None;
+        self.dirty = true;
     }
 
     fn handle_slash(&mut self, raw: &str) {
@@ -2480,6 +2558,13 @@ async fn run_inner(
                 // independent of how fast the AI streams. A slow / high-latency
                 // API must never freeze the indicator; the animation is driven
                 // by wall-clock time, not by incoming stream deltas.
+                if app.streaming
+                    && app.last_stream_activity.elapsed() > STREAM_STALL_TIMEOUT
+                {
+                    // Safety net: no stream event for a very long time means the
+                    // turn is wedged. Recover so the user can send again.
+                    app.force_unstick_stream();
+                }
                 if app.stream_phase.is_active() && !app.stream_phase.is_terminal()
                     || app.streaming
                     || app.slash_mode
