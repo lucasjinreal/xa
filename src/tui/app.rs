@@ -2652,6 +2652,8 @@ async fn run_inner(
         // the first draw finishes, giving a smooth "open at the latest msg" UX.
         app.auto_scroll = true;
     }
+        // Force a redraw after resume so the history is visible immediately.
+        app.dirty = true;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     // First paint before waiting on input.
