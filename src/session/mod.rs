@@ -14,6 +14,20 @@ pub struct StoredToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Unified `git diff` produced by file-mutating tools (edit / write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+/// One element in an interleaved assistant turn: either text or a tool call.
+/// Stored in order so that on resume the TUI can reconstruct the original
+/// interleaving instead of grouping all tools first.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum StoredBlock {
+    #[serde(rename = "text")]
+    Text(String),
+    #[serde(rename = "tool")]
+    Tool(StoredToolCall),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -24,6 +38,11 @@ pub struct StoredMessage {
     pub tool_calls: Option<Vec<StoredToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Interleaved blocks (text + tool calls) preserving the original order
+    /// emitted by the model. Only set on assistant messages that have tools;
+    /// on resume the TUI reads this instead of appending all tools first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<StoredBlock>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -35,6 +54,9 @@ pub struct Session {
     pub created: i64,
     pub updated: i64,
     pub messages: Vec<StoredMessage>,
+    /// Workspace directory where this session was last used, if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Per-tool output reductions. Kept with the session for an auditable
     /// account of what was removed before sending tool output to the LLM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -51,6 +73,9 @@ pub struct SessionSummary {
     pub title: String,
     pub model: String,
     pub updated: i64,
+    /// Workspace directory where this session was last used, if recorded.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// Session data used by `xa gain`; message bodies are intentionally omitted.
@@ -130,11 +155,25 @@ pub fn relative_time(timestamp_ms: i64) -> String {
     }
 }
 
-/// Persist a session (creating the directory if needed).
+/// Normalize a path string for workspace matching: canonicalize if possible,
+/// otherwise fall back to the raw string. This ensures consistent comparison
+/// regardless of symlinks, trailing slashes, or relative paths.
+pub fn normalize_workspace(path: &std::path::Path) -> String {
+    path.canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
 pub fn save(session: &Session) -> std::io::Result<()> {
     let dir = sessions_dir();
     fs::create_dir_all(&dir)?;
-    let json = serde_json::to_string_pretty(session)
+    // Record the current working directory so the resume picker can filter
+    // to workspace-local sessions by default.
+    let mut session = session.clone();
+    session.workspace = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()));
+    let json = serde_json::to_string_pretty(&session)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     fs::write(path_for(&session.id), json)
 }
@@ -248,6 +287,7 @@ impl Session {
             created: now,
             updated: now,
             messages: Vec::new(),
+            workspace: None,
             output_filter_calls: Vec::new(),
             api_token_usage: ApiTokenUsage::default(),
         }
@@ -328,6 +368,7 @@ mod tests {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -339,6 +380,7 @@ mod tests {
             id: "call-1".into(),
             name: "read".into(),
             arguments: "{}".into(),
+            diff: None,
         }]);
         session.messages = vec![
             call,

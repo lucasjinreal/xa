@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::tui::render::RenderContext;
-use crate::tui::shimmer::shimmer_spans;
+use crate::tui::shimmer::{shimmer_spans, shimmer_spans_to};
 use crate::tui::theme;
 
 /// Cached layout for a history cell at a given terminal width.
@@ -1103,7 +1103,7 @@ impl ToolCallCell {
         
         match ctx {
             Some(c) if self.status == ToolStatus::Running => {
-                let mut s = shimmer_spans(&args_display, color, c.shimmer_phase);
+                let mut s = shimmer_spans_to(&args_display, color, theme::t().accent, c.shimmer_phase);
                 spans.append(&mut s);
             }
             _ => spans.push(Span::styled(args_display, args_style)),
@@ -1548,10 +1548,13 @@ impl ThinkingCell {
 
     fn bump_layout(&mut self) {
         self.layout_gen = self.layout_gen.wrapping_add(1);
+        // Only invalidate the overall layout cache. Per-block caches (
+        // `rendered_blocks` / `block_sigs`) are managed independently by
+        // `render_block_cached` using content hashes — content that hasn't
+        // changed keeps its highlight rows, so a long generation only ever
+        // re-highlights the single trailing text block instead of the whole
+        // transcript on every delta.
         *self.layout.borrow_mut() = None;
-        // Invalidate per-block cache: drop everything so it rebuilds lazily.
-        *self.rendered_blocks.borrow_mut() = Vec::new();
-        *self.block_sigs.borrow_mut() = Vec::new();
     }
 
     fn fingerprint(&self) -> u64 {

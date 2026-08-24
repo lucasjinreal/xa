@@ -546,9 +546,12 @@ async fn run_login(name: Option<String>) -> Result<(), Box<dyn std::error::Error
 
 /// Resume a named session, or open the session picker when no id was given.
 async fn resume_session(id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = std::env::current_dir()
+        .map(|p| session::normalize_workspace(&p))
+        .unwrap_or_default();
     let id = match id {
         Some(id) => id,
-        None => match tui::resume::pick_session()? {
+        None => match tui::resume::pick_session(&workspace)? {
             Some(id) => id,
             None => return Ok(()),
         },

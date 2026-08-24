@@ -457,10 +457,7 @@ pub async fn run_conversation(
                 // dropout can make the model emit an empty completion). Both
                 // re-prompt with a plain "continue" turn to recover.
                 let no_output = text.trim().is_empty() && calls.is_empty();
-                // Only auto-continue if there's actually something wrong:
-                // either no output at all, or output that looks truncated
-                // (non-empty but stream didn't end cleanly).
-                if calls.is_empty() && auto_continues < MAX_AUTO_CONTINUE && (no_output || (!clean && !text.trim().is_empty())) {
+                if calls.is_empty() && (no_output || !clean) && auto_continues < MAX_AUTO_CONTINUE {
                     auto_continues += 1;
                     let reason = if text.trim().is_empty() {
                         "no output".to_string()

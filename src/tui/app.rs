@@ -21,6 +21,7 @@ use ratatui::{
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use unicode_width::UnicodeWidthChar;
 
 use crate::agent::{self, Provider, StreamEvent};
@@ -92,11 +93,13 @@ impl TerminalEventGuard {
 impl Drop for TerminalEventGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self
-                .tx
-                .blocking_send(AppEvent::Stream(StreamEvent::Error(
-                    "internal error: the agent task ended unexpectedly".into(),
-                )));
+            // Can't use blocking_send here — this Drop may fire on the async
+            // runtime main thread and Tokio forbids blocking it. Use non-
+            // blocking send; if the channel is full we simply lose the signal
+            // and rely on the next keypress or event loop iteration to recover.
+            let _ = self.tx.try_send(AppEvent::Stream(StreamEvent::Error(
+                "internal error: the agent task ended unexpectedly".into(),
+            )));
         }
     }
 }
@@ -196,6 +199,11 @@ pub struct App {
     agent_history: std::sync::Arc<std::sync::Mutex<Vec<agent::ChatMessage>>>,
     shimmer_start: Instant,
     dirty: bool,
+    /// Cache of per-cell heights from the last layout pass.
+    /// Key: (terminal_width, cell_count_at_cache_time).
+    /// Invalidated whenever cells are added/removed so completed-user cells
+    /// are never re-measured on every frame — the hot path for long sessions.
+    heights_cache: Option<(u16, usize, Vec<u16>)>,
     /// Active tool-call card index (during a streaming tool run) for grouping.
     active_think: Option<usize>,
     /// Timestamp of the last Ctrl-C press (for double-press-to-quit).
@@ -220,6 +228,9 @@ pub struct App {
     paste_blocks: Vec<String>,
     /// Shared flag checked by the agent loop to support ESC-to-interrupt.
     cancel_flag: Arc<AtomicBool>,
+    /// Handle to the currently-running agent task, used to forcibly abort it
+    /// on ESC so in-flight HTTP streams and tool processes don't keep going.
+    agent_task: Option<AbortHandle>,
     /// Last time any stream event arrived. The stall watchdog in the UI loop
     /// force-recovers a turn that somehow never delivers a terminal event.
     last_stream_activity: Instant,
@@ -256,6 +267,7 @@ impl App {
             agent_history: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shimmer_start: Instant::now(),
             dirty: true,
+            heights_cache: None,
             active_think: None,
             last_ctrl_c: None,
             slash_mode: false,
@@ -270,12 +282,14 @@ impl App {
             wizard: None,
             paste_blocks: Vec::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_task: None,
             last_stream_activity: Instant::now(),
         }
     }
 
     fn push_cell(&mut self, cell: Box<dyn crate::tui::cells::HistoryCell>) {
         self.cells.push(cell);
+        self.heights_cache = None;
         self.dirty = true;
         if self.auto_scroll {
             // `draw` derives the live bottom from the current layout. Keep a
@@ -343,9 +357,32 @@ impl App {
                     content: u.content.clone(),
                     tool_calls: None,
                     tool_call_id: None,
+                    blocks: Vec::new(),
                 });
             } else if let Some(tc) = c.as_any().downcast_ref::<ThinkingCell>() {
                 let tools = tc.tool_blocks();
+                // Collect interleaved blocks preserving the original order
+                // (text → tool → text → tool …). These are what the model
+                // actually emitted, so on resume the TUI can reconstruct the
+                // same layout instead of grouping all tools first.
+                let mut blocks: Vec<session::StoredBlock> = Vec::new();
+                for b in &tc.blocks {
+                    match b {
+                        crate::tui::cells::ThinkBlock::Text(s) => {
+                            if !s.is_empty() {
+                                blocks.push(session::StoredBlock::Text(s.clone()));
+                            }
+                        }
+                        crate::tui::cells::ThinkBlock::Tool(t) => {
+                            blocks.push(session::StoredBlock::Tool(session::StoredToolCall {
+                                id: t.tool_call_id.clone().unwrap_or_default(),
+                                name: t.tool_name.clone(),
+                                arguments: t.arguments.clone().unwrap_or_default(),
+                                diff: t.diff.clone(),
+                            }));
+                        }
+                    }
+                }
                 if !tools.is_empty() {
                     let stored_tcs: Vec<session::StoredToolCall> = tools
                         .iter()
@@ -354,6 +391,7 @@ impl App {
                                 id: t.tool_call_id.clone()?,
                                 name: t.tool_name.clone(),
                                 arguments: t.arguments.clone().unwrap_or_default(),
+                                diff: t.diff.clone(),
                             })
                         })
                         .collect();
@@ -364,6 +402,7 @@ impl App {
                             content: answer,
                             tool_calls: Some(stored_tcs.clone()),
                             tool_call_id: None,
+                            blocks: blocks.clone(),
                         });
                         for stc in &stored_tcs {
                             let output = tools
@@ -376,6 +415,7 @@ impl App {
                                 content: output,
                                 tool_calls: None,
                                 tool_call_id: Some(stc.id.clone()),
+                                blocks: Vec::new(),
                             });
                         }
                         // The assistant message above already includes the
@@ -391,6 +431,7 @@ impl App {
                         content: answer,
                         tool_calls: None,
                         tool_call_id: None,
+                        blocks: blocks,
                     });
                 }
             }
@@ -422,18 +463,22 @@ impl App {
         session::save(&self.session).is_ok()
     }
 
-    fn submit(&mut self, text: String) {
+    fn submit(&mut self, text: String, clear_input: bool) {
         self.path_completion_open = false;
         if text.starts_with('/') {
             self.handle_slash(&text);
-            self.input = TextArea::default();
-            self.paste_blocks.clear();
+            if clear_input {
+                self.input = TextArea::default();
+                self.paste_blocks.clear();
+            }
             return;
         }
 
         self.push_cell(Box::new(UserCell::new(text.clone())));
-        self.input = TextArea::default();
-        self.paste_blocks.clear();
+        if clear_input {
+            self.input = TextArea::default();
+            self.paste_blocks.clear();
+        }
         self.auto_scroll = true;
 
         {
@@ -453,7 +498,11 @@ impl App {
         self.think_filter.reset();
         self.cancel_flag.store(false, Ordering::SeqCst);
         self.set_stream_phase(StreamPhase::Waiting);
-        self.status.clear();
+        // Preserve any queued followup info in the footer; clear status only
+        // when nothing remains queued.
+        if self.queued_inputs.is_empty() {
+            self.status.clear();
+        }
         self.auto_continue_notice = None;
         self.dirty = true;
 
@@ -462,7 +511,7 @@ impl App {
         let agent_hist = self.agent_history.clone();
         let cancel = self.cancel_flag.clone();
         let assistant_idx = think_idx as u32;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let (stx, mut srx) = mpsc::channel::<StreamEvent>(64);
             let fwd = event_tx.clone();
             let forward = tokio::spawn(async move {
@@ -485,6 +534,7 @@ impl App {
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::Done)).await;
             let _ = event_tx.send(AppEvent::Stream(StreamEvent::InternalAssistIdx(assistant_idx))).await;
         });
+        self.agent_task = Some(task.abort_handle());
     }
 
     fn handle_stream(&mut self, se: StreamEvent) {
@@ -553,8 +603,12 @@ impl App {
                 // Do not auto-flush the queue after an interrupt/error — the
                 // user stopped this turn on purpose.
                 if !self.stream_phase.is_terminal() {
-                    if let Some(next) = self.queued_inputs.pop_front() {
-                        self.submit(next);
+                    if self.queued_inputs.len() > 0 {
+                        if let Some(next) = self.queued_inputs.pop_front() {
+                            // Don't clear the input bar here — it's already
+                            // empty (user pressed Tab to queue). Just submit.
+                            self.submit(next, false);
+                        }
                     }
                 }
                 self.dirty = true;
@@ -968,8 +1022,12 @@ impl App {
         match key.code {
             KeyCode::Esc if self.streaming => {
                 self.cancel_flag.store(true, Ordering::SeqCst);
+                self.streaming = false;
                 self.set_stream_phase(StreamPhase::Interrupted);
                 self.status.clear();
+                if let Some(handle) = self.agent_task.take() {
+                    handle.abort();
+                }
                 self.dirty = true;
             }
             KeyCode::PageUp => {
@@ -1004,7 +1062,8 @@ impl App {
                         self.queued_inputs.push_back(text);
                         self.input = TextArea::default();
                         self.paste_blocks.clear();
-                        self.status = format!("queued · {} pending", self.queued_inputs.len());
+                        // The queue preview is rendered in the footer; keep
+                        // status empty so the activity strip stays clear.
                         self.dirty = true;
                     }
                     return Ok(false);
@@ -1013,7 +1072,7 @@ impl App {
                 if !text.is_empty() {
                     self.history.push(text.clone());
                     self.history_idx = None;
-                    self.submit(text);
+                    self.submit(text, true);
                 } else if !self.paste_blocks.is_empty() {
                     self.paste_blocks.clear();
                     self.dirty = true;
@@ -1025,7 +1084,7 @@ impl App {
                     self.queued_inputs.push_back(text);
                     self.input = TextArea::default();
                     self.paste_blocks.clear();
-                    self.status = format!("queued · {} pending", self.queued_inputs.len());
+                    // Same as Tab — queue preview rendered in the footer.
                     self.dirty = true;
                 }
             }
@@ -1087,7 +1146,7 @@ impl App {
                 if let Some(cmd) = filtered.get(self.slash_selected).map(|c| c.name.to_string()) {
                     self.slash_mode = false;
                     self.slash_query.clear();
-                    self.submit(cmd);
+                    self.submit(cmd, true);
                 }
                 self.dirty = true;
             }
@@ -1584,6 +1643,7 @@ impl App {
         if area.height == 0 {
             return;
         }
+
         let label = if let Some(l) = self.stream_phase.label() {
             l
         } else if !self.status.is_empty() {
@@ -1636,17 +1696,41 @@ impl App {
                 Style::default().fg(theme::t().text_dim),
             ));
         }
+        if !self.queued_inputs.is_empty() {
+            let preview = self.queued_inputs.front()
+                .map(|s| {
+                    let s: String = s.chars().take(40).collect();
+                    if s.len() < self.queued_inputs.front().unwrap().len() {
+                        format!("{}...", s)
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("  ↳ {} followup · \"{}\"", self.queued_inputs.len(), preview),
+                Style::default().fg(theme::t().text_dim),
+            ));
+        }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Measure every cell once for this frame. Callers previously re-ran
     /// `desired_height` (full markdown + highlight) for total, then again per
     /// cell while painting — O(2N) of the hottest path.
-    fn cell_heights(&self, width: u16) -> Vec<u16> {
-        self.cells
-            .iter()
-            .map(|c| c.desired_height(width))
-            .collect()
+    ///
+    /// Result is cached by (width, cell_count) so completed-cell transcript
+    /// rows are never re-measured on every frame; only new or resized cells
+    /// trigger a rebuild.
+    fn cell_heights(&mut self, width: u16) -> Vec<u16> {
+        if let Some((cached_w, cached_n, ref heights)) = self.heights_cache {
+            if cached_w == width && cached_n == self.cells.len() {
+                return heights.clone();
+            }
+        }
+        let heights: Vec<u16> = self.cells.iter().map(|c| c.desired_height(width)).collect();
+        self.heights_cache = Some((width, self.cells.len(), heights.clone()));
+        heights
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame) {
@@ -1655,7 +1739,7 @@ impl App {
 
         // Activity strip sits *above* the input (Claude Code): Waiting /
         // Thinking / Responding. Footer under the input keeps model meta.
-        let show_activity = self.stream_phase.is_active() || !self.status.is_empty();
+        let show_activity = self.stream_phase.is_active() || self.streaming || !self.status.is_empty();
         let activity_h: u16 = if show_activity { 1 } else { 0 };
         // Unlike the slash menu, path suggestions reserve real layout space
         // *below* the composer. This keeps the text being typed unobscured.
@@ -1670,28 +1754,13 @@ impl App {
             0
         };
 
-        // Pre-compute the layout with a provisional height so we know the input
-        // width available for soft-wrapping.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),
-                Constraint::Length(1),  // padding above activity
-                Constraint::Length(activity_h),
-                Constraint::Length(1),  // padding below activity
-                Constraint::Length(3),
-                Constraint::Length(path_popup_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        self.input_area_width = chunks[4].width;
-
-        // Build the soft-wrapped composer copy now that we know the width, so
-        // the input block can grow vertically with the wrapped line count.
+        // Single layout pass: compute input_h from a provisional width, then
+        // use it for the final split. We need the width to wrap the composer
+        // text, so we do a quick preliminary split with the minimum input_h
+        // (3) to learn the width, then rebuild with the real height.
         let wrapped = self.wrapped_input();
         let input_lines = wrapped.lines().len().max(1) as u16;
         let paste_block_rows = self.paste_blocks.len() as u16;
-        // One blank padding row above and below the text; grows with content.
         let input_h = (input_lines + paste_block_rows + 2).clamp(3, 14);
 
         let chunks = Layout::default()
@@ -2002,13 +2071,6 @@ impl App {
                 Style::default().fg(theme::t().footer),
             ),
         ];
-        if !self.queued_inputs.is_empty() {
-            footer_spans.push(Span::styled(" • ", Style::default().fg(theme::t().footer)));
-            footer_spans.push(Span::styled(
-                format!("{} queued", self.queued_inputs.len()),
-                Style::default().fg(theme::t().footer),
-            ));
-        }
         // Silent-drop auto-recovery notice, shown last after provider/model.
         if let Some(notice) = &self.auto_continue_notice {
             footer_spans.push(Span::styled(" • ", Style::default().fg(theme::t().footer)));
@@ -2428,6 +2490,10 @@ async fn run_inner(
     }
 
     if !app.session.messages.is_empty() {
+        // Disable auto_scroll during the rebuild loop so push_cell doesn't
+        // fight with us. We re-enable it below so the user lands at the
+        // bottom after all cells are painted.
+        app.auto_scroll = false;
         let resumed = app.session.messages.clone();
         app.system_msg(format!("resumed session `{}`", app.session.id));
         let mut i = 0;
@@ -2446,7 +2512,56 @@ async fn run_inner(
                     // memory on resume.
                     i += 1;
                     let mut tc = ThinkingCell::new();
-                    if let Some(tool_calls) = &m.tool_calls {
+                    // Restore interleaved blocks if they were persisted
+                    // (newer sessions); otherwise fall back to the legacy
+                    // approach of grouping all tools first.
+                    if !m.blocks.is_empty() {
+                        for b in &m.blocks {
+                            match b {
+                                session::StoredBlock::Text(s) => {
+                                    if !s.is_empty() {
+                                        tc.add_text(s);
+                                    }
+                                }
+                                session::StoredBlock::Tool(stc) => {
+                                    let args_preview = args_preview(&stc.arguments);
+                                    let (path, read_offset, read_limit) =
+                                        tool_path_window(&stc.arguments);
+                                    tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                                        crate::tui::cells::ToolCallCell {
+                                            tool_name: stc.name.clone(),
+                                            args_preview,
+                                            status: crate::tui::cells::ToolStatus::Success,
+                                            output: None,
+                                            diff: stc.diff.clone(),
+                                            expanded: false,
+                                            path,
+                                            read_offset,
+                                            read_limit,
+                                            tool_call_id: Some(stc.id.clone()),
+                                            arguments: Some(stc.arguments.clone()),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        // Consume following tool-result messages and attach their
+                        // output to the matching tool card.
+                        while i < resumed.len() && resumed[i].role == "tool" {
+                            let tool_msg = &resumed[i];
+                            if let Some(tcid) = &tool_msg.tool_call_id {
+                                for b in tc.blocks.iter_mut() {
+                                    if let crate::tui::cells::ThinkBlock::Tool(ref mut tool) = b {
+                                        if tool.tool_call_id.as_deref() == Some(tcid.as_str()) {
+                                            tool.output = Some(tool_msg.content.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                    } else if let Some(tool_calls) = &m.tool_calls {
                         for stc in tool_calls {
                             let args_preview = args_preview(&stc.arguments);
                             let (path, read_offset, read_limit) = tool_path_window(&stc.arguments);
@@ -2456,7 +2571,7 @@ async fn run_inner(
                                     args_preview,
                                     status: crate::tui::cells::ToolStatus::Success,
                                     output: None,
-                                    diff: None,
+                                    diff: stc.diff.clone(),
                                     expanded: false,
                                     path,
                                     read_offset,
@@ -2489,7 +2604,10 @@ async fn run_inner(
                     let tail = filter.finish();
                     let mut text = visible;
                     text.push_str(&tail);
-                    if !text.is_empty() {
+                    // Only append trailing text if the cell has no stored
+                    // blocks yet (older sessions without interleaved blocks).
+                    // When blocks are present the text is already in the cell.
+                    if m.blocks.is_empty() && !text.is_empty() {
                         tc.add_text(&text);
                     }
                     tc.streaming = false;
@@ -2530,6 +2648,9 @@ async fn run_inner(
             })
             .collect();
         *app.agent_history.lock().unwrap() = hist;
+        // Re-enable auto-scroll so the transcript snaps to the bottom once
+        // the first draw finishes, giving a smooth "open at the latest msg" UX.
+        app.auto_scroll = true;
     }
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
