@@ -2298,7 +2298,7 @@ impl ThinkingCell {
         let mut rows = vec![Row::blank(width)]; // top padding
         let mut prev_kind: Option<BlockKind> = None;
 
-        // Group consecutive running Tool blocks into an inline group for rendering.
+        // Group ALL consecutive Tool blocks into a single inline group.
         let mut i = 0;
         while i < self.blocks.len() {
             let block_live = Some(i) == live_idx;
@@ -2312,32 +2312,31 @@ impl ThinkingCell {
                 rows.push(Row::blank(width));
             }
             prev_kind = Some(cur_kind);
-                // Collect consecutive Tool blocks for inline group rendering.
+                // Collect ALL consecutive Tool blocks for inline group rendering.
                 if let ThinkBlock::Tool(first) = &self.blocks[i] {
                     let first_tool = first.clone();
                     i += 1;
-                    // Check if next block is also a Tool (same batch).
-                    if i < self.blocks.len() {
-                        let mut group: Vec<ToolCallCell> = vec![first_tool];
-                        while i < self.blocks.len() {
-                            if let ThinkBlock::Tool(t) = &self.blocks[i] {
-                                group.push(t.clone());
-                                i += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        if group.len() > 1 {
-                            // Multi-tool group: render inline.
-                            let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
-                            rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
-                            continue;
+                    let mut group: Vec<ToolCallCell> = vec![first_tool];
+                    while i < self.blocks.len() {
+                        if let ThinkBlock::Tool(t) = &self.blocks[i] {
+                            group.push(t.clone());
+                            i += 1;
+                        } else {
+                            break;
                         }
                     }
-                    // Single tool: fall through to normal render.
-                    rows.extend(self.render_block_cached(&self.blocks[i.saturating_sub(1)], i.saturating_sub(1), width, ctx, block_live));
+                    // Always render as inline group (even single tool).
+                    let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
+                    rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
+                    continue;
                 } else {
-                    rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
+                    // Existing ToolGroup block — render inline.
+                    if let ThinkBlock::ToolGroup(existing_group) = &self.blocks[i] {
+                        let is_live = existing_group.iter().any(|t| t.status == ToolStatus::Running);
+                        rows.extend(render_group_inline(existing_group, width, if is_live { ctx } else { None }));
+                    } else {
+                        rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
+                    }
                     i += 1;
                 }
         }
