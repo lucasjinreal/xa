@@ -58,6 +58,14 @@ similar = "3.1.1"
 # Used by terminal light/dark detection (OSC 11 / termios on Unix).
 libc = "0.2"
 
+# Vendored fork of ratatui-markdown 0.3.6 with one fix: cache the tree-sitter
+# HighlightConfiguration per language instead of recompiling the highlights
+# query on every highlight() call (upstream cost ~25ms per call, which made
+# session resume and diff rendering take seconds). See
+# vendor/ratatui-markdown/src/highlight/treesitter.rs.
+[patch.crates-io]
+ratatui-markdown = { path = "vendor/ratatui-markdown" }
+
 [profile.release]
 opt-level = "z"
 strip = true

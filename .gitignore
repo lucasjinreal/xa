@@ -1,5 +1,6 @@
 /target
-/vendor
+/vendor/*
+!/vendor/ratatui-markdown
 /data
 .qoder/
 .agents/
@@ -8,3 +9,4 @@
 __pycache__/
 build/
 *.egg-info/
+vendor/

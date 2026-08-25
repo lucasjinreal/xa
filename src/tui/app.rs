@@ -539,6 +539,13 @@ impl App {
 
     fn handle_stream(&mut self, se: StreamEvent) {
         self.last_stream_activity = Instant::now();
+        // Stream events mutate cells *in place* (append text, add/finish tool
+        // cards) without changing `cells.len()`, so the app-level heights
+        // cache — keyed only on (width, cell_count) — would keep serving the
+        // height measured when this turn's ThinkingCell was still empty and
+        // clip every streamed frame to zero rows until the next push_cell.
+        // Drop it here; per-cell layout caches make re-measuring cheap.
+        self.heights_cache = None;
         match se {
             StreamEvent::Delta(s) => {
                 // Strip `<think>`…`</think>` from the transcript; drive phase.
@@ -755,6 +762,8 @@ impl App {
         if !self.streaming {
             return;
         }
+        // Appends an error block to a cell below — re-measure heights.
+        self.heights_cache = None;
         self.streaming = false;
         if !self.stream_phase.is_terminal() {
             self.set_stream_phase(StreamPhase::Error);

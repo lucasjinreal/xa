@@ -1254,8 +1254,19 @@ impl ToolCallCell {
 /// each changed line is shown with its line number and a colored background
 /// (green for additions, red for deletions) — no `+`/`-` prefix characters.
 /// Code content is syntax-highlighted via tree-sitter when the language is known.
+///
+/// All diff lines are highlighted in a **single** tree-sitter pass: calling
+/// the highlighter once per line made large diffs take seconds (each call paid
+/// per-call parser/query setup) and broke multi-line tokens across lines.
 fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option<&str>) -> Vec<Row> {
-    let mut rows = Vec::new();
+    struct DiffLine<'a> {
+        sign: &'static str,
+        content: &'a str,
+        ln: usize,
+    }
+
+    // First pass: strip headers, track hunk line numbers.
+    let mut lines: Vec<DiffLine<'_>> = Vec::new();
     let mut old_ln: usize = 0;
     let mut new_ln: usize = 0;
     for raw in diff.lines() {
@@ -1292,49 +1303,64 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option
             }
             _ => {}
         }
-        let (fg, bg) = match sign {
+        lines.push(DiffLine { sign, content, ln });
+    }
+
+    let ln_width = 5;
+    let content_w = (w as usize).saturating_sub(ln_width);
+
+    // One highlighter pass over all diff content, then split per line.
+    let highlighted: Option<Vec<Vec<Span<'static>>>> = lang.and_then(|lg| {
+        let joined = lines
+            .iter()
+            .map(|l| l.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if joined.is_empty() {
+            return None;
+        }
+        let per_line = highlight_lines_batched(lg, &joined);
+        // Empty result means "unknown language / nothing highlighted" — let
+        // the caller fall back to the plain (non-highlighted) rendering.
+        (!per_line.is_empty() && per_line.len() == lines.len()).then_some(per_line)
+    });
+
+    let mut rows = Vec::with_capacity(lines.len());
+    for (i, dl) in lines.iter().enumerate() {
+        let (fg, bg) = match dl.sign {
             "-" => (theme::t().diff_del, theme::t().diff_del_bg),
             "+" => (theme::t().diff_add, theme::t().diff_add_bg),
             _ => (theme::t().diff_meta, Color::Reset),
         };
-        let ln_style = if sign == " " || sign == "" {
+        let ln_style = if dl.sign == " " || dl.sign == "" {
             Style::default().fg(theme::t().text_hint)
         } else {
             Style::default().fg(fg).bg(bg)
         };
-        let ln_width = 5;
-        let content_w = (w as usize).saturating_sub(ln_width);
 
-        let mut line_spans = vec![Span::styled(format!("{:>4} ", ln), ln_style)];
+        let mut line_spans = vec![Span::styled(format!("{:>4} ", dl.ln), ln_style)];
 
-        if let Some(lg) = lang {
-            let bg_ov = if sign == "-" || sign == "+" { Some(bg) } else { None };
-            let mut hl_spans = highlight_code_spans(content, lg, bg_ov, content_w);
-            let visible_w: usize = hl_spans.iter()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                .sum();
-            if visible_w < content_w {
-                let pad_style = if sign == "-" || sign == "+" {
-                    Style::default().bg(bg)
-                } else {
-                    Style::default()
-                };
-                hl_spans.push(Span::styled(" ".repeat(content_w - visible_w), pad_style));
-            }
+        if let Some(per_line) = &highlighted {
+            let bg_ov = if dl.sign == "-" || dl.sign == "+" { Some(bg) } else { None };
+            let hl_spans = style_diff_code_line(
+                per_line[i].clone(),
+                bg_ov,
+                content_w,
+            );
             line_spans.extend(hl_spans);
         } else {
-            let content_style = if sign == " " || sign == "" {
+            let content_style = if dl.sign == " " || dl.sign == "" {
                 Style::default().fg(theme::t().diff_meta)
             } else {
                 Style::default().fg(fg).bg(bg)
             };
-            let padded = if content.len() < content_w {
-                format!("{:<width$}", content, width = content_w)
+            let padded = if dl.content.len() < content_w {
+                format!("{:<width$}", dl.content, width = content_w)
             } else {
-                content.to_string()
+                dl.content.to_string()
             };
             line_spans.push(Span::styled(padded, content_style));
-        };
+        }
 
         rows.push(Row::new(
             x,
@@ -1343,6 +1369,79 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option
         ));
     }
     rows
+}
+
+/// Highlight newline-joined `joined` in one tree-sitter pass and return the
+/// styled spans for each source line, splitting segments at newline
+/// boundaries. Returns an empty Vec when nothing could be highlighted.
+fn highlight_lines_batched(lang: &str, joined: &str) -> Vec<Vec<Span<'static>>> {
+    let segments = TS_HIGHLIGHTER.highlight(lang, joined);
+    let mut out: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    // Append `text` (which may contain newlines) to the current line list,
+    /// starting a new span list after every newline.
+    fn push_text(out: &mut Vec<Vec<Span<'static>>>, text: &str, style: Style) {
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                out.last_mut()
+                    .expect("at least one line present")
+                    .push(Span::styled(part.to_string(), style));
+            }
+            if parts.peek().is_some() {
+                out.push(Vec::new());
+            }
+        }
+    }
+
+    let mut cursor = 0usize;
+    for seg in &segments {
+        let end = seg.end.min(joined.len());
+        if seg.start > cursor {
+            // Defensive: uncovered source between segments renders unstyled.
+            push_text(&mut out, &joined[cursor..seg.start.min(end)], Style::default());
+        }
+        if end > cursor {
+            push_text(&mut out, &joined[cursor.max(seg.start)..end], seg.style);
+            cursor = end;
+        }
+    }
+    if cursor < joined.len() {
+        push_text(&mut out, &joined[cursor..], Style::default());
+    }
+    out
+}
+
+/// Apply diff-line styling (harsh-white remap, +/- background) to one line of
+/// batched highlight spans and pad it to the full row content width.
+fn style_diff_code_line(
+    mut spans: Vec<Span<'static>>,
+    bg_override: Option<Color>,
+    content_w: usize,
+) -> Vec<Span<'static>> {
+    for span in &mut spans {
+        if is_harsh_white_fg(span.style.fg) {
+            span.style = span.style.fg(theme::t().code_text);
+        }
+        if let Some(bg) = bg_override {
+            span.style = span.style.bg(bg);
+        }
+    }
+    let visible_w: usize = spans
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    if visible_w < content_w {
+        let pad_style = match bg_override {
+            Some(bg) => Style::default().bg(bg),
+            None => Style::default(),
+        };
+        spans.push(Span::styled(" ".repeat(content_w - visible_w), pad_style));
+    }
+    spans
 }
 
 /// Map a file path to a tree-sitter language name for syntax highlighting.
@@ -1369,50 +1468,6 @@ fn lang_from_path(path: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-
-/// Syntax-highlight a single line of code, returning styled spans.
-/// If `bg_override` is set, it replaces the background on every span (used for
-/// diff +/- lines that carry a green/red background).
-fn highlight_code_spans(code: &str, lang: &str, bg_override: Option<Color>, _max_w: usize) -> Vec<Span<'static>> {
-    let segments = TS_HIGHLIGHTER.highlight(lang, code);
-    if segments.is_empty() {
-        let style = if let Some(bg) = bg_override {
-            Style::default().fg(theme::t().code_text).bg(bg)
-        } else {
-            Style::default().fg(theme::t().code_text)
-        };
-        return vec![Span::styled(code.to_string(), style)];
-    }
-    let mut spans = Vec::new();
-    for seg in &segments {
-        // tree-sitter returns byte offsets; use bytes for slicing.
-        let end = seg.end.min(code.len());
-        let start = seg.start.min(end);
-        let text = code[start..end].to_string();
-        if text.is_empty() {
-            continue;
-        }
-        let mut style = if is_harsh_white_fg(seg.style.fg) {
-            seg.style.fg(theme::t().code_text)
-        } else {
-            seg.style
-        };
-        if let Some(bg) = bg_override {
-            style = style.bg(bg);
-        }
-        spans.push(Span::styled(text, style));
-    }
-    if spans.is_empty() {
-        let style = if let Some(bg) = bg_override {
-            Style::default().fg(theme::t().diff_meta).bg(bg)
-        } else {
-            Style::default().fg(theme::t().diff_meta)
-        };
-        spans.push(Span::styled(code.to_string(), style));
-    }
-    spans
-}
-
 
 /// Parse the line numbers out of a hunk header like `@@ -204,7 +204,7 @@`.
 fn parse_hunk_header(h: &str) -> Option<(usize, usize)> {
@@ -1858,6 +1913,83 @@ impl HistoryCell for ThinkingCell {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod resume_perf_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn fake_diff(lines: usize) -> String {
+        let mut s = String::from("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,5 @@\n");
+        for i in 0..lines {
+            match i % 3 {
+                0 => s.push_str(&format!("+fn added_line_{i}(x: usize) -> usize {{ x + {i} }}\n")),
+                1 => s.push_str(&format!("-fn removed_line_{i}(x: usize) -> usize {{ x * {i} }}\n")),
+                _ => s.push_str(&format!("  fn context_line_{i}(x: usize) -> usize {{ x }}\n")),
+            }
+        }
+        s
+    }
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Regression guard for the resume slowdown: diff rows must be produced
+    /// with ONE tree-sitter pass over the whole diff (plus the per-language
+    /// config cached in the vendored ratatui-markdown), never one highlighter
+    /// call per line. A 200-line diff once took ~5s; it must stay in the
+    /// low milliseconds.
+    #[test]
+    fn large_diff_rows_are_fast_and_complete() {
+        let diff = fake_diff(200);
+        let t = Instant::now();
+        let rows = build_diff_rows(&diff, 2, 100, "Edit", Some("rust"));
+        let elapsed = t.elapsed();
+
+        assert_eq!(rows.len(), 200);
+        // Every row keeps its line-number gutter and content.
+        let joined: Vec<String> = rows
+            .iter()
+            .map(|r| line_text(&r.line))
+            .collect();
+        assert!(joined.iter().any(|l| l.contains("added_line_0")));
+        assert!(joined.iter().any(|l| l.contains("removed_line_199")));
+        assert!(joined.iter().any(|l| l.contains("context_line_101")));
+
+        // First build pays one query compile; everything after is cache hits.
+        // Keep a generous bound so slow CI machines don't flake.
+        assert!(
+            elapsed.as_millis() < 500,
+            "build_diff_rows(200 lines) took {elapsed:?} — per-line highlighting regression?"
+        );
+    }
+
+    /// Batched splitting must preserve every source line and its content,
+    /// including empty lines and multi-line tokens.
+    #[test]
+    fn batched_highlight_splits_per_line() {
+        let code = "fn a() {}\n\nlet x = /* multi\nline */ 1;";
+        let per_line = highlight_lines_batched("rust", code);
+        assert_eq!(per_line.len(), 4, "one span-list per source line");
+
+        let texts: Vec<String> = per_line
+            .iter()
+            .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert_eq!(texts[0], "fn a() {}");
+        assert_eq!(texts[1], "", "empty line stays an empty list");
+        assert!(
+            texts[2].starts_with("let x = ") && texts[2].contains("/* multi"),
+            "comment start stays on its source line"
+        );
+        // The multi-line comment token is split across the newline boundary.
+        assert!(
+            texts[3].contains("line */") && texts[3].contains('1'),
+            "comment continuation lands on the next source line"
+        );
     }
 }
 
