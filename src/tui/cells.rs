@@ -2261,10 +2261,10 @@ impl ThinkingCell {
                     i += 1;
                     // Check if next block is also a Tool (same batch).
                     if i < self.blocks.len() {
-                        let mut group: Vec<&ToolCallCell> = vec![&first_tool];
+                        let mut group: Vec<ToolCallCell> = vec![first_tool];
                         while i < self.blocks.len() {
                             if let ThinkBlock::Tool(t) = &self.blocks[i] {
-                                group.push(t);
+                                group.push(t.clone());
                                 i += 1;
                             } else {
                                 break;
