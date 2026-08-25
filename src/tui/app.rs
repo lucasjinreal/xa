@@ -427,6 +427,16 @@ impl App {
                                 diff: t.diff.clone(),
                             }));
                         }
+                        crate::tui::cells::ThinkBlock::ToolGroup(items) => {
+                            for t in items {
+                                blocks.push(session::StoredBlock::Tool(session::StoredToolCall {
+                                    id: t.tool_call_id.clone().unwrap_or_default(),
+                                    name: t.tool_name.clone(),
+                                    arguments: t.arguments.clone().unwrap_or_default(),
+                                    diff: t.diff.clone(),
+                                }));
+                            }
+                        }
                     }
                 }
                 if !tools.is_empty() {
@@ -491,33 +501,46 @@ impl App {
         self.session.touch();
 
         // Auto-generate a session title from the first user message once
-        // there are at least 2 user turns (so we know the session is real).
+        // there is at least 1 user turn (so we know the session is real).
+        // If there are 2+ turns, also fire an LLM call for a nicer summary.
         if self.session.title == "untitled" {
             let user_msgs: Vec<&str> = self.cells.iter().filter_map(|c| {
                 c.as_any().downcast_ref::<UserCell>().map(|u| u.content.as_str())
             }).collect();
-            if user_msgs.len() >= 2 {
+            if !user_msgs.is_empty() {
                 let first = user_msgs[0];
                 // Keep a fallback title from the first user message text.
                 let fallback = truncate_chars(first.lines().next().unwrap_or("").trim(), 44);
                 self.session.title = fallback.clone();
                 // Record for the resume summary.
                 self.session.first_user_msg = first.to_string();
-                // Fire-and-forget LLM summary; overwrite only on success.
-                let prov = self.provider.clone();
-                let h = self.agent_history.lock().unwrap();
-                let msgs = serde_json::Value::Array(agent::messages_to_json(&h));
-                drop(h);
-                let session_id = self.session.id.clone();
-                tokio::spawn(async move {
-                    if let Some(summary) = generate_ai_title(&prov, &msgs).await {
-                        let mut s = session::load(&session_id).unwrap_or_default();
-                        if s.title == fallback {
-                            s.title = summary;
+                // Fire-and-forget LLM summary when we have enough context.
+                if user_msgs.len() >= 2 {
+                    let prov = self.provider.clone();
+                    let h = self.agent_history.lock().unwrap();
+                    let msgs = serde_json::Value::Array(agent::messages_to_json(&h));
+                    drop(h);
+                    let session_id = self.session.id.clone();
+                    tokio::spawn(async move {
+                        if let Some(summary) = generate_ai_title(&prov, &msgs).await {
+                            // Load first; if the file hasn't been persisted yet,
+                            // fall back to a fresh session with the known title.
+                            let mut s = session::load(&session_id).unwrap_or_else(|| {
+                                session::Session {
+                                    id: session_id,
+                                    title: fallback.clone(),
+                                    ..Default::default()
+                                }
+                            });
+                            // Only overwrite if the title is still the raw fallback
+                            // (user may have renamed via /save already).
+                            if s.title == fallback {
+                                s.title = summary;
+                            }
                             let _ = session::save(&s);
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -624,6 +647,14 @@ impl App {
                 }
 
                 if !visible.is_empty() {
+                    // Flush trailing tool blocks into a group before starting text.
+                    if let Some(i) = self.active_think {
+                        if let Some(tc) =
+                            self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>()
+                        {
+                            tc.flush_tool_blocks_to_group();
+                        }
+                    }
                     if let Some(i) = self.active_think {
                         if let Some(tc) =
                             self.cells[i].as_any_mut().downcast_mut::<ThinkingCell>()
@@ -2680,6 +2711,8 @@ async fn run_inner(
                     if m.blocks.is_empty() && !text.is_empty() {
                         tc.add_text(&text);
                     }
+                    // Flush trailing tools into groups for inline rendering.
+                    tc.flush_tool_blocks_to_group();
                     tc.streaming = false;
                     app.push_cell(Box::new(tc));
                 }
