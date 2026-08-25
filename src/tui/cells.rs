@@ -1409,6 +1409,12 @@ fn render_group_inline(
             skip_next_bash = false;
         }
 
+        // If first tool is bash, only render the "Ran(...)" part.
+        // Skip rendering other tools in header — they'll be shown in body.
+        if i > 0 && bash_idx == Some(0) {
+            continue;
+        }
+
         if i > 0 {
             spans.push(Span::styled("  │  ", Style::default().fg(theme::t().text_dim)));
         }
