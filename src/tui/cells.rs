@@ -2250,9 +2250,39 @@ impl ThinkingCell {
         let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
         let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
-        for (idx, b) in self.blocks.iter().enumerate() {
-            let live_block = Some(idx) == live_idx;
-            rows.extend(self.render_block_cached(b, idx, width, ctx, live_block));
+
+        // Group consecutive running Tool blocks into an inline group for rendering.
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let block_live = Some(i) == live_idx;
+                // Collect consecutive Tool blocks for inline group rendering.
+                if let ThinkBlock::Tool(first) = &self.blocks[i] {
+                    let first_tool = first.clone();
+                    i += 1;
+                    // Check if next block is also a Tool (same batch).
+                    if i < self.blocks.len() {
+                        let mut group: Vec<&ToolCallCell> = vec![&first_tool];
+                        while i < self.blocks.len() {
+                            if let ThinkBlock::Tool(t) = &self.blocks[i] {
+                                group.push(t);
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if group.len() > 1 {
+                            // Multi-tool group: render inline.
+                            let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
+                            rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
+                            continue;
+                        }
+                    }
+                    // Single tool: fall through to normal render.
+                    rows.extend(self.render_block_cached(&self.blocks[i.saturating_sub(1)], i.saturating_sub(1), width, ctx, block_live));
+                } else {
+                    rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
+                    i += 1;
+                }
         }
         // Streaming cursor: append to the last text row so it sits at the end
         // of the answer (not on its own row, which looked like a stray glyph /
