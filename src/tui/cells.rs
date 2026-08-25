@@ -1415,12 +1415,6 @@ fn render_group_inline(
             continue;
         }
 
-        // If there are multiple tools and first is NOT bash, only render the first one.
-        // Other tools will be shown in body lines below.
-        if items.len() > 1 && bash_idx != Some(0) && i > 0 {
-            continue;
-        }
-
         if i > 0 {
             spans.push(Span::styled("  │  ", Style::default().fg(theme::t().text_dim)));
         }
