@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::tui::render::RenderContext;
-use crate::tui::shimmer::{shimmer_spans, shimmer_spans_to};
+use crate::tui::shimmer::{shimmer_spans_to};
 use crate::tui::theme;
 
 /// Cached layout for a history cell at a given terminal width.
@@ -1165,7 +1165,7 @@ impl ToolCallCell {
                     };
                     let lang = self.path.as_deref().and_then(lang_from_path);
                     let mut shown = build_diff_rows(diff, x, w, label, lang);
-                    const MAX_DIFF_ROWS: usize = 200;
+                    const MAX_DIFF_ROWS: usize = 70;
                     const DIFF_HEAD_ROWS: usize = MAX_DIFF_ROWS / 2;
                     if shown.len() > MAX_DIFF_ROWS {
                         let omitted = shown.len() - MAX_DIFF_ROWS;
@@ -1248,6 +1248,355 @@ impl ToolCallCell {
         
         rows
     }
+}
+
+/// Color blend helper for shimmer animation.
+fn to_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::White => (255, 255, 255),
+        Color::Gray => (190, 190, 190),
+        Color::DarkGray => (110, 110, 110),
+        Color::Black => (0, 0, 0),
+        _ => (128, 128, 128),
+    }
+}
+
+/// Check whether a group contains any edit/write tool.
+/// If so, we skip single-row merging so diffs stay readable.
+fn group_contains_edit(items: &[ToolCallCell]) -> bool {
+    items.iter().any(|t| matches!(t.tool_name.as_str(), "edit" | "write"))
+}
+
+/// Render a compact one-line summary of a tool's result for the group view.
+fn result_summary(item: &ToolCallCell) -> Option<Span<'static>> {
+    match item.status {
+        ToolStatus::Failed => {
+            let msg = item.output.as_deref().and_then(|s| s.lines().next()).unwrap_or("error");
+            Some(Span::styled(
+                format!(" ✗{msg}"),
+                Style::default().fg(theme::t().error),
+            ))
+        }
+        ToolStatus::Running => None,
+        ToolStatus::Success => match item.tool_name.as_str() {
+            "read" => {
+                let n = if let Some(out) = item.output.as_deref() {
+                    out.lines().count()
+                } else {
+                    0
+                };
+                Some(Span::styled(
+                    format!(" → {n} lines"),
+                    Style::default().fg(theme::t().text_hint),
+                ))
+            }
+            "edit" | "write" => {
+                if let Some(diff) = item.diff.as_deref() {
+                    let (added, removed) = diff_change_counts(diff);
+                    if added > 0 || removed > 0 {
+                        return Some(Span::styled(
+                            format!(" +{added} -{removed}"),
+                            Style::default().fg(theme::t().text_hint),
+                        ));
+                    }
+                }
+                None
+            }
+            _ => {
+                if let Some(out) = item.output.as_deref() {
+                    let first = out.lines().next().unwrap_or("");
+                    let s = if first.len() > 35 {
+                        format!("…{}]", &first[..35])
+                    } else {
+                        first.to_string()
+                    };
+                    Some(Span::styled(
+                        format!(" → {s}"),
+                        Style::default().fg(theme::t().text_hint),
+                    ))
+                } else {
+                    None
+                }
+            }
+        },
+    }
+}
+
+/// Render a group of tool cells into a single compact line (no edit/write present).
+/// Codex-style: all commands joined with &&, outputs below.
+/// Format:
+///   ▪ Ran cmd1 && cmd2 && cmd3 │ read(path) │ ...
+///   └ src/file.ts:47:  loadTaskById(...)
+///     … +193 lines (ctrl + t to view transcript)
+///     M src/pages/EditorPage.tsx
+fn render_group_inline(
+    items: &[ToolCallCell],
+    width: u16,
+    ctx: Option<&RenderContext>,
+) -> Vec<Row> {
+    let indent = THINK_INDENT;
+    let body_indent = indent + 2;
+    let row_w = width.saturating_sub(indent).max(1);
+    let body_w = width.saturating_sub(body_indent).max(1);
+
+    // ---- Header line: collect all bash args, then render tools ----
+    let bash_idx = items.iter().position(|t| t.tool_name == "bash");
+
+    // Collect all bash arg texts for the joined command.
+    let bash_args_text: Vec<String> = match bash_idx {
+        Some(idx) => {
+            items.iter().skip(idx).take_while(|t| t.tool_name == "bash")
+                .map(|t| t.header_arg_text())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let joined_bash = bash_args_text.join(" && ");
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  │  ", Style::default().fg(theme::t().text_dim)));
+        }
+
+        let is_running = item.status == ToolStatus::Running;
+        let icon_color = match item.status {
+            ToolStatus::Running => theme::t().accent,
+            ToolStatus::Success => theme::t().text,
+            ToolStatus::Failed => theme::t().error,
+        };
+        let icon = if is_running { "▸" } else { "▪" };
+
+        // Decide what to display: bash at position of first bash → "Ran joined_cmds"; other tools → normal.
+        let (display_name, display_args) = if item.tool_name == "bash" && i == bash_idx.unwrap_or(usize::MAX) {
+            // First bash in group: show "Ran" + all joined bash args.
+            let args_display = if joined_bash.chars().count() > 38 {
+                format!("{}...", joined_bash.chars().take(38).collect::<String>())
+            } else {
+                joined_bash.clone()
+            };
+            ("Ran".to_string(), args_display)
+        } else {
+            // Other tools: normal short name + arg.
+            let short_name = if item.tool_name.len() > 3 {
+                format!("{}…", &item.tool_name[..3])
+            } else {
+                item.tool_name.clone()
+            };
+            let args_text = item.header_arg_text();
+            let max_len = if item.tool_name == "bash" { 32 } else { 38 };
+            let truncated = args_text.chars().count() > max_len;
+            let args_display = if truncated {
+                format!("{}...", args_text.chars().take(max_len).collect::<String>())
+            } else {
+                args_text
+            };
+            (short_name, args_display)
+        };
+
+        let args_style = if display_args.chars().count() > 38 || (display_name == "Ran" && joined_bash.chars().count() > 38) {
+            Style::default().fg(theme::t().text_hint)
+        } else {
+            Style::default().fg(theme::t().text_dim)
+        };
+
+        // Icon + name + args.
+        spans.push(Span::styled(
+            format!("{icon} {display_name}("),
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+        ));
+
+        // Args with shimmer if running.
+        if is_running {
+            if let Some(c) = ctx {
+                let phase = c.shimmer_phase;
+                let len = display_args.chars().count().max(1) as f32;
+                for (j, ch) in display_args.chars().enumerate() {
+                    let pos = j as f32 / len;
+                    let dist = (pos - phase).abs().min(1.0 - (pos - phase).abs());
+                    let highlight = (1.0 - dist * 4.0).clamp(0.0, 1.0);
+                    let (br, bg, bb) = to_rgb(args_style.fg.unwrap_or(theme::t().text));
+                    let (tr, tg, tb) = to_rgb(theme::t().accent);
+                    let r = (br as f32 + (tr as f32 - br as f32) * highlight) as u8;
+                    let g = (bg as f32 + (tg as f32 - bg as f32) * highlight) as u8;
+                    let b = (bb as f32 + (tb as f32 - bb as f32) * highlight) as u8;
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(Color::Rgb(r, g, b)),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(display_args, args_style));
+            }
+        } else {
+            spans.push(Span::styled(display_args, args_style));
+        }
+
+        // Close paren.
+        spans.push(Span::styled(")", args_style));
+    }
+
+    let mut rows = if spans.is_empty() {
+        vec![Row::blank(width)]
+    } else {
+        vec![Row::new(indent, row_w, Line::from(spans))]
+    };
+
+    // ---- Body lines: each tool's output below ----
+    for item in items {
+        match item.status {
+            ToolStatus::Running => {
+                // Running tools show a simple indicator.
+                rows.push(Row::new(
+                    body_indent,
+                    body_w,
+                    Line::from(vec![
+                        Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
+                        Span::styled(
+                            format!("{}… running", item.tool_name),
+                            Style::default().fg(theme::t().accent),
+                        ),
+                    ]),
+                ));
+            }
+            ToolStatus::Failed => {
+                let msg = item.output.as_deref().and_then(|s| s.lines().next()).unwrap_or("error");
+                rows.push(Row::new(
+                    body_indent,
+                    body_w,
+                    Line::from(vec![
+                        Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
+                        Span::styled(
+                            format!("{}", msg),
+                            Style::default().fg(theme::t().error),
+                        ),
+                    ]),
+                ));
+            }
+            ToolStatus::Success => match item.tool_name.as_str() {
+                "read" => {
+                    if let Some(output) = &item.output {
+                        let lines: Vec<&str> = output.lines().collect();
+                        let total = lines.len();
+                        // Show first few lines with line numbers.
+                        let preview_lines = lines.iter().take(5).enumerate();
+                        for (idx, line) in preview_lines {
+                            rows.push(Row::new(
+                                body_indent + 2,
+                                body_w.saturating_sub(2),
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!("{:>4}: ", idx + 1),
+                                        Style::default().fg(theme::t().text_hint),
+                                    ),
+                                    Span::styled(
+                                        line.to_string(),
+                                        Style::default().fg(theme::t().text_dim),
+                                    ),
+                                ]),
+                            ));
+                        }
+                        if total > 5 {
+                            rows.push(Row::new(
+                                body_indent + 2,
+                                body_w.saturating_sub(2),
+                                Line::from(vec![
+                                    Span::styled("  ", Style::default().fg(theme::t().text_dim)),
+                                    Span::styled(
+                                        format!("… +{} lines", total - 5),
+                                        Style::default().fg(theme::t().text_hint),
+                                    ),
+                                    Span::styled(
+                                        " (ctrl+t to view transcript)",
+                                        Style::default().fg(theme::t().text_dim),
+                                    ),
+                                ]),
+                            ));
+                        }
+                    } else {
+                        rows.push(Row::new(
+                            body_indent,
+                            body_w,
+                            Line::from(vec![
+                                Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
+                                Span::styled(
+                                    "0 lines",
+                                    Style::default().fg(theme::t().text_dim),
+                                ),
+                            ]),
+                        ));
+                    }
+                }
+                "edit" | "write" => {
+                    if let Some(diff) = &item.diff {
+                        let (added, removed) = diff_change_counts(diff);
+                        let file_path = item.path.as_deref().unwrap_or("").to_string();
+                        if added > 0 || removed > 0 {
+                            // Show file path with change summary.
+                            rows.push(Row::new(
+                                body_indent,
+                                body_w,
+                                Line::from(vec![
+                                    Span::styled("M ", Style::default().fg(theme::t().diff_add)),
+                                    Span::styled(
+                                        file_path.clone(),
+                                        Style::default().fg(theme::t().text),
+                                    ),
+                                    Span::styled(
+                                        format!(" (+{added} -{removed})"),
+                                        Style::default().fg(theme::t().text_hint),
+                                    ),
+                                ]),
+                            ));
+                        } else {
+                            // No changes.
+                            rows.push(Row::new(
+                                body_indent,
+                                body_w,
+                                Line::from(vec![
+                                    Span::styled("U ", Style::default().fg(theme::t().text_dim)),
+                                    Span::styled(file_path, Style::default().fg(theme::t().text_dim)),
+                                ]),
+                            ));
+                        }
+                    } else {
+                        let file_path = item.path.as_deref().unwrap_or("").to_string();
+                        rows.push(Row::new(
+                            body_indent,
+                            body_w,
+                            Line::from(vec![
+                                Span::styled("✓ ", Style::default().fg(theme::t().text_dim)),
+                                Span::styled(file_path, Style::default().fg(theme::t().text_dim)),
+                            ]),
+                        ));
+                    }
+                }
+                _ => {
+                    // For other tools, show first line of output or a summary.
+                    if let Some(output) = &item.output {
+                        let first_line = output.lines().next().unwrap_or("");
+                        let display = if first_line.len() > (body_w as usize).saturating_sub(4) {
+                            format!("…{}", &first_line[..(body_w as usize).saturating_sub(4) - 1])
+                        } else {
+                            first_line.to_string()
+                        };
+                        rows.push(Row::new(
+                            body_indent,
+                            body_w,
+                            Line::from(vec![
+                                Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
+                                Span::styled(display, Style::default().fg(theme::t().text_dim)),
+                            ]),
+                        ));
+                    }
+                }
+            },
+        }
+    }
+
+    rows
 }
 
 /// Parse a unified `git diff` into a compact, line-numbered edit view:
@@ -1533,12 +1882,22 @@ fn diff_change_summary(diff: &str) -> String {
 pub enum ThinkBlock {
     Text(String),
     Tool(ToolCallCell),
+    /// A group of tool calls that ran in the same batch (parallel execution).
+    /// Rendered as one compact line (or separate rows if any is edit/write).
+    ToolGroup(Vec<ToolCallCell>),
 }
 
 impl ThinkBlock {
     fn as_tool_mut(&mut self) -> Option<&mut ToolCallCell> {
         match self {
             ThinkBlock::Tool(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn as_tool_group_mut(&mut self) -> Option<&mut Vec<ToolCallCell>> {
+        match self {
+            ThinkBlock::ToolGroup(g) => Some(g),
             _ => None,
         }
     }
@@ -1584,6 +1943,17 @@ fn block_sig(b: &ThinkBlock, width: u16) -> u64 {
             t.diff.hash(&mut h);
             t.expanded.hash(&mut h);
         }
+        ThinkBlock::ToolGroup(items) => {
+            b'G'.hash(&mut h);
+            items.len().hash(&mut h);
+            for item in items {
+                item.tool_name.hash(&mut h);
+                (item.status as u8).hash(&mut h);
+                item.path.hash(&mut h);
+                item.output.hash(&mut h);
+                item.diff.hash(&mut h);
+            }
+        }
     }
     h.finish()
 }
@@ -1622,11 +1992,10 @@ impl ThinkingCell {
 
     /// True when a tool header still needs the shimmer animation.
     fn has_running_tool(&self) -> bool {
-        self.blocks.iter().any(|b| {
-            matches!(
-                b,
-                ThinkBlock::Tool(t) if t.status == ToolStatus::Running
-            )
+        self.blocks.iter().any(|b| match b {
+            ThinkBlock::Tool(t) => t.status == ToolStatus::Running,
+            ThinkBlock::ToolGroup(items) => items.iter().any(|t| t.status == ToolStatus::Running),
+            _ => false,
         })
     }
 
@@ -1668,9 +2037,25 @@ impl ThinkingCell {
         self.bump_layout();
     }
 
-    /// Mark the most recent still-running tool card as finished.
+    /// Mark the most recent still-running tool card (or group) as finished.
     pub fn finish_tool(&mut self, output: Option<String>, is_error: bool, diff: Option<String>) {
+        // Walk blocks in reverse, trying groups first (most recent group),
+        // then falling back to a single tool block.
         for b in self.blocks.iter_mut().rev() {
+            if let Some(items) = b.as_tool_group_mut() {
+                if let Some(t) = items.iter_mut().rev().find(|t| t.status == ToolStatus::Running) {
+                    t.status = if is_error {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Success
+                    };
+                    t.output = output;
+                    t.diff = diff;
+                    t.expanded = is_error || t.diff.is_some() || t.tool_name == "read";
+                    self.bump_layout();
+                    return;
+                }
+            }
             if let Some(t) = b.as_tool_mut() {
                 if t.status == ToolStatus::Running {
                     t.status = if is_error {
@@ -1680,14 +2065,36 @@ impl ThinkingCell {
                     };
                     t.output = output;
                     t.diff = diff;
-                    // Auto-expand on failure, when we have a diff to show, or for
-                    // reads (so the `→ Read` header is visible).
                     t.expanded = is_error || t.diff.is_some() || t.tool_name == "read";
                     self.bump_layout();
                     return;
                 }
             }
         }
+    }
+
+    /// Flush trailing consecutive tool blocks into a single ToolGroup.
+    /// Called before appending a new text block so parallel calls appear as one unit.
+    /// Groups containing edit/write are NOT merged — they need their own expanded view.
+    pub fn flush_tool_blocks_to_group(&mut self) {
+        let mut tools: Vec<ToolCallCell> = Vec::new();
+        while matches!(self.blocks.last(), Some(ThinkBlock::Tool(_))) {
+            if let Some(ThinkBlock::Tool(t)) = self.blocks.pop() {
+                tools.push(t);
+            }
+        }
+        if tools.is_empty() {
+            return;
+        }
+        // Keep edit/write tools as separate blocks so diffs render expanded.
+        if group_contains_edit(&tools) {
+            for t in tools.into_iter().rev() {
+                self.blocks.push(ThinkBlock::Tool(t));
+            }
+            return;
+        }
+        tools.reverse();
+        self.blocks.push(ThinkBlock::ToolGroup(tools));
     }
 
     /// Concatenated assistant text (for session persistence).
@@ -1703,13 +2110,15 @@ impl ThinkingCell {
 
     /// References to every tool-call card in order (for session persistence).
     pub fn tool_blocks(&self) -> Vec<&ToolCallCell> {
-        self.blocks
-            .iter()
-            .filter_map(|b| match b {
-                ThinkBlock::Tool(t) => Some(t),
-                _ => None,
-            })
-            .collect()
+        let mut out = Vec::new();
+        for b in &self.blocks {
+            match b {
+                ThinkBlock::Tool(t) => out.push(t),
+                ThinkBlock::ToolGroup(items) => out.extend(items.iter()),
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Render a single text block's markdown into rows (no cursor/padding).
@@ -1772,6 +2181,7 @@ impl ThinkingCell {
         if live_block {
             return match b {
                 ThinkBlock::Tool(t) => t.build(width, ctx),
+                ThinkBlock::ToolGroup(items) => render_group_inline(items, width, ctx),
                 ThinkBlock::Text(text) => self.render_text_block(text, width),
             };
         }
@@ -1787,6 +2197,7 @@ impl ThinkingCell {
         }
         let rows = match b {
             ThinkBlock::Tool(t) => t.build(width, ctx),
+            ThinkBlock::ToolGroup(items) => render_group_inline(items, width, ctx),
             ThinkBlock::Text(text) => self.render_text_block(text, width),
         };
         let mut sigs = self.block_sigs.borrow_mut();
@@ -1800,11 +2211,13 @@ impl ThinkingCell {
         rows
     }
 
-    /// Index of the single still-running tool card, if any.
+    /// Index of the single still-running tool card/group, if any.
     fn running_tool_idx(&self) -> Option<usize> {
-        self.blocks
-            .iter()
-            .position(|b| matches!(b, ThinkBlock::Tool(t) if t.status == ToolStatus::Running))
+        self.blocks.iter().enumerate().find_map(|(i, b)| match b {
+            ThinkBlock::Tool(t) if t.status == ToolStatus::Running => Some(i),
+            ThinkBlock::ToolGroup(items) if items.iter().any(|t| t.status == ToolStatus::Running) => Some(i),
+            _ => None,
+        })
     }
 
     fn build(&self, width: u16, ctx: Option<&RenderContext>) -> Vec<Row> {
@@ -1826,7 +2239,7 @@ impl ThinkingCell {
         // of the answer (not on its own row, which looked like a stray glyph /
         // broken line break after the message). Skip full-width code bars.
         if self.streaming {
-            let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)));
+            let tail_is_tool = matches!(self.blocks.last(), Some(ThinkBlock::Tool(_)) | Some(ThinkBlock::ToolGroup(_)));
             if !tail_is_tool {
                 let cursor = Span::styled("█", Style::default().fg(theme::t().accent));
                 let mut glued = false;
