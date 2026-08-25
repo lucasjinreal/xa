@@ -352,7 +352,7 @@ pub async fn interactive_configure(mut ask: impl FnMut(&str) -> String) -> Provi
 
 /// Serialize our `ChatMessage` history into OpenAI-compatible `messages`,
 /// preserving tool calls (`tool_calls`) and tool results (`tool_call_id`).
-fn messages_to_json(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+pub fn messages_to_json(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|m| {
@@ -688,7 +688,6 @@ async fn stream_completion_with_retry(
     Err(last_err)
 }
 
-/// Stream one completion from `provider`. Forwards text deltas to `tx` and
 /// returns the accumulated `(text, tool_calls)` for the turn. Uses raw SSE
 /// over reqwest so any custom OpenAI-compatible endpoint works.
 async fn stream_completion(

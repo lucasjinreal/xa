@@ -182,7 +182,7 @@ impl Theme {
             shimmer_peak: Color::Rgb(255, 255, 255),
             success: Color::Rgb(0x9E, 0xCE, 0x6A),
             error: Color::Rgb(0xF7, 0x76, 0x8E),
-            warning: gold,
+            warning: mid,
             // Diff — low saturation (Edit tool).
             diff_add: Color::Rgb(0x9E, 0xCE, 0x6A), // #9ECE6A
             diff_del: Color::Rgb(0xF7, 0x76, 0x8E), // #F7768E
@@ -262,7 +262,7 @@ impl Theme {
             shimmer_peak: accent,
             success: Color::Rgb(0x3D, 0x8B, 0x40),
             error: Color::Rgb(0xC4, 0x3E, 0x55),
-            warning: gold,
+            warning: mid,
             diff_add: Color::Rgb(0x3D, 0x8B, 0x40),
             diff_del: Color::Rgb(0xC4, 0x3E, 0x55),
             diff_meta: mid,

@@ -45,7 +45,7 @@ pub struct StoredMessage {
     pub blocks: Vec<StoredBlock>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Session {
     pub id: String,
     pub title: String,
@@ -63,6 +63,9 @@ pub struct Session {
     pub output_filter_calls: Vec<crate::output_filter::ToolOutputStats>,
     #[serde(default, skip_serializing_if = "ApiTokenUsage::is_empty")]
     pub api_token_usage: ApiTokenUsage,
+    /// The raw first user message, stored so the resume picker can show it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub first_user_msg: String,
 }
 
 /// Lightweight metadata used by session lists and the resume picker. Reading
@@ -76,6 +79,9 @@ pub struct SessionSummary {
     /// Workspace directory where this session was last used, if recorded.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The raw first user message, stored so the resume picker can show it.
+    #[serde(default)]
+    pub first_user_msg: String,
 }
 
 /// Session data used by `xa gain`; message bodies are intentionally omitted.
@@ -290,6 +296,7 @@ impl Session {
             workspace: None,
             output_filter_calls: Vec::new(),
             api_token_usage: ApiTokenUsage::default(),
+            first_user_msg: String::new(),
         }
     }
 

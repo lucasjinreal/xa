@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-
 use dirs;
 use crossterm::{
     event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind},
@@ -146,6 +145,53 @@ mod tests {
     fn title_truncation_leaves_short_unicode_text_intact() {
         assert_eq!(truncate_chars("中文标题", 44), "中文标题");
     }
+}
+
+/// Call the LLM to produce a concise session title from the conversation history.
+/// Returns `None` on any failure so we never overwrite a user-set title.
+async fn generate_ai_title(
+    provider: &Provider,
+    messages: &serde_json::Value,
+) -> Option<String> {
+    let system = serde_json::json!({
+        "role": "system",
+        "content": "You are a session-title summarizer. Given the conversation history below,\
+         produce a single concise title (max 44 characters, no quotes). Prefer\
+         the first user request's topic. If it is a code task, name the file or\
+         goal; if it is a question, name the subject. Output ONLY the title —\
+         no explanation."
+    });
+    let mut msgs = vec![system];
+    if let Some(arr) = messages.as_array() {
+        msgs.extend(arr.clone());
+    }
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": &provider.model,
+        "stream": false,
+        "messages": msgs,
+    });
+    let resp = client
+        .post(provider.chat_url())
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    let text = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())?;
+    let t: String = text.lines().next()?.trim().chars().take(44).collect();
+    (!t.is_empty()).then_some(t)
 }
 
 /// Information printed after leaving the alternate-screen TUI. Keeping this
@@ -452,11 +498,26 @@ impl App {
             }).collect();
             if user_msgs.len() >= 2 {
                 let first = user_msgs[0];
-                let title = first.lines().next().unwrap_or("").trim();
-                let title = truncate_chars(title, 44);
-                if !title.is_empty() {
-                    self.session.title = title;
-                }
+                // Keep a fallback title from the first user message text.
+                let fallback = truncate_chars(first.lines().next().unwrap_or("").trim(), 44);
+                self.session.title = fallback.clone();
+                // Record for the resume summary.
+                self.session.first_user_msg = first.to_string();
+                // Fire-and-forget LLM summary; overwrite only on success.
+                let prov = self.provider.clone();
+                let h = self.agent_history.lock().unwrap();
+                let msgs = serde_json::Value::Array(agent::messages_to_json(&h));
+                drop(h);
+                let session_id = self.session.id.clone();
+                tokio::spawn(async move {
+                    if let Some(summary) = generate_ai_title(&prov, &msgs).await {
+                        let mut s = session::load(&session_id).unwrap_or_default();
+                        if s.title == fallback {
+                            s.title = summary;
+                            let _ = session::save(&s);
+                        }
+                    }
+                });
             }
         }
 

@@ -485,6 +485,9 @@ pub async fn call_tool(
     if name == "bash" {
         return run_bash(arg_str(&args, "command")?.to_string(), cancel).await;
     }
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("tool cancelled".into());
+    }
     let tool = find_tool(name, tools)
         .ok_or_else(|| format!("unknown tool: {name}"))?
         .clone();

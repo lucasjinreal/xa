@@ -197,14 +197,14 @@ fn draw(
     let current_ws = std::env::current_dir()
         .map(|p| normalize_workspace(&p))
         .unwrap_or_default();
-    let mut lines = Vec::with_capacity(end - start);
+    let mut lines = Vec::with_capacity((end - start) * 2);
     for (index, summary) in sessions[start..end].iter().enumerate() {
         let index = start + index;
         let active = index == selected;
-        let title = if summary.title == "untitled" {
-            "Untitled session"
+        let title_span = if summary.title == "untitled" {
+            Span::styled("Untitled session", Style::default().fg(theme::t().text_dim))
         } else {
-            &summary.title
+            Span::styled(&summary.title, Style::default().fg(theme::t().text))
         };
         let prefix = if active { "›" } else { " " };
         // Show a small tag for sessions from a different workspace.
@@ -217,6 +217,19 @@ fn draw(
         } else {
             " · no workspace".to_string()
         };
+        // First user message as a secondary hint.
+        let first_msg = summary.first_user_msg.trim();
+        let snippet = if first_msg.is_empty() {
+            String::new()
+        } else {
+            let w = (area.width as usize).saturating_sub(28).max(10);
+            let line: String = first_msg.lines().next().unwrap_or("").chars().take(w).collect();
+            if line.len() < first_msg.lines().next().map(|l| l.len()).unwrap_or(0) {
+                format!("{}…", line)
+            } else {
+                line
+            }
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{prefix} {:<9}", session::relative_time(summary.updated)),
@@ -224,14 +237,20 @@ fn draw(
                     .fg(if active { theme::t().accent } else { theme::t().text_dim })
                     .bg(if active { theme::t().select_bg } else { theme::t().bg }),
             ),
-            Span::styled(
-                format!("{}{}", title, ws_tag),
-                Style::default()
-                    .fg(theme::t().text)
-                    .bg(if active { theme::t().select_bg } else { theme::t().bg })
-                    .add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
-            ),
+            title_span,
+            Span::styled(ws_tag, Style::default().fg(theme::t().text_dim)),
         ]));
+        if !snippet.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
+                Span::styled(
+                    snippet,
+                    Style::default()
+                        .fg(if active { theme::t().accent_dim } else { theme::t().text_dim })
+                        .bg(if active { theme::t().select_bg } else { theme::t().bg }),
+                ),
+            ]));
+        }
     }
     frame.render_widget(Paragraph::new(lines), sections[2]);
     frame.render_widget(
