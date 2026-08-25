@@ -204,7 +204,8 @@ fn draw(
         let title_span = if summary.title == "untitled" {
             Span::styled("Untitled session", Style::default().fg(theme::t().text_dim))
         } else {
-            Span::styled(&summary.title, Style::default().fg(theme::t().text))
+            let title = summary.title.lines().next().unwrap_or("").trim();
+            Span::styled(title, Style::default().fg(theme::t().text))
         };
         let prefix = if active { "›" } else { " " };
         // Show a small tag for sessions from a different workspace.
@@ -217,19 +218,6 @@ fn draw(
         } else {
             " · no workspace".to_string()
         };
-        // First user message as a secondary hint.
-        let first_msg = summary.first_user_msg.trim();
-        let snippet = if first_msg.is_empty() {
-            String::new()
-        } else {
-            let w = (area.width as usize).saturating_sub(28).max(10);
-            let line: String = first_msg.lines().next().unwrap_or("").chars().take(w).collect();
-            if line.len() < first_msg.lines().next().map(|l| l.len()).unwrap_or(0) {
-                format!("{}…", line)
-            } else {
-                line
-            }
-        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{prefix} {:<9}", session::relative_time(summary.updated)),
@@ -240,17 +228,6 @@ fn draw(
             title_span,
             Span::styled(ws_tag, Style::default().fg(theme::t().text_dim)),
         ]));
-        if !snippet.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
-                Span::styled(
-                    snippet,
-                    Style::default()
-                        .fg(if active { theme::t().accent_dim } else { theme::t().text_dim })
-                        .bg(if active { theme::t().select_bg } else { theme::t().bg }),
-                ),
-            ]));
-        }
     }
     frame.render_widget(Paragraph::new(lines), sections[2]);
     frame.render_widget(
