@@ -1392,8 +1392,23 @@ fn render_group_inline(
     let joined_bash = bash_args_text.join(" && ");
 
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut skip_next_bash = false;
 
     for (i, item) in items.iter().enumerate() {
+        // Skip bash tools that are part of the joined command (except first).
+        if item.tool_name == "bash" {
+            if skip_next_bash {
+                skip_next_bash = false;
+                continue; // Skip this bash entirely.
+            }
+            if i > bash_idx.unwrap_or(0) {
+                skip_next_bash = true;
+                continue; // Skip non-first bash in sequence.
+            }
+        } else {
+            skip_next_bash = false;
+        }
+
         if i > 0 {
             spans.push(Span::styled("  │  ", Style::default().fg(theme::t().text_dim)));
         }
