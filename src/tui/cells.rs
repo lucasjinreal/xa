@@ -1026,6 +1026,24 @@ pub struct ToolCallCell {
     pub arguments: Option<String>,
 }
 
+impl Clone for ToolCallCell {
+    fn clone(&self) -> Self {
+        ToolCallCell {
+            tool_name: self.tool_name.clone(),
+            args_preview: self.args_preview.clone(),
+            status: self.status,
+            output: self.output.clone(),
+            diff: self.diff.clone(),
+            expanded: self.expanded,
+            path: self.path.clone(),
+            read_offset: self.read_offset,
+            read_limit: self.read_limit,
+            tool_call_id: self.tool_call_id.clone(),
+            arguments: self.arguments.clone(),
+        }
+    }
+}
+
 impl ToolCallCell {
     /// Text shown inside the tool header parentheses, e.g. `Read(path:10-50)`.
     fn header_arg_text(&self) -> String {
