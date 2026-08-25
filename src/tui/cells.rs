@@ -1409,9 +1409,9 @@ fn render_group_inline(
             skip_next_bash = false;
         }
 
-        // If first tool is bash, only render the "Ran(...)" part.
+        // If multiple tools, only render the first one in header.
         // Skip rendering other tools in header — they'll be shown in body.
-        if i > 0 && bash_idx == Some(0) {
+        if i > 0 {
             continue;
         }
 
