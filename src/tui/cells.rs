@@ -1937,13 +1937,6 @@ fn diff_change_summary(diff: &str) -> String {
 /// One ordered entry in a thinking block. Interleaving mirrors the real model
 /// turn — text, then a tool call, then more text, then another tool call — so
 /// the transcript reads naturally instead of putting every tool at the top.
-/// Track which kind of block we're rendering so we can insert a blank separator on transitions.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BlockKind {
-    Text,
-    Tool,
-}
-
 pub enum ThinkBlock {
     Text(String),
     Tool(ToolCallCell),
@@ -2296,22 +2289,17 @@ impl ThinkingCell {
         let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
         let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
-        let mut prev_kind: Option<BlockKind> = None;
+        // Track whether the *previously rendered* block was Text (true) or
+        // Tool (false). We only insert a blank separator when transitioning
+        // from Text→Tool or Tool→Text — never between consecutive same-type
+        // blocks. Consecutive Tool blocks are merged into one group above,
+        // so we only ever see a single Tool entry for them.
+        let mut prev_was_text: Option<bool> = None;
 
         // Group ALL consecutive Tool blocks into a single inline group.
         let mut i = 0;
         while i < self.blocks.len() {
             let block_live = Some(i) == live_idx;
-            let cur_kind = match &self.blocks[i] {
-                ThinkBlock::Tool(_) | ThinkBlock::ToolGroup(_) => BlockKind::Tool,
-                ThinkBlock::Text(_) => BlockKind::Text,
-            };
-            // Blank separator on type transition (text↔tool), but not at the
-            // very first block or between consecutive same-type blocks.
-            if prev_kind.is_some_and(|k| k != cur_kind) {
-                rows.push(Row::blank(width));
-            }
-            prev_kind = Some(cur_kind);
                 // Collect ALL consecutive Tool blocks for inline group rendering.
                 if let ThinkBlock::Tool(first) = &self.blocks[i] {
                     let first_tool = first.clone();
@@ -2325,6 +2313,11 @@ impl ThinkingCell {
                             break;
                         }
                     }
+                    // Insert blank separator only on text→tool transition.
+                    if prev_was_text == Some(true) {
+                        rows.push(Row::blank(width));
+                    }
+                    prev_was_text = Some(false);
                     // Always render as inline group (even single tool).
                     let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
                     rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
@@ -2332,9 +2325,18 @@ impl ThinkingCell {
                 } else {
                     // Existing ToolGroup block — render inline.
                     if let ThinkBlock::ToolGroup(existing_group) = &self.blocks[i] {
+                        if prev_was_text == Some(true) {
+                            rows.push(Row::blank(width));
+                        }
+                        prev_was_text = Some(false);
                         let is_live = existing_group.iter().any(|t| t.status == ToolStatus::Running);
                         rows.extend(render_group_inline(existing_group, width, if is_live { ctx } else { None }));
                     } else {
+                        // Text block — insert separator only on tool→text transition.
+                        if prev_was_text == Some(false) {
+                            rows.push(Row::blank(width));
+                        }
+                        prev_was_text = Some(true);
                         rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
                     }
                     i += 1;
