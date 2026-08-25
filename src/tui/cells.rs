@@ -15,13 +15,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
+use std::sync::Arc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui_markdown::{
-    highlight::{segments_to_lines, CodeHighlighter, TreeSitterHighlighter},
+    highlight::{segments_to_lines, CodeHighlighter, StyleSegment, TreeSitterHighlighter},
     markdown::{MarkdownBlock, MarkdownRenderer},
 };
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex};
 
 use crate::tui::render::RenderContext;
 use crate::tui::shimmer::{shimmer_spans_to};
@@ -76,6 +80,37 @@ static TS_HIGHLIGHTER: std::sync::LazyLock<Arc<TreeSitterHighlighter>> =
             TreeSitterHighlighter::new().with_code_colors(theme::code_syntax_colors()),
         )
     });
+
+/// Segment-level memo for [`TS_HIGHLIGHTER`], keyed by `(language, content hash)`.
+///
+/// Upstream `TreeSitterHighlighter::highlight()` recompiles the per-language
+/// highlights query on every call (~25ms each), so session resume, diff
+/// redraws and streaming re-renders re-highlight identical code blocks over
+/// and over — which made those paths take seconds. Caching the produced
+/// segments keeps the official crates.io dependency while making repeat
+/// renders free; only the first appearance of unique content pays full price.
+type HlCache = HashMap<(String, u64), Arc<Vec<StyleSegment>>>;
+
+const HL_CACHE_MAX_ENTRIES: usize = 512;
+
+static HL_CACHE: LazyLock<Mutex<HlCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_highlight(lang: &str, content: &str) -> Arc<Vec<StyleSegment>> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let key = (lang.to_owned(), hasher.finish());
+    let cache = HL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache.get(&key) {
+        return hit.clone();
+    }
+    let segments = Arc::new(TS_HIGHLIGHTER.highlight(lang, content));
+    let mut cache = HL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= HL_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, segments.clone());
+    segments
+}
 
 /// A single drawable row inside a cell. `x`/`w` are offsets relative to the
 /// cell's left edge (which is always the transcript's left edge), so the same
@@ -218,36 +253,24 @@ fn line_is_blank(l: &Line<'_>) -> bool {
 /// Code-block rows (marked with the theme code-block background) are never
 /// treated as collapsible blanks — they form a solid code background bar.
 fn compact_md_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
     let mut prev_blank = true; // suppress leading blanks
-    for line in lines {
-        if is_code_line(&line) {
-            out.push(line);
+    lines.into_iter().filter(|line| {
+        if is_code_line(line) {
             prev_blank = false;
-            continue;
-        }
-        let blank = line_is_blank(&line);
-        if blank {
-            if !prev_blank {
-                out.push(Line::default());
-                prev_blank = true;
-            }
+            true
         } else {
-            out.push(line);
-            prev_blank = false;
+            let blank = line_is_blank(line);
+            if blank {
+                if prev_blank {
+                    return false;
+                }
+                prev_blank = true;
+            } else {
+                prev_blank = false;
+            }
+            true
         }
-    }
-    while out.last().is_some_and(|l| line_is_blank(l) && !is_code_line(l)) {
-        out.pop();
-    }
-    // Drop leading non-code blanks only.
-    while out
-        .first()
-        .is_some_and(|l| line_is_blank(l) && !is_code_line(l))
-    {
-        out.remove(0);
-    }
-    out
+    }).collect()
 }
 
 /// Merge a paragraph that is only punctuation into the previous paragraph.
@@ -764,7 +787,7 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
 
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
         let content = trim_code_fence_body(content);
-        let segments = TS_HIGHLIGHTER.highlight(lang, content);
+        let segments = cached_highlight(lang, content);
         let mut lines: Vec<Line<'static>> = Vec::new();
         // Body only — vertical padding = 0; margin applied at flush time.
 
@@ -1002,8 +1025,6 @@ const THINK_INDENT: u16 = 2;
 /// Right-side breathing room for AI markdown text (not used by full-width
 /// code bars, which paint edge-to-edge).
 const THINK_RIGHT_PAD: u16 = 1;
-/// Extra indent for content nested *under* a tool card (diff / read meta).
-const TOOL_BODY_INDENT: u16 = 4;
 
 pub struct ToolCallCell {
     pub tool_name: String,
@@ -1382,13 +1403,15 @@ fn render_group_inline(
 
     // Collect all bash arg texts for the joined command (full, non-truncated).
     let bash_args_text: Vec<String> = match bash_idx {
-        Some(idx) => {
-            items.iter().skip(idx).take_while(|t| t.tool_name == "bash")
-                .map(|t| t.bash_cmd_full())
-                .collect()
-        }
+        Some(idx) => items
+            .iter()
+            .skip(idx)
+            .take_while(|t| t.tool_name == "bash")
+            .map(|t| t.bash_cmd_full())
+            .collect(),
         None => Vec::new(),
     };
+    // Join the arg texts once; re-use the same buffer for each piece.
     let joined_bash = bash_args_text.join(" && ");
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1430,11 +1453,7 @@ fn render_group_inline(
         // Decide what to display: bash at position of first bash → "Ran joined_cmds"; other tools → normal.
         let (display_name, display_args) = if item.tool_name == "bash" && i == bash_idx.unwrap_or(usize::MAX) {
             // First bash in group: show "Ran" + all joined bash args.
-            let args_display = if joined_bash.chars().count() > 38 {
-                format!("{}...", joined_bash.chars().take(38).collect::<String>())
-            } else {
-                joined_bash.clone()
-            };
+            let args_display = format!("{}...", joined_bash.chars().take(38).collect::<String>());
             ("Ran".to_string(), args_display)
         } else {
             // Other tools: normal short name + arg.
@@ -1449,7 +1468,7 @@ fn render_group_inline(
             let args_display = if truncated {
                 format!("{}...", args_text.chars().take(max_len).collect::<String>())
             } else {
-                args_text
+                args_text.to_string()
             };
             (short_name, args_display)
         };
@@ -1782,7 +1801,7 @@ fn build_diff_rows(diff: &str, x: u16, w: u16, _header_label: &str, lang: Option
 /// styled spans for each source line, splitting segments at newline
 /// boundaries. Returns an empty Vec when nothing could be highlighted.
 fn highlight_lines_batched(lang: &str, joined: &str) -> Vec<Vec<Span<'static>>> {
-    let segments = TS_HIGHLIGHTER.highlight(lang, joined);
+    let segments = cached_highlight(lang, joined);
     let mut out: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     if segments.is_empty() {
         return Vec::new();
@@ -1805,7 +1824,7 @@ fn highlight_lines_batched(lang: &str, joined: &str) -> Vec<Vec<Span<'static>>> 
     }
 
     let mut cursor = 0usize;
-    for seg in &segments {
+    for seg in segments.iter() {
         let end = seg.end.min(joined.len());
         if seg.start > cursor {
             // Defensive: uncovered source between segments renders unstyled.
@@ -1938,7 +1957,7 @@ fn diff_change_summary(diff: &str) -> String {
 /// turn — text, then a tool call, then more text, then another tool call — so
 /// the transcript reads naturally instead of putting every tool at the top.
 pub enum ThinkBlock {
-    Text(String),
+    Text(Cow<'static, str>),
     Tool(ToolCallCell),
     /// A group of tool calls that ran in the same batch (parallel execution).
     /// Rendered as one compact line (or separate rows if any is edit/write).
@@ -2061,9 +2080,9 @@ impl ThinkingCell {
     /// model is still emitting the same paragraph.
     pub fn add_text(&mut self, s: &str) {
         if let Some(ThinkBlock::Text(last)) = self.blocks.last_mut() {
-            last.push_str(s);
+            last.to_mut().push_str(s);
         } else {
-            self.blocks.push(ThinkBlock::Text(s.to_string()));
+            self.blocks.push(ThinkBlock::Text(s.to_string().into()));
         }
         self.bump_layout();
     }
@@ -2160,7 +2179,7 @@ impl ThinkingCell {
         let mut s = String::new();
         for b in &self.blocks {
             if let ThinkBlock::Text(t) = b {
-                s.push_str(t);
+                s.push_str(t.as_ref());
             }
         }
         s
@@ -2240,23 +2259,25 @@ impl ThinkingCell {
             return match b {
                 ThinkBlock::Tool(t) => t.build(width, ctx),
                 ThinkBlock::ToolGroup(items) => render_group_inline(items, width, ctx),
-                ThinkBlock::Text(text) => self.render_text_block(text, width),
+                ThinkBlock::Text(text) => self.render_text_block(text.as_ref(), width),
             };
         }
         let sig = block_sig(b, width);
         {
             let sigs = self.block_sigs.borrow();
             let cache = self.rendered_blocks.borrow();
-            if let (Some(stored_sig), Some(Some(rows))) = (sigs.get(idx), cache.get(idx)) {
+            if let Some(stored_sig) = sigs.get(idx) {
                 if *stored_sig == sig {
-                    return rows.clone();
+                    if let Some(rows) = cache.get(idx).and_then(|r| r.as_ref()) {
+                        return rows.clone();
+                    }
                 }
             }
         }
         let rows = match b {
             ThinkBlock::Tool(t) => t.build(width, ctx),
             ThinkBlock::ToolGroup(items) => render_group_inline(items, width, ctx),
-            ThinkBlock::Text(text) => self.render_text_block(text, width),
+            ThinkBlock::Text(text) => self.render_text_block(text.as_ref(), width),
         };
         let mut sigs = self.block_sigs.borrow_mut();
         let mut cache = self.rendered_blocks.borrow_mut();
@@ -2458,10 +2479,9 @@ mod resume_perf_tests {
     }
 
     /// Regression guard for the resume slowdown: diff rows must be produced
-    /// with ONE tree-sitter pass over the whole diff (plus the per-language
-    /// config cached in the vendored ratatui-markdown), never one highlighter
-    /// call per line. A 200-line diff once took ~5s; it must stay in the
-    /// low milliseconds.
+    /// with ONE tree-sitter pass over the whole diff (plus the segment-level
+    /// memo in `cached_highlight`), never one highlighter call per line. A
+    /// 200-line diff once took ~5s; it must stay in the low milliseconds.
     #[test]
     fn large_diff_rows_are_fast_and_complete() {
         let diff = fake_diff(200);
@@ -2485,6 +2505,20 @@ mod resume_perf_tests {
             elapsed.as_millis() < 500,
             "build_diff_rows(200 lines) took {elapsed:?} — per-line highlighting regression?"
         );
+    }
+
+    /// Identical (lang, content) must hit the segment-level memo instead of
+    /// re-running the ~25ms query compile inside upstream `highlight()`.
+    #[test]
+    fn highlight_memo_hits_for_identical_content() {
+        let code = "fn main() { println!(\"hi\"); }";
+        let first = cached_highlight("rust", code);
+        let second = cached_highlight("rust", code);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second highlight() of identical content must be a cache hit"
+        );
+        assert!(!first.is_empty(), "rust source should produce segments");
     }
 
     /// Batched splitting must preserve every source line and its content,
