@@ -1937,6 +1937,13 @@ fn diff_change_summary(diff: &str) -> String {
 /// One ordered entry in a thinking block. Interleaving mirrors the real model
 /// turn — text, then a tool call, then more text, then another tool call — so
 /// the transcript reads naturally instead of putting every tool at the top.
+/// Track which kind of block we're rendering so we can insert a blank separator on transitions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Tool,
+}
+
 pub enum ThinkBlock {
     Text(String),
     Tool(ToolCallCell),
@@ -2289,11 +2296,22 @@ impl ThinkingCell {
         let text_row_w = width.saturating_sub(indent.saturating_add(THINK_RIGHT_PAD));
         let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
+        let mut prev_kind: Option<BlockKind> = None;
 
         // Group consecutive running Tool blocks into an inline group for rendering.
         let mut i = 0;
         while i < self.blocks.len() {
             let block_live = Some(i) == live_idx;
+            let cur_kind = match &self.blocks[i] {
+                ThinkBlock::Tool(_) | ThinkBlock::ToolGroup(_) => BlockKind::Tool,
+                ThinkBlock::Text(_) => BlockKind::Text,
+            };
+            // Blank separator on type transition (text↔tool), but not at the
+            // very first block or between consecutive same-type blocks.
+            if prev_kind.is_some_and(|k| k != cur_kind) {
+                rows.push(Row::blank(width));
+            }
+            prev_kind = Some(cur_kind);
                 // Collect consecutive Tool blocks for inline group rendering.
                 if let ThinkBlock::Tool(first) = &self.blocks[i] {
                     let first_tool = first.clone();
