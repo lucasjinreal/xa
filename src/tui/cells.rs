@@ -1055,6 +1055,25 @@ impl ToolCallCell {
         }
     }
 
+    /// Full command text for bash tools (from raw JSON, no truncation).
+    /// Falls back to `args_preview` if no `command` field found.
+    pub fn bash_cmd_full(&self) -> String {
+        if self.tool_name != "bash" {
+            return String::new();
+        }
+        if let Some(ref args) = self.arguments {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                    return cmd.to_string();
+                }
+                if let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()) {
+                    return cmd.to_string();
+                }
+            }
+        }
+        self.args_preview.clone()
+    }
+
     pub fn header_line(&self, ctx: Option<&RenderContext>) -> Line<'static> {
         let (icon, color) = match self.status {
             ToolStatus::Running => ("▸", theme::t().accent),
@@ -1343,11 +1362,11 @@ fn render_group_inline(
     // ---- Header line: collect all bash args, then render tools ----
     let bash_idx = items.iter().position(|t| t.tool_name == "bash");
 
-    // Collect all bash arg texts for the joined command.
+    // Collect all bash arg texts for the joined command (full, non-truncated).
     let bash_args_text: Vec<String> = match bash_idx {
         Some(idx) => {
             items.iter().skip(idx).take_while(|t| t.tool_name == "bash")
-                .map(|t| t.header_arg_text())
+                .map(|t| t.bash_cmd_full())
                 .collect()
         }
         None => Vec::new(),
