@@ -2588,7 +2588,10 @@ async fn run_inner(
         // fight with us. We re-enable it below so the user lands at the
         // bottom after all cells are painted.
         app.auto_scroll = false;
-        let resumed = app.session.messages.clone();
+        // Take ownership of the messages instead of cloning them: sessions
+        // reach multiple MB and a full deep clone here spiked resident memory
+        // (and swap pressure) on every resume.
+        let mut resumed = std::mem::take(&mut app.session.messages);
         app.system_msg(format!("resumed session `{}`", app.session.id));
         let mut i = 0;
         while i < resumed.len() {
@@ -2719,9 +2722,7 @@ async fn run_inner(
                 }
             }
         }
-        let hist: Vec<agent::ChatMessage> = app
-            .session
-            .messages
+        let hist: Vec<agent::ChatMessage> = resumed
             .iter()
             .map(|m| agent::ChatMessage {
                 role: match m.role.as_str() {
@@ -2744,6 +2745,8 @@ async fn run_inner(
             })
             .collect();
         *app.agent_history.lock().unwrap() = hist;
+        // Hand the messages back to the session for further turns / saving.
+        app.session.messages = resumed;
         // Re-enable auto-scroll so the transcript snaps to the bottom once
         // the first draw finishes, giving a smooth "open at the latest msg" UX.
         app.auto_scroll = true;
@@ -2817,4 +2820,164 @@ async fn run_inner(
     terminal.show_cursor()?;
     print_exit_summary(&summary);
     Ok(())
+}
+
+#[cfg(test)]
+mod resume_bench {
+    use super::*;
+    use crate::tui::cells::HistoryCell;
+    use std::time::Instant;
+
+    /// Manual perf probe (ignored by default: needs real saved sessions):
+    /// `cargo test --release bench_real_session_resume_layout -- --ignored --nocapture`
+    ///
+    /// Times the two resume hot spots end to end:
+    ///   1. `list_summaries` — the picker's startup cost. Served from the
+    ///      size+mtime-validated summary index, so unchanged files are never
+    ///      re-parsed.
+    ///   2. The first full layout pass after rebuilding cells from every
+    ///      session, exactly like the resume loop in the TUI.
+    #[test]
+    #[ignore]
+    fn bench_real_session_resume_layout() {
+        let t0 = Instant::now();
+        let n = session::list_summaries().len();
+        println!("== list_summaries (picker): {:?} for {n} sessions", t0.elapsed());
+
+        let dir = dirs::config_dir().unwrap().join("xa/sessions");
+        let mut results: Vec<(u64, String, usize, usize, u128)> = Vec::new();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "json")
+                    && p.file_stem().is_some_and(|s| s != "index")
+            })
+            .collect();
+        entries.sort();
+        for path in entries {
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            let Some(s) = session::load(&id) else {
+                continue;
+            };
+            if s.messages.is_empty() {
+                continue;
+            }
+            let layout = run_one_session(&s);
+            results.push((
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                id,
+                s.messages.len(),
+                s.messages
+                    .iter()
+                    .filter(|m| m.role == "assistant" || m.role == "user")
+                    .count(),
+                layout.as_millis(),
+            ));
+        }
+        println!("== first-layout per session (worst first):");
+        results.sort_by(|a, b| b.4.cmp(&a.4));
+        for (len, id, msgs, turns, ms) in results.iter().take(12) {
+            println!(
+                "== {len:>7} bytes {msgs:>4} msgs {turns:>4} turns  first-layout {ms} ms  [{id}]"
+            );
+        }
+    }
+
+    fn run_one_session(s: &Session) -> std::time::Duration {
+        let mut cells: Vec<Box<dyn HistoryCell>> = Vec::new();
+        let resumed = &s.messages;
+        let mut i = 0;
+        while i < resumed.len() {
+            let m = &resumed[i];
+            match m.role.as_str() {
+                "user" => {
+                    cells.push(Box::new(UserCell::new(m.content.clone())));
+                    i += 1;
+                }
+                "assistant" => {
+                    i += 1;
+                    let mut tc = rebuild_assistant_cell(m);
+                    // Attach following tool results like the real resume path.
+                    while i < resumed.len() && resumed[i].role == "tool" {
+                        if let Some(tcid) = &resumed[i].tool_call_id {
+                            for b in tc.blocks.iter_mut() {
+                                if let crate::tui::cells::ThinkBlock::Tool(tool) = b {
+                                    if tool.tool_call_id.as_deref() == Some(tcid.as_str()) {
+                                        tool.output = Some(resumed[i].content.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    cells.push(Box::new(tc));
+                }
+                _ => i += 1,
+            }
+        }
+        let w = 120u16;
+        let t_first = Instant::now();
+        let _: Vec<u16> = cells.iter().map(|c| c.desired_height(w)).collect();
+        t_first.elapsed()
+    }
+
+    fn rebuild_assistant_cell(m: &session::StoredMessage) -> ThinkingCell {
+        let mut tc = ThinkingCell::new();
+        if !m.blocks.is_empty() {
+            for b in &m.blocks {
+                match b {
+                    session::StoredBlock::Text(txt) => {
+                        if !txt.is_empty() {
+                            tc.add_text(txt);
+                        }
+                    }
+                    session::StoredBlock::Tool(stc) => {
+                        let args_preview = args_preview(&stc.arguments);
+                        let (p, ro, rl) = tool_path_window(&stc.arguments);
+                        tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                            crate::tui::cells::ToolCallCell {
+                                tool_name: stc.name.clone(),
+                                args_preview,
+                                status: crate::tui::cells::ToolStatus::Success,
+                                output: None,
+                                diff: stc.diff.clone(),
+                                expanded: false,
+                                path: p,
+                                read_offset: ro,
+                                read_limit: rl,
+                                tool_call_id: Some(stc.id.clone()),
+                                arguments: Some(stc.arguments.clone()),
+                            },
+                        ));
+                    }
+                }
+            }
+        } else if let Some(tool_calls) = &m.tool_calls {
+            for stc in tool_calls {
+                let args_preview = args_preview(&stc.arguments);
+                let (p, ro, rl) = tool_path_window(&stc.arguments);
+                tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                    crate::tui::cells::ToolCallCell {
+                        tool_name: stc.name.clone(),
+                        args_preview,
+                        status: crate::tui::cells::ToolStatus::Success,
+                        output: None,
+                        diff: stc.diff.clone(),
+                        expanded: false,
+                        path: p,
+                        read_offset: ro,
+                        read_limit: rl,
+                        tool_call_id: Some(stc.id.clone()),
+                        arguments: Some(stc.arguments.clone()),
+                    },
+                ));
+            }
+        }
+        tc.flush_tool_blocks_to_group();
+        tc.streaming = false;
+        tc
+    }
 }
