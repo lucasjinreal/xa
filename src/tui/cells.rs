@@ -1367,6 +1367,10 @@ fn result_summary(item: &ToolCallCell) -> Option<Span<'static>> {
 ///   └ src/file.ts:47:  loadTaskById(...)
 ///     … +193 lines (ctrl + t to view transcript)
 ///     M src/pages/EditorPage.tsx
+///
+/// Max body lines (excluding header). 6 lines total = 1 header + 5 body.
+const MAX_GROUP_BODY_ROWS: usize = 5;
+
 fn render_group_inline(
     items: &[ToolCallCell],
     width: u16,
@@ -1502,11 +1506,14 @@ fn render_group_inline(
         vec![Row::new(indent, row_w, Line::from(spans))]
     };
 
-    // ---- Body lines: each tool's output below ----
+    // ---- Body lines: each tool's output below (capped at MAX_GROUP_BODY_ROWS) ----
+    let mut body_count: usize = 0;
     for item in items {
+        if body_count >= MAX_GROUP_BODY_ROWS {
+            break;
+        }
         match item.status {
             ToolStatus::Running => {
-                // Running tools show a simple indicator.
                 rows.push(Row::new(
                     body_indent,
                     body_w,
@@ -1518,6 +1525,7 @@ fn render_group_inline(
                         ),
                     ]),
                 ));
+                body_count += 1;
             }
             ToolStatus::Failed => {
                 let msg = item.output.as_deref().and_then(|s| s.lines().next()).unwrap_or("error");
@@ -1532,6 +1540,7 @@ fn render_group_inline(
                         ),
                     ]),
                 ));
+                body_count += 1;
             }
             ToolStatus::Success => match item.tool_name.as_str() {
                 "read" => {
@@ -1555,8 +1564,12 @@ fn render_group_inline(
                                     ),
                                 ]),
                             ));
+                            body_count += 1;
+                            if body_count >= MAX_GROUP_BODY_ROWS {
+                                break;
+                            }
                         }
-                        if total > 5 {
+                        if total > 5 && body_count < MAX_GROUP_BODY_ROWS {
                             rows.push(Row::new(
                                 body_indent + 2,
                                 body_w.saturating_sub(2),
@@ -1572,6 +1585,7 @@ fn render_group_inline(
                                     ),
                                 ]),
                             ));
+                            body_count += 1;
                         }
                     } else {
                         rows.push(Row::new(
@@ -1630,6 +1644,7 @@ fn render_group_inline(
                             ]),
                         ));
                     }
+                    body_count += 1;
                 }
                 _ => {
                     // For other tools, show first line of output or a summary.
@@ -1649,6 +1664,7 @@ fn render_group_inline(
                             ]),
                         ));
                     }
+                    body_count += 1;
                 }
             },
         }
@@ -2290,11 +2306,10 @@ impl ThinkingCell {
         let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
         // Track whether the *previously rendered* block was Text (true) or
-        // Tool (false). We only insert a blank separator when transitioning
-        // from Text→Tool or Tool→Text — never between consecutive same-type
-        // blocks. Consecutive Tool blocks are merged into one group above,
-        // so we only ever see a single Tool entry for them.
-        let mut prev_was_text: Option<bool> = None;
+        // Tool (false). Text blocks already include a trailing blank row, so
+        // we only need an explicit separator when a tool block is followed by
+        // text — the tool block itself has no trailing blank.
+        let mut prev_was_tool: bool = false;
 
         // Group ALL consecutive Tool blocks into a single inline group.
         let mut i = 0;
@@ -2313,11 +2328,8 @@ impl ThinkingCell {
                             break;
                         }
                     }
-                    // Insert blank separator only on text→tool transition.
-                    if prev_was_text == Some(true) {
-                        rows.push(Row::blank(width));
-                    }
-                    prev_was_text = Some(false);
+                    // No separator needed: text blocks already have trailing blank.
+                    prev_was_tool = true;
                     // Always render as inline group (even single tool).
                     let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
                     rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
@@ -2325,18 +2337,17 @@ impl ThinkingCell {
                 } else {
                     // Existing ToolGroup block — render inline.
                     if let ThinkBlock::ToolGroup(existing_group) = &self.blocks[i] {
-                        if prev_was_text == Some(true) {
-                            rows.push(Row::blank(width));
-                        }
-                        prev_was_text = Some(false);
+                        // Tool→tool: never a separator here. Only tool→text
+                        // needs one (see below).
+                        prev_was_tool = true;
                         let is_live = existing_group.iter().any(|t| t.status == ToolStatus::Running);
                         rows.extend(render_group_inline(existing_group, width, if is_live { ctx } else { None }));
                     } else {
-                        // Text block — insert separator only on tool→text transition.
-                        if prev_was_text == Some(false) {
+                        // Text block — add separator only after a tool block.
+                        if prev_was_tool {
                             rows.push(Row::blank(width));
                         }
-                        prev_was_text = Some(true);
+                        prev_was_tool = false;
                         rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
                     }
                     i += 1;
