@@ -59,6 +59,7 @@ fn restore_terminal() {
     let _ = crossterm::execute!(
         stdout,
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show,
     );
