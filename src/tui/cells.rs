@@ -99,9 +99,11 @@ fn cached_highlight(lang: &str, content: &str) -> Arc<Vec<StyleSegment>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
     let key = (lang.to_owned(), hasher.finish());
-    let cache = HL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(hit) = cache.get(&key) {
-        return hit.clone();
+    {
+        let cache = HL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
     }
     let segments = Arc::new(TS_HIGHLIGHTER.highlight(lang, content));
     let mut cache = HL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
