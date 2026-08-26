@@ -70,7 +70,7 @@ pub struct Session {
 
 /// Lightweight metadata used by session lists and the resume picker. Reading
 /// this avoids loading every saved conversation into memory just to display it.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
@@ -95,9 +95,63 @@ pub struct GainSessionRecord {
 }
 
 fn sessions_dir() -> PathBuf {
+    // Test hook: point the store at a throwaway directory.
+    if let Ok(dir) = std::env::var("XA_SESSIONS_DIR") {
+        return PathBuf::from(dir);
+    }
     config_dir()
         .map(|d| d.join("xa").join("sessions"))
         .unwrap_or_else(|| PathBuf::from(".xa/sessions"))
+}
+
+/// On-disk cache of per-session summaries keyed by file stem. Entries are
+/// validated against `(file_len, file_mtime)`; any mismatch falls back to
+/// parsing that single session file. Without this the resume picker had to
+/// tokenize every byte of every session JSON (~1.5s at 45 sessions / 10MB),
+/// which made `xa resume` feel frozen before the picker even appeared.
+#[derive(Serialize, Deserialize, Default)]
+struct SummaryIndex {
+    entries: BTreeMap<String, CachedSummary>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CachedSummary {
+    #[serde(flatten)]
+    summary: SessionSummary,
+    size: u64,
+    mtime_ms: i64,
+}
+
+fn index_path() -> PathBuf {
+    sessions_dir().join("index.json")
+}
+
+fn load_summary_index() -> SummaryIndex {
+    fs::read_to_string(index_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_summary_index(index: &SummaryIndex) {
+    let dir = sessions_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(index) {
+        let _ = fs::write(index_path(), json);
+    }
+}
+
+fn stat_fingerprint(path: &std::path::Path) -> Option<(u64, i64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((meta.len(), mtime))
 }
 
 fn path_for(id: &str) -> PathBuf {
@@ -111,22 +165,81 @@ pub fn new_id() -> String {
     format!("{millis:x}-{pid:x}")
 }
 
-/// List session metadata newest first, without deserializing message bodies.
+/// List session metadata newest first. Served from a size+mtime-validated
+/// index so unchanged session files are never re-parsed; only new or modified
+/// files pay one full parse (and get cached into the index afterwards).
 pub fn list_summaries() -> Vec<SessionSummary> {
     let dir = sessions_dir();
+    let mut index = load_summary_index();
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<SessionSummary> = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
+    let mut index_dirty = false;
+
+    if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Ok(file) = fs::File::open(path) {
-                    if let Ok(summary) = serde_json::from_reader(file) {
-                        out.push(summary);
-                    }
+            let is_session_json = path
+                .extension()
+                .is_some_and(|ext| ext == "json")
+                && path.file_stem().is_some_and(|stem| stem != "index");
+            if !is_session_json {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let fp = stat_fingerprint(&path);
+            if fp.is_some() {
+                used_ids.insert(id.clone());
+            }
+            let cached_ok = match (&fp, index.entries.get(&id)) {
+                (Some((size, mtime)), cached) => {
+                    cached.is_some_and(|c| c.size == *size && c.mtime_ms == *mtime)
                 }
+                _ => false,
+            };
+            if !cached_ok {
+                // New or modified file: parse it fully once and refresh the cache.
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
+                let Ok(mut summary) = serde_json::from_reader::<_, SessionSummary>(file) else {
+                    continue;
+                };
+                summary.id = id.clone();
+                if let Some((size, mtime_ms)) = fp {
+                    index_dirty = true;
+                    index.entries.insert(
+                        id.clone(),
+                        CachedSummary {
+                            summary: summary.clone(),
+                            size,
+                            mtime_ms,
+                        },
+                    );
+                } else {
+                    // Unstatable file: still listable this round, just not cached.
+                }
+                out.push(summary);
+            } else if let Some(cached) = index.entries.get(&id) {
+                out.push(cached.summary.clone());
             }
         }
     }
+
+    // Drop entries for deleted sessions so the index cannot grow forever.
+    let before = index.entries.len();
+    index.entries.retain(|id, _| used_ids.contains(id));
+    if index.entries.len() != before {
+        index_dirty = true;
+    }
+    if index_dirty {
+        save_summary_index(&index);
+    }
+
     out.sort_by(|a, b| b.updated.cmp(&a.updated));
     out
 }
@@ -181,7 +294,30 @@ pub fn save(session: &Session) -> std::io::Result<()> {
         .and_then(|p| p.to_str().map(|s| s.to_string()));
     let json = serde_json::to_string_pretty(&session)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    fs::write(path_for(&session.id), json)
+    fs::write(path_for(&session.id), json)?;
+    // Keep the summary index warm so the next `xa resume` picker opens
+    // instantly instead of re-parsing this file (mtime changed → miss).
+    let path = path_for(&session.id);
+    if let Some((size, mtime_ms)) = stat_fingerprint(&path) {
+        let mut index = load_summary_index();
+        index.entries.insert(
+            session.id.clone(),
+            CachedSummary {
+                summary: SessionSummary {
+                    id: session.id.clone(),
+                    title: session.title.clone(),
+                    model: session.model.clone(),
+                    updated: session.updated,
+                    workspace: session.workspace.clone(),
+                    first_user_msg: session.first_user_msg.clone(),
+                },
+                size,
+                mtime_ms,
+            },
+        );
+        save_summary_index(&index);
+    }
+    Ok(())
 }
 
 /// Load a session by id.
@@ -448,5 +584,58 @@ mod tests {
         assert_eq!(rows[0].calls, 2);
         assert_eq!(rows[0].bytes_saved(), 900);
         assert!((rows[0].savings_percent() - 75.0).abs() < f64::EPSILON);
+    }
+
+    /// The summary index must serve the picker without re-parsing session
+    /// bodies, survive a corrupt index, and never list `index.json` itself.
+    #[test]
+    fn summary_index_serves_and_self_heals() {
+        let tmp = std::env::temp_dir().join(format!(
+            "xa-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: single-threaded test binary usage of this env var; no other
+        // test reads XA_SESSIONS_DIR.
+        std::env::set_var("XA_SESSIONS_DIR", &tmp);
+
+        let mut s = Session::new("prov", "model");
+        s.id = new_id();
+        s.title = "index test".into();
+        s.first_user_msg = "hello".into();
+        s.messages.push(message("user", "hello"));
+        save(&s).unwrap();
+
+        // First list: file is fresh in the index (save() warmed it).
+        let listed = list_summaries();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, s.id);
+        assert_eq!(listed[0].title, "index test");
+
+        // A second list must be served entirely from the index.
+        let listed_again = list_summaries();
+        assert_eq!(listed_again.len(), 1);
+        assert_eq!(listed_again[0].id, s.id);
+
+        // Corrupt the index: listing must self-heal by re-parsing the file.
+        fs::write(index_path(), "{not json").unwrap();
+        let healed = list_summaries();
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed[0].id, s.id);
+
+        // index.json itself must never appear as a session.
+        assert!(index_path().exists());
+        assert_eq!(list_summaries().len(), 1);
+
+        // Deleting the session drops its stale entry on the next list.
+        delete(&s.id).unwrap();
+        assert!(list_summaries().is_empty());
+
+        std::env::remove_var("XA_SESSIONS_DIR");
+        fs::remove_dir_all(&tmp).ok();
     }
 }

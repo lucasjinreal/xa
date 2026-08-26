@@ -1128,15 +1128,7 @@ impl ToolCallCell {
         )];
         
         // Capitalize tool name and make it bold white
-        let tool_name_cap = if self.tool_name.len() > 0 {
-            let mut chars = self.tool_name.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            }
-        } else {
-            self.tool_name.clone()
-        };
+        let tool_name_cap = display_tool_name(&self.tool_name);
         
         spans.push(Span::styled(
             format!("{}(", tool_name_cap),
@@ -1218,35 +1210,7 @@ impl ToolCallCell {
             "edit" | "write" => {
                 // Show git diff for edits
                 if let Some(diff) = self.diff.as_deref() {
-                    let label = if diff_is_new_file(diff) {
-                        "New file"
-                    } else {
-                        "Edit"
-                    };
-                    let lang = self.path.as_deref().and_then(lang_from_path);
-                    let mut shown = build_diff_rows(diff, x, w, label, lang);
-                    const MAX_DIFF_ROWS: usize = 70;
-                    const DIFF_HEAD_ROWS: usize = MAX_DIFF_ROWS / 2;
-                    if shown.len() > MAX_DIFF_ROWS {
-                        let omitted = shown.len() - MAX_DIFF_ROWS;
-                        let mut tail = shown.split_off(shown.len() - DIFF_HEAD_ROWS);
-                        shown.truncate(DIFF_HEAD_ROWS);
-                        rows.append(&mut shown);
-                        rows.push(Row::new(
-                            x,
-                            w,
-                            Line::from(vec![
-                                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
-                                Span::styled(
-                                    format!("… {omitted} diff lines omitted …"),
-                                    Style::default().fg(theme::t().text_hint),
-                                ),
-                            ]),
-                        ));
-                        rows.append(&mut tail);
-                    } else {
-                        rows.append(&mut shown);
-                    }
+                    push_diff_rows(&mut rows, diff, x, w, self.path.as_deref());
                 }
             }
             _ => {
@@ -1390,6 +1354,55 @@ fn result_summary(item: &ToolCallCell) -> Option<Span<'static>> {
 ///   └ src/file.ts:47:  loadTaskById(...)
 ///     … +193 lines (ctrl + t to view transcript)
 ///     M src/pages/EditorPage.tsx
+///
+/// Max body lines (excluding header). 6 lines total = 1 header + 5 body.
+const MAX_GROUP_BODY_ROWS: usize = 5;
+
+/// Capitalized display name for a tool (`"edit"` → `"Edit"`).
+fn display_tool_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Append the colored, line-numbered diff rows for an edit/write tool —
+/// head + tail with an omission marker when very long. Shared by the
+/// standalone tool card and merged inline groups so edits keep their full
+/// diff view in both layouts.
+fn push_diff_rows(rows: &mut Vec<Row>, diff: &str, x: u16, w: u16, path: Option<&str>) {
+    let label = if diff_is_new_file(diff) {
+        "New file"
+    } else {
+        "Edit"
+    };
+    let lang = path.and_then(lang_from_path);
+    let mut shown = build_diff_rows(diff, x, w, label, lang);
+    const MAX_DIFF_ROWS: usize = 70;
+    const DIFF_HEAD_ROWS: usize = MAX_DIFF_ROWS / 2;
+    if shown.len() > MAX_DIFF_ROWS {
+        let omitted = shown.len() - MAX_DIFF_ROWS;
+        let mut tail = shown.split_off(shown.len() - DIFF_HEAD_ROWS);
+        shown.truncate(DIFF_HEAD_ROWS);
+        rows.append(&mut shown);
+        rows.push(Row::new(
+            x,
+            w,
+            Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme::t().text_dim)),
+                Span::styled(
+                    format!("… {omitted} diff lines omitted …"),
+                    Style::default().fg(theme::t().text_hint),
+                ),
+            ]),
+        ));
+        rows.append(&mut tail);
+    } else {
+        rows.append(&mut shown);
+    }
+}
+
 fn render_group_inline(
     items: &[ToolCallCell],
     width: u16,
@@ -1453,29 +1466,35 @@ fn render_group_inline(
         let icon = if is_running { "▸" } else { "▪" };
 
         // Decide what to display: bash at position of first bash → "Ran joined_cmds"; other tools → normal.
+        // Args budget scales with the terminal instead of a fixed 38 columns,
+        // so merged `Ran(a && b && c …)` headers use the whole line.
+        let name_overhead = 10usize; // "▪ " + "Name(" + ")" + right margin
+        let args_budget = (row_w as usize)
+            .saturating_sub(name_overhead)
+            .clamp(38, 120);
         let (display_name, display_args) = if item.tool_name == "bash" && i == bash_idx.unwrap_or(usize::MAX) {
             // First bash in group: show "Ran" + all joined bash args.
-            let args_display = format!("{}...", joined_bash.chars().take(38).collect::<String>());
+            let truncated = joined_bash.chars().count() > args_budget;
+            let args_display = if truncated {
+                format!("{}...", joined_bash.chars().take(args_budget).collect::<String>())
+            } else {
+                joined_bash.clone()
+            };
             ("Ran".to_string(), args_display)
         } else {
-            // Other tools: normal short name + arg.
-            let short_name = if item.tool_name.len() > 3 {
-                format!("{}…", &item.tool_name[..3])
-            } else {
-                item.tool_name.clone()
-            };
+            // Other tools: capitalized full name + arg.
+            let short_name = display_tool_name(&item.tool_name);
             let args_text = item.header_arg_text();
-            let max_len = if item.tool_name == "bash" { 32 } else { 38 };
-            let truncated = args_text.chars().count() > max_len;
+            let truncated = args_text.chars().count() > args_budget;
             let args_display = if truncated {
-                format!("{}...", args_text.chars().take(max_len).collect::<String>())
+                format!("{}...", args_text.chars().take(args_budget).collect::<String>())
             } else {
-                args_text.to_string()
+                args_text
             };
             (short_name, args_display)
         };
 
-        let args_style = if display_args.chars().count() > 38 || (display_name == "Ran" && joined_bash.chars().count() > 38) {
+        let args_style = if display_args.chars().count() > args_budget || (display_name == "Ran" && joined_bash.chars().count() > args_budget) {
             Style::default().fg(theme::t().text_hint)
         } else {
             Style::default().fg(theme::t().text_dim)
@@ -1523,22 +1542,26 @@ fn render_group_inline(
         vec![Row::new(indent, row_w, Line::from(spans))]
     };
 
-    // ---- Body lines: each tool's output below ----
+    // ---- Body lines: each tool's output below (capped at MAX_GROUP_BODY_ROWS) ----
+    let mut body_count: usize = 0;
     for item in items {
+        if body_count >= MAX_GROUP_BODY_ROWS {
+            break;
+        }
         match item.status {
             ToolStatus::Running => {
-                // Running tools show a simple indicator.
                 rows.push(Row::new(
                     body_indent,
                     body_w,
                     Line::from(vec![
                         Span::styled("└ ", Style::default().fg(theme::t().text_dim)),
                         Span::styled(
-                            format!("{}… running", item.tool_name),
+                            format!("{}… running", display_tool_name(&item.tool_name)),
                             Style::default().fg(theme::t().accent),
                         ),
                     ]),
                 ));
+                body_count += 1;
             }
             ToolStatus::Failed => {
                 let msg = item.output.as_deref().and_then(|s| s.lines().next()).unwrap_or("error");
@@ -1553,6 +1576,7 @@ fn render_group_inline(
                         ),
                     ]),
                 ));
+                body_count += 1;
             }
             ToolStatus::Success => match item.tool_name.as_str() {
                 "read" => {
@@ -1576,8 +1600,12 @@ fn render_group_inline(
                                     ),
                                 ]),
                             ));
+                            body_count += 1;
+                            if body_count >= MAX_GROUP_BODY_ROWS {
+                                break;
+                            }
                         }
-                        if total > 5 {
+                        if total > 5 && body_count < MAX_GROUP_BODY_ROWS {
                             rows.push(Row::new(
                                 body_indent + 2,
                                 body_w.saturating_sub(2),
@@ -1593,6 +1621,7 @@ fn render_group_inline(
                                     ),
                                 ]),
                             ));
+                            body_count += 1;
                         }
                     } else {
                         rows.push(Row::new(
@@ -1651,6 +1680,19 @@ fn render_group_inline(
                             ]),
                         ));
                     }
+                    body_count += 1;
+                    // Keep the full colored diff inside merged groups — the
+                    // summary line alone hid every change. Diff rows are
+                    // bounded by push_diff_rows itself, not the body cap.
+                    if let Some(diff) = item.diff.as_deref() {
+                        push_diff_rows(
+                            &mut rows,
+                            diff,
+                            body_indent + 2,
+                            body_w.saturating_sub(2),
+                            item.path.as_deref(),
+                        );
+                    }
                 }
                 _ => {
                     // For other tools, show first line of output or a summary.
@@ -1670,6 +1712,7 @@ fn render_group_inline(
                             ]),
                         ));
                     }
+                    body_count += 1;
                 }
             },
         }
@@ -2313,11 +2356,10 @@ impl ThinkingCell {
         let live_idx = self.running_tool_idx();
         let mut rows = vec![Row::blank(width)]; // top padding
         // Track whether the *previously rendered* block was Text (true) or
-        // Tool (false). We only insert a blank separator when transitioning
-        // from Text→Tool or Tool→Text — never between consecutive same-type
-        // blocks. Consecutive Tool blocks are merged into one group above,
-        // so we only ever see a single Tool entry for them.
-        let mut prev_was_text: Option<bool> = None;
+        // Tool (false). Text blocks already include a trailing blank row, so
+        // we only need an explicit separator when a tool block is followed by
+        // text — the tool block itself has no trailing blank.
+        let mut prev_was_tool: bool = false;
 
         // Group ALL consecutive Tool blocks into a single inline group.
         let mut i = 0;
@@ -2336,11 +2378,8 @@ impl ThinkingCell {
                             break;
                         }
                     }
-                    // Insert blank separator only on text→tool transition.
-                    if prev_was_text == Some(true) {
-                        rows.push(Row::blank(width));
-                    }
-                    prev_was_text = Some(false);
+                    // No separator needed: text blocks already have trailing blank.
+                    prev_was_tool = true;
                     // Always render as inline group (even single tool).
                     let is_live = group.iter().any(|t| t.status == ToolStatus::Running);
                     rows.extend(render_group_inline(&group, width, if is_live { ctx } else { None }));
@@ -2348,18 +2387,25 @@ impl ThinkingCell {
                 } else {
                     // Existing ToolGroup block — render inline.
                     if let ThinkBlock::ToolGroup(existing_group) = &self.blocks[i] {
-                        if prev_was_text == Some(true) {
-                            rows.push(Row::blank(width));
-                        }
-                        prev_was_text = Some(false);
+                        // Tool→tool: never a separator here. Only tool→text
+                        // needs one (see below).
+                        prev_was_tool = true;
                         let is_live = existing_group.iter().any(|t| t.status == ToolStatus::Running);
                         rows.extend(render_group_inline(existing_group, width, if is_live { ctx } else { None }));
-                    } else {
-                        // Text block — insert separator only on tool→text transition.
-                        if prev_was_text == Some(false) {
-                            rows.push(Row::blank(width));
-                        }
-                        prev_was_text = Some(true);
+                } else {
+                    // Whitespace-only text segments (think-tag separators such
+                    // as "\n\n\n" between tool batches) would render as pure
+                    // blank rows and made consecutive tool groups look split
+                    // by stray empty lines. Drop them outright.
+                    if matches!(&self.blocks[i], ThinkBlock::Text(t) if t.trim().is_empty()) {
+                        i += 1;
+                        continue;
+                    }
+                    // Text block — add separator only after a tool block.
+                    if prev_was_tool {
+                        rows.push(Row::blank(width));
+                    }
+                        prev_was_tool = false;
                         rows.extend(self.render_block_cached(&self.blocks[i], i, width, ctx, block_live));
                     }
                     i += 1;
@@ -2456,6 +2502,191 @@ impl HistoryCell for ThinkingCell {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod group_render_tests {
+    use super::*;
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn success_tool(name: &str, output: Option<&str>) -> ToolCallCell {
+        ToolCallCell {
+            tool_name: name.to_string(),
+            args_preview: "arg".to_string(),
+            status: ToolStatus::Success,
+            output: output.map(|s| s.to_string()),
+            diff: None,
+            expanded: false,
+            path: None,
+            read_offset: None,
+            read_limit: None,
+            tool_call_id: Some("t1".into()),
+            arguments: None,
+        }
+    }
+
+    fn edit_tool_with_diff(diff: &str) -> ToolCallCell {
+        ToolCallCell {
+            tool_name: "edit".to_string(),
+            args_preview: String::new(),
+            status: ToolStatus::Success,
+            output: None,
+            diff: Some(diff.to_string()),
+            expanded: false,
+            path: Some("/tmp/x.rs".to_string()),
+            read_offset: None,
+            read_limit: None,
+            tool_call_id: Some("t2".into()),
+            arguments: None,
+        }
+    }
+
+    fn sample_diff() -> String {
+        let mut s = String::from("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n");
+        for i in 0..6 {
+            match i % 3 {
+                0 => s.push_str(&format!("+fn added_{i}() {{}}\n")),
+                1 => s.push_str(&format!("-fn removed_{i}() {{}}\n")),
+                _ => s.push_str("  fn ctx() {}\n"),
+            }
+        }
+        s
+    }
+
+    /// Consecutive tool groups must sit flush against each other: no blank
+    /// rows between them, and whitespace-only text segments (think-tag
+    /// separators like "\n\n\n") must vanish entirely.
+    #[test]
+    fn adjacent_tool_groups_have_no_blank_rows() {
+        let mut tc = ThinkingCell::new();
+        tc.streaming = false;
+        tc.blocks.push(ThinkBlock::ToolGroup(vec![success_tool(
+            "bash",
+            Some("ok\nmore"),
+        )]));
+        tc.blocks.push(ThinkBlock::Text("\n\n\n".into()));
+        tc.blocks.push(ThinkBlock::ToolGroup(vec![
+            success_tool("read", None),
+            success_tool("grep", Some("match")),
+        ]));
+
+        let rows = tc.build(120, None);
+        // Only the top padding + bottom padding may be blank.
+        let blanks_in_middle = rows
+            .iter()
+            .skip(1)
+            .take(rows.len().saturating_sub(2))
+            .filter(|r| line_is_blank(&r.line))
+            .count();
+
+        assert_eq!(
+            blanks_in_middle, 0,
+            "rows between tool groups must contain no blanks: {:?}",
+            rows.iter().map(|r| line_text(&r.line)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool group followed by real text keeps exactly one separator row,
+    /// and a whitespace-only segment before text adds nothing.
+    #[test]
+    fn tool_to_text_transition_has_single_blank() {
+        let mut tc = ThinkingCell::new();
+        tc.streaming = false;
+        tc.blocks.push(ThinkBlock::ToolGroup(vec![success_tool(
+            "bash",
+            Some("done"),
+        )]));
+        tc.blocks.push(ThinkBlock::Text("\n\n\n".into()));
+        tc.blocks.push(ThinkBlock::Text("real answer".into()));
+
+        let rows = tc.build(120, None);
+        let texts: Vec<String> = rows.iter().map(|r| line_text(&r.line)).collect();
+        let group_end = texts
+            .iter()
+            .position(|t| t.contains("Ran("))
+            .expect("group header");
+        let answer_idx = texts.iter().position(|t| t.contains("real answer")).unwrap();
+        let gap_blanks = texts[group_end + 1..answer_idx]
+            .iter()
+            .filter(|t| t.trim().is_empty())
+            .count();
+        assert_eq!(gap_blanks, 1, "exactly one blank between tools and text");
+    }
+
+    /// Merged groups must keep the full colored diff view for edits.
+    #[test]
+    fn group_body_shows_edit_diff_rows() {
+        let mut tc = ThinkingCell::new();
+        tc.streaming = false;
+        tc.blocks.push(ThinkBlock::ToolGroup(vec![
+            edit_tool_with_diff(&sample_diff()),
+            success_tool("bash", Some("warning: something")),
+        ]));
+
+        let rows = tc.build(120, None);
+        let texts: Vec<String> = rows.iter().map(|r| line_text(&r.line)).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("added_0")),
+            "diff addition rows must render inside the group: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("removed_1")),
+            "diff removal rows must render inside the group"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("(+2 -2)")),
+            "summary line with change counts stays"
+        );
+    }
+
+    /// Header shows the full capitalized tool name — never a lowercase stub.
+    #[test]
+    fn header_names_are_capitalized_full_words() {
+        let mut tc = ThinkingCell::new();
+        tc.streaming = false;
+        tc.blocks.push(ThinkBlock::ToolGroup(vec![
+            edit_tool_with_diff(&sample_diff()),
+            success_tool("bash", Some("out")),
+        ]));
+
+        let rows = tc.build(120, None);
+        let first = line_text(&rows[1].line); // row 0 is top padding
+        assert!(
+            first.starts_with("▪ Edit("),
+            "expected '▪ Edit(', got {first:?}"
+        );
+        assert!(!first.contains("edi…"), "no lowercase truncated names");
+    }
+
+    /// The merged bash header uses the available width instead of a fixed
+    /// 38-column cap.
+    #[test]
+    fn ran_header_scales_with_width() {
+        let long_cmd = format!("cargo check {} 2>&1 | head -50", "--workspaces".repeat(12));
+        let tool = ToolCallCell {
+            tool_name: "bash".to_string(),
+            args_preview: long_cmd.clone(),
+            status: ToolStatus::Success,
+            output: None,
+            diff: None,
+            expanded: false,
+            path: None,
+            read_offset: None,
+            read_limit: None,
+            tool_call_id: Some("t3".into()),
+            arguments: Some(format!("{{\"command\":\"{long_cmd}\"}}")),
+        };
+        let rows = render_group_inline(std::slice::from_ref(&tool), 160, None);
+        let header = line_text(&rows[0].line);
+        let visible = header.chars().count();
+        assert!(
+            visible > 60,
+            "wide terminal should show a much longer Ran(...) preview, got {visible}: {header:?}"
+        );
     }
 }
 

@@ -47,8 +47,9 @@ pub const HELP_TEXT: &str = r#"
 - `/help` — show this help
 - `/exit` — quit
 
-Keys: `Enter` send · `Shift+Enter` newline · `PageUp/PageDown` scroll ·
-type `/` for the command menu · `@` to reference a workspace path · `Ctrl-C` quit.
+Keys: `Enter` send · `Shift+Enter` newline · `↑↓` input history ·
+`PageUp/PageDown` scroll · type `/` for the command menu ·
+`@` to reference a workspace path · `Ctrl-C` quit.
 "#;
 
 /// Short codex-style tip shown when a fresh session opens.
@@ -242,6 +243,9 @@ pub struct App {
     session: Session,
     history: Vec<String>,
     history_idx: Option<usize>,
+    /// What the user was typing before they stepped back into `history`.
+    /// Restored when they navigate past the newest entry (shell-style draft).
+    history_draft: Option<String>,
     agent_history: std::sync::Arc<std::sync::Mutex<Vec<agent::ChatMessage>>>,
     shimmer_start: Instant,
     dirty: bool,
@@ -310,6 +314,7 @@ impl App {
             session,
             history: Vec::new(),
             history_idx: None,
+            history_draft: None,
             agent_history: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shimmer_start: Instant::now(),
             dirty: true,
@@ -1137,14 +1142,12 @@ impl App {
             KeyCode::PageDown => {
                 self.scroll_down(5);
             }
-            KeyCode::Up if self.input_is_empty() => {
-                self.scroll_up(1);
-            }
-            KeyCode::Down if self.input_is_empty() => {
-                self.scroll_down(1);
-            }
-            KeyCode::Up if self.input.lines().len() <= 1 => self.recall_history(-1),
-            KeyCode::Down if self.input.lines().len() <= 1 => self.recall_history(1),
+            // ↑/↓ always walk the input history (shell-style). The composer
+            // itself never scrolls: multi-line drafts are edited with
+            // Left/Right/Home/End, and the transcript scrolls via PageUp /
+            // PageDown / mouse wheel — even while the composer has text.
+            KeyCode::Up => self.recall_history(-1),
+            KeyCode::Down => self.recall_history(1),
             KeyCode::Char('/') if self.input.lines().len() <= 1
                 && self.input.lines().first().map(|l| l.is_empty()).unwrap_or(true) =>
             {
@@ -1173,6 +1176,7 @@ impl App {
                 if !text.is_empty() {
                     self.history.push(text.clone());
                     self.history_idx = None;
+                    self.history_draft = None;
                     self.submit(text, true);
                 } else if !self.paste_blocks.is_empty() {
                     self.paste_blocks.clear();
@@ -1198,12 +1202,20 @@ impl App {
                 self.dirty = true;
             }
             _ => {
-                self.history_idx = None;
+                // Only genuine edits invalidate the history browse position —
+                // moving the cursor (Left/Right/Home/End) must not, or one
+                // arrow press would jump back to the oldest entry.
+                let before = self.input_text();
                 if let Some(input) = map_key(key) {
                     let refresh = matches!(key.code, KeyCode::Char('@'));
                     self.input.input(input);
                     self.update_path_completion(refresh);
                     self.dirty = true;
+                }
+                if self.input_text() != before {
+                    self.history_idx = None;
+                    // The live composer is now the authoritative draft.
+                    self.history_draft = Some(self.input_text());
                 }
             }
         }
@@ -1375,6 +1387,7 @@ impl App {
             }
             _ => {
                 self.history_idx = None;
+                self.history_draft = None;
                 if let Some(input) = map_key(key) {
                     let refresh = matches!(key.code, KeyCode::Char('@'));
                     self.input.input(input);
@@ -1386,36 +1399,46 @@ impl App {
         Ok(false)
     }
 
-    /// Recall a previous submitted input (codex-like Up/Down on a single line).
+    /// Replace the composer contents with `text`, cursor parked at the end.
+    fn set_composer(&mut self, text: String) {
+        self.input = TextArea::new(vec![text]);
+        self.input.input(Input { key: Key::End, ctrl: false, alt: false, shift: false });
+        self.dirty = true;
+    }
+
+    /// Step through previously sent inputs with ↑/↓. Leaving the live
+    /// composer stashes it as a draft; stepping past the newest entry puts
+    /// the draft back so a half-typed message is never lost.
     fn recall_history(&mut self, dir: i32) {
         if self.history.is_empty() {
             return;
         }
+        // ↓ from the live composer: nothing newer to show.
+        if self.history_idx.is_none() && dir > 0 {
+            return;
+        }
         let len = self.history.len() as i32;
+        if self.history_idx.is_none() {
+            // Entering history: save whatever was being typed.
+            self.history_draft = Some(self.input_text());
+        }
         let idx = match self.history_idx {
             Some(i) => {
                 let n = i as i32 + dir;
-                if n < 0 {
-                    0
-                } else if n >= len {
-                    (len - 1) as usize
-                } else {
-                    n as usize
+                if n >= len {
+                    // Past the newest entry: hand the draft back.
+                    let draft = self.history_draft.take().unwrap_or_default();
+                    self.history_idx = None;
+                    self.set_composer(draft);
+                    return;
                 }
+                n.max(0) as usize
             }
-            None => {
-                if dir < 0 {
-                    (len - 1) as usize
-                } else {
-                    0
-                }
-            }
+            None => (len - 1) as usize,
         };
         self.history_idx = Some(idx);
         let text = self.history[idx].clone();
-        self.input = TextArea::new(vec![text]);
-        self.input.input(Input { key: Key::End, ctrl: false, alt: false, shift: false });
-        self.dirty = true;
+        self.set_composer(text);
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
@@ -2536,7 +2559,11 @@ async fn run_inner(
         stdout,
         terminal::EnterAlternateScreen,
         crossterm::cursor::Hide,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        // Without mouse capture the terminal never delivers wheel events, so
+        // the transcript could only be scrolled from the keyboard. Capture
+        // routes ScrollUp/ScrollDown into `App::handle_mouse`.
+        crossterm::event::EnableMouseCapture
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2556,7 +2583,17 @@ async fn run_inner(
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(e) => {
-                        if tx.blocking_send(AppEvent::Terminal(e)).is_err() {
+                        // With mouse capture on, terminals emit a Drag/Moved
+                        // event per pointer step; we only act on clicks and
+                        // wheel, so drop the rest before they flood the
+                        // channel and wake the render loop for nothing.
+                        let useful = match &e {
+                            crossterm::event::Event::Mouse(m) => {
+                                !matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_))
+                            }
+                            _ => true,
+                        };
+                        if useful && tx.blocking_send(AppEvent::Terminal(e)).is_err() {
                             break;
                         }
                     }
@@ -2588,8 +2625,19 @@ async fn run_inner(
         // fight with us. We re-enable it below so the user lands at the
         // bottom after all cells are painted.
         app.auto_scroll = false;
-        let resumed = app.session.messages.clone();
+        // Take ownership of the messages instead of cloning them: sessions
+        // reach multiple MB and a full deep clone here spiked resident memory
+        // (and swap pressure) on every resume.
+        let mut resumed = std::mem::take(&mut app.session.messages);
         app.system_msg(format!("resumed session `{}`", app.session.id));
+        // Seed the composer history with this session's previous user
+        // messages so ↑/↓ recall works right after a resume.
+        app.history.extend(
+            resumed
+                .iter()
+                .filter(|m| m.role == "user" && !m.content.is_empty())
+                .map(|m| m.content.clone()),
+        );
         let mut i = 0;
         while i < resumed.len() {
             let m = &resumed[i];
@@ -2719,9 +2767,7 @@ async fn run_inner(
                 }
             }
         }
-        let hist: Vec<agent::ChatMessage> = app
-            .session
-            .messages
+        let hist: Vec<agent::ChatMessage> = resumed
             .iter()
             .map(|m| agent::ChatMessage {
                 role: match m.role.as_str() {
@@ -2744,6 +2790,8 @@ async fn run_inner(
             })
             .collect();
         *app.agent_history.lock().unwrap() = hist;
+        // Hand the messages back to the session for further turns / saving.
+        app.session.messages = resumed;
         // Re-enable auto-scroll so the transcript snaps to the bottom once
         // the first draw finishes, giving a smooth "open at the latest msg" UX.
         app.auto_scroll = true;
@@ -2812,9 +2860,327 @@ async fn run_inner(
     crossterm::execute!(
         terminal.backend_mut(),
         terminal::LeaveAlternateScreen,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     print_exit_summary(&summary);
     Ok(())
+}
+
+#[cfg(test)]
+mod resume_bench {
+    use super::*;
+    use crate::tui::cells::HistoryCell;
+    use std::time::Instant;
+
+    /// Manual perf probe (ignored by default: needs real saved sessions):
+    /// `cargo test --release bench_real_session_resume_layout -- --ignored --nocapture`
+    ///
+    /// Times the two resume hot spots end to end:
+    ///   1. `list_summaries` — the picker's startup cost. Served from the
+    ///      size+mtime-validated summary index, so unchanged files are never
+    ///      re-parsed.
+    ///   2. The first full layout pass after rebuilding cells from every
+    ///      session, exactly like the resume loop in the TUI.
+    #[test]
+    #[ignore]
+    fn bench_real_session_resume_layout() {
+        let t0 = Instant::now();
+        let n = session::list_summaries().len();
+        println!("== list_summaries (picker): {:?} for {n} sessions", t0.elapsed());
+
+        let dir = dirs::config_dir().unwrap().join("xa/sessions");
+        let mut results: Vec<(u64, String, usize, usize, u128)> = Vec::new();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "json")
+                    && p.file_stem().is_some_and(|s| s != "index")
+            })
+            .collect();
+        entries.sort();
+        for path in entries {
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            let Some(s) = session::load(&id) else {
+                continue;
+            };
+            if s.messages.is_empty() {
+                continue;
+            }
+            let layout = run_one_session(&s);
+            results.push((
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                id,
+                s.messages.len(),
+                s.messages
+                    .iter()
+                    .filter(|m| m.role == "assistant" || m.role == "user")
+                    .count(),
+                layout.as_millis(),
+            ));
+        }
+        println!("== first-layout per session (worst first):");
+        results.sort_by(|a, b| b.4.cmp(&a.4));
+        for (len, id, msgs, turns, ms) in results.iter().take(12) {
+            println!(
+                "== {len:>7} bytes {msgs:>4} msgs {turns:>4} turns  first-layout {ms} ms  [{id}]"
+            );
+        }
+    }
+
+    fn run_one_session(s: &Session) -> std::time::Duration {
+        let mut cells: Vec<Box<dyn HistoryCell>> = Vec::new();
+        let resumed = &s.messages;
+        let mut i = 0;
+        while i < resumed.len() {
+            let m = &resumed[i];
+            match m.role.as_str() {
+                "user" => {
+                    cells.push(Box::new(UserCell::new(m.content.clone())));
+                    i += 1;
+                }
+                "assistant" => {
+                    i += 1;
+                    let mut tc = rebuild_assistant_cell(m);
+                    // Attach following tool results like the real resume path.
+                    while i < resumed.len() && resumed[i].role == "tool" {
+                        if let Some(tcid) = &resumed[i].tool_call_id {
+                            for b in tc.blocks.iter_mut() {
+                                if let crate::tui::cells::ThinkBlock::Tool(tool) = b {
+                                    if tool.tool_call_id.as_deref() == Some(tcid.as_str()) {
+                                        tool.output = Some(resumed[i].content.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    cells.push(Box::new(tc));
+                }
+                _ => i += 1,
+            }
+        }
+        let w = 120u16;
+        let t_first = Instant::now();
+        let _: Vec<u16> = cells.iter().map(|c| c.desired_height(w)).collect();
+        t_first.elapsed()
+    }
+
+    fn rebuild_assistant_cell(m: &session::StoredMessage) -> ThinkingCell {        let mut tc = ThinkingCell::new();
+        if !m.blocks.is_empty() {
+            for b in &m.blocks {
+                match b {
+                    session::StoredBlock::Text(txt) => {
+                        if !txt.is_empty() {
+                            tc.add_text(txt);
+                        }
+                    }
+                    session::StoredBlock::Tool(stc) => {
+                        let args_preview = args_preview(&stc.arguments);
+                        let (p, ro, rl) = tool_path_window(&stc.arguments);
+                        tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                            crate::tui::cells::ToolCallCell {
+                                tool_name: stc.name.clone(),
+                                args_preview,
+                                status: crate::tui::cells::ToolStatus::Success,
+                                output: None,
+                                diff: stc.diff.clone(),
+                                expanded: false,
+                                path: p,
+                                read_offset: ro,
+                                read_limit: rl,
+                                tool_call_id: Some(stc.id.clone()),
+                                arguments: Some(stc.arguments.clone()),
+                            },
+                        ));
+                    }
+                }
+            }
+        } else if let Some(tool_calls) = &m.tool_calls {
+            for stc in tool_calls {
+                let args_preview = args_preview(&stc.arguments);
+                let (p, ro, rl) = tool_path_window(&stc.arguments);
+                tc.blocks.push(crate::tui::cells::ThinkBlock::Tool(
+                    crate::tui::cells::ToolCallCell {
+                        tool_name: stc.name.clone(),
+                        args_preview,
+                        status: crate::tui::cells::ToolStatus::Success,
+                        output: None,
+                        diff: stc.diff.clone(),
+                        expanded: false,
+                        path: p,
+                        read_offset: ro,
+                        read_limit: rl,
+                        tool_call_id: Some(stc.id.clone()),
+                        arguments: Some(stc.arguments.clone()),
+                    },
+                ));
+            }
+        }
+        tc.flush_tool_blocks_to_group();
+        tc.streaming = false;
+        tc
+    }
+}
+
+#[cfg(test)]
+mod composer_history_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let _ = app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn composer_text(app: &App) -> String {
+        app.input_text()
+    }
+
+    fn test_app() -> App {
+        let (tx, _rx) = mpsc::channel(64);
+        App::new(
+            Provider::default(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Session::new("prov", "model"),
+        )
+    }
+
+    /// ↑/↓ must always walk the input history — even when the composer
+    /// already holds (multi-line) text — and never scroll the transcript.
+    #[test]
+    fn up_down_always_recall_history() {
+        let mut app = test_app();
+        app.history = vec!["first msg".into(), "second msg".into()];
+        // Composer pre-filled with a multi-line draft.
+        app.set_composer("draft line one\ndraft line two".into());
+
+        // ↑ leaves the live draft, lands on the newest entry.
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "second msg");
+        // ↑ again walks older entries.
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "first msg");
+        // ↓ returns toward the draft…
+        let _ = app.handle_key(key(KeyCode::Down));
+        assert_eq!(composer_text(&app), "second msg");
+        // …and past the newest entry restores it verbatim.
+        let _ = app.handle_key(key(KeyCode::Down));
+        assert_eq!(composer_text(&app), "draft line one\ndraft line two");
+        // History browsing is fully exited at that point.
+        assert_eq!(app.history_idx, None);
+        // Transcript follow mode untouched by history navigation.
+        assert!(app.auto_scroll);
+    }
+
+    /// Cursor movement inside the composer must NOT reset the browse
+    /// position: ↑↑ lands on a middle entry, ←, ↓ walks to the next-newer
+    /// entry instead of exiting or restarting.
+    #[test]
+    fn cursor_moves_keep_history_position() {
+        let mut app = test_app();
+        app.history = vec!["a".into(), "b".into(), "c".into()];
+
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "c");
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "b");
+        let _ = app.handle_key(key(KeyCode::Left)); // pure cursor move
+        let _ = app.handle_key(key(KeyCode::Down));
+        assert_eq!(composer_text(&app), "c", "↓ after ← must step to 'c'");
+
+        // Typing, however, exits browse mode; ↑ then starts from the newest.
+        type_text(&mut app, "X");
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "c");
+    }
+
+    /// Scrolling the transcript stays on PageUp/PageDown; ↑ never scrolls.
+    #[test]
+    fn up_does_not_scroll_transcript() {
+        let mut app = test_app();
+        app.auto_scroll = false;
+        app.scroll = 40;
+        let before = (app.scroll, app.auto_scroll);
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!((app.scroll, app.auto_scroll), before);
+
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert!(app.scroll < 40, "PageUp must still scroll the transcript");
+    }
+
+    /// Scrolling works even while the composer holds text — PageUp/PageDown
+    /// are never swallowed by the input.
+    #[test]
+    fn pageup_scrolls_while_typing() {
+        let mut app = test_app();
+        // Simulate a scrolled-back state as draw() would have established.
+        app.auto_scroll = false;
+        app.scroll = 40;
+        app.scroll_max = 40;
+        type_text(&mut app, "hello there");
+        assert!(!composer_text(&app).is_empty());
+
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 35, "PageUp scrolls up while typing");
+
+        // And typing afterwards does not disturb the scroll position.
+        type_text(&mut app, "!");
+        assert_eq!(app.scroll, 35);
+        assert!(!app.auto_scroll);
+    }
+
+    /// Resuming seeds ↑/↓ history with every previous user message of the
+    /// session, oldest → newest.
+    #[test]
+    fn resume_seeds_input_history_from_user_messages() {
+        let mut session = Session::new("prov", "model");
+        session.messages = vec![
+            session::StoredMessage {
+                role: "user".into(),
+                content: "first question".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                blocks: Vec::new(),
+            },
+            session::StoredMessage {
+                role: "assistant".into(),
+                content: "answer".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                blocks: Vec::new(),
+            },
+            session::StoredMessage {
+                role: "user".into(),
+                content: "second question".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                blocks: Vec::new(),
+            },
+        ];
+
+        let mut app = test_app();
+        // Mirror the resume loop's seeding step.
+        app.history.extend(
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == "user" && !m.content.is_empty())
+                .map(|m| m.content.clone()),
+        );
+
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "second question");
+        let _ = app.handle_key(key(KeyCode::Up));
+        assert_eq!(composer_text(&app), "first question");
+    }
 }
