@@ -416,7 +416,7 @@ impl App {
                     match b {
                         crate::tui::cells::ThinkBlock::Text(s) => {
                             if !s.is_empty() {
-                                blocks.push(session::StoredBlock::Text(s.clone()));
+                                blocks.push(session::StoredBlock::Text(s.as_ref().to_string()));
                             }
                         }
                         crate::tui::cells::ThinkBlock::Tool(t) => {
@@ -1816,13 +1816,6 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Measure every cell once for this frame. Callers previously re-ran
-    /// `desired_height` (full markdown + highlight) for total, then again per
-    /// cell while painting — O(2N) of the hottest path.
-    ///
-    /// Result is cached by (width, cell_count) so completed-cell transcript
-    /// rows are never re-measured on every frame; only new or resized cells
-    /// trigger a rebuild.
     fn cell_heights(&mut self, width: u16) -> Vec<u16> {
         if let Some((cached_w, cached_n, ref heights)) = self.heights_cache {
             if cached_w == width && cached_n == self.cells.len() {
