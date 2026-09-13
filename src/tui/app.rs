@@ -11,12 +11,13 @@ use crossterm::{
     terminal,
 };
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::Cell,
+    layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 use tokio::sync::mpsc;
@@ -36,6 +37,72 @@ use crate::tui::path::{
 use crate::tui::theme;
 use crate::tui::think::{StreamPhase, ThinkFilter};
 use crate::tui::wizard::{Wizard, WizardAction};
+
+/// Crossterm's cursor-position query (CPR/DSR) is not supported by every
+/// terminal host. Inline viewports only need the position we explicitly set at
+/// startup, so track it locally instead of blocking on a terminal response.
+struct InlineBackend<W: Write> {
+    inner: CrosstermBackend<W>,
+    cursor: Position,
+}
+
+impl<W: Write> Write for InlineBackend<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+
+impl<W: Write> Backend for InlineBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(self.cursor)
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.cursor = position;
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, n: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, n)
+    }
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, n: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, n)
+    }
+}
+
+type AppTerminal = Terminal<InlineBackend<Stdout>>;
 
 /// Verbose command reference, shown only on `/help`.
 pub const HELP_TEXT: &str = r#"
@@ -213,6 +280,12 @@ struct ExitSummary {
 pub struct App {
     provider: Provider,
     cells: Vec<Box<dyn crate::tui::cells::HistoryCell>>,
+    /// Cells already written into the terminal's native scrollback.
+    committed_cells: usize,
+    /// Initial branded header captured from the first frame so it can be
+    /// inserted into native scrollback with the first committed messages.
+    header_rows: Option<Vec<Vec<Cell>>>,
+    header_committed: bool,
     input: TextArea<'static>,
     scroll: u16,
     auto_scroll: bool,
@@ -296,6 +369,9 @@ impl App {
         App {
             provider,
             cells: Vec::new(),
+            committed_cells: 0,
+            header_rows: None,
+            header_committed: false,
             input: TextArea::default(),
             scroll: 0,
             auto_scroll: true,
@@ -1489,7 +1565,7 @@ impl App {
 
     async fn do_pending(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut AppTerminal,
     ) -> io::Result<()> {
         self.reader_paused.store(true, Ordering::SeqCst);
         let result = match std::mem::replace(&mut self.pending, Pending::None) {
@@ -1845,9 +1921,101 @@ impl App {
                 return heights.clone();
             }
         }
-        let heights: Vec<u16> = self.cells.iter().map(|c| c.desired_height(width)).collect();
+        let heights: Vec<u16> = self.cells[self.committed_cells..]
+            .iter()
+            .map(|c| c.desired_height(width))
+            .collect();
         self.heights_cache = Some((width, self.cells.len(), heights.clone()));
         heights
+    }
+
+    fn flush_header(&mut self, terminal: &mut AppTerminal) -> io::Result<()> {
+        if self.header_committed {
+            return Ok(());
+        }
+        let Some(rows) = self.header_rows.as_ref() else {
+            return Ok(());
+        };
+        terminal.insert_before(rows.len() as u16, |buffer| {
+            let mut y = buffer.area.top();
+            for row in rows {
+                for (offset, cell) in row.iter().take(buffer.area.width as usize).enumerate() {
+                    buffer
+                        .get_mut(buffer.area.left() + offset as u16, y)
+                        .clone_from(cell);
+                }
+                y = y.saturating_add(1);
+            }
+        })?;
+        self.header_committed = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Move stable transcript cells into the terminal's native scrollback.
+    /// The active streaming cell stays in the inline viewport because it is
+    /// still being mutated on every delta.
+    fn flush_committed_history(
+        &mut self,
+        terminal: &mut AppTerminal,
+    ) -> io::Result<()> {
+        // Keep the fresh-session header visible until the first real turn.
+        if self.committed_cells == 0
+            && self.active_think.is_none()
+            && !self
+                .cells
+                .iter()
+                .any(|cell| cell.as_any().is::<UserCell>())
+        {
+            return Ok(());
+        }
+        let stable_end = self.active_think.unwrap_or(self.cells.len());
+        let width = terminal.size()?.width;
+        let viewport_height = terminal.size()?.height;
+        // Keep a screenful of recent history in the live viewport. Only move
+        // the oldest stable cells into native scrollback once the transcript
+        // would otherwise crowd the composer off screen.
+        let live_budget = viewport_height.saturating_sub(6).max(1);
+        let mut live_height: u16 = self.cells[self.committed_cells..]
+            .iter()
+            .map(|cell| cell.desired_height(width))
+            .sum();
+        let mut end = self.committed_cells;
+        while end < stable_end && live_height > live_budget {
+            live_height = live_height.saturating_sub(self.cells[end].desired_height(width));
+            end += 1;
+        }
+        if end <= self.committed_cells {
+            return Ok(());
+        }
+
+        let cells = &self.cells[self.committed_cells..end];
+        let heights: Vec<u16> = cells.iter().map(|cell| cell.desired_height(width)).collect();
+        let total: u16 = heights.iter().copied().sum();
+        let ctx = RenderContext { shimmer_phase: 0.0 };
+        terminal.insert_before(total, |buffer| {
+            let mut y = buffer.area.top();
+            for (cell, height) in cells.iter().zip(heights.iter().copied()) {
+                let area = Rect {
+                    x: buffer.area.left(),
+                    y,
+                    width: buffer.area.width,
+                    height,
+                };
+                if let Some(bg) = cell.bg() {
+                    buffer.set_style(area, Style::default().bg(bg));
+                }
+                cell.render(area, 0, buffer, &ctx);
+                y = y.saturating_add(height);
+            }
+        })?;
+        self.committed_cells = end;
+        self.heights_cache = None;
+        self.scroll = 0;
+        self.scroll_max = 0;
+        self.auto_scroll = true;
+        self.dirty = true;
+        Ok(())
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame) {
@@ -1924,7 +2092,7 @@ impl App {
         } else {
             self.scroll.min(max_with_header)
         };
-        let show_header = scroll_candidate == 0;
+        let show_header = !self.header_committed && scroll_candidate == 0;
 
         let (transcript, header_area, tip_area) = if show_header {
             (
@@ -1954,6 +2122,18 @@ impl App {
         if show_header {
             self.draw_header(f, header_area);
             self.draw_tip(f, tip_area);
+            if self.header_rows.is_none() {
+                let buffer = f.buffer_mut();
+                self.header_rows = Some(
+                    (header_area.top()..tip_area.bottom())
+                        .map(|y| {
+                            (area.left()..area.right())
+                                .map(|x| buffer.get(x, y).clone())
+                                .collect()
+                        })
+                        .collect(),
+                );
+            }
         }
 
         // Virtual scroll: clip precomputed heights to the viewport.
@@ -1979,7 +2159,7 @@ impl App {
         self.scroll_max = max_scroll + pad;
 
         let mut y: i32 = -(scroll as i32);
-        for (c, &h_u) in self.cells.iter().zip(heights.iter()) {
+        for (c, &h_u) in self.cells[self.committed_cells..].iter().zip(heights.iter()) {
             let h = h_u as i32;
             if y + h > 0 && y < view_h as i32 {
                 let top = y.max(0) as u16;
@@ -2456,7 +2636,7 @@ fn format_count(value: usize) -> String {
 /// Handle one multiplexed app event. Returns `true` when the UI should exit.
 fn apply_app_event(
     app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut AppTerminal,
     ev: AppEvent,
 ) -> io::Result<bool> {
     match ev {
@@ -2519,13 +2699,13 @@ fn map_key(key: KeyEvent) -> Option<Input> {
 
 /// Temporarily drop raw mode to read a single line from the user.
 fn read_line_paused(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut AppTerminal,
     prompt: &str,
 ) -> io::Result<String> {
     terminal::disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Show)?;
     write!(terminal.backend_mut(), "\r\n\x1b[33m{prompt}\x1b[0m ")?;
-    terminal.backend_mut().flush()?;
+    Write::flush(terminal.backend_mut())?;
     let mut s = String::new();
     io::stdin().read_line(&mut s)?;
     terminal::enable_raw_mode()?;
@@ -2555,18 +2735,24 @@ async fn run_inner(
     use std::time::Duration;
 
     let mut stdout = io::stdout();
+    let (_, screen_height) = terminal::size()?;
+    let viewport_height = screen_height.min(14).max(1);
     crossterm::execute!(
         stdout,
-        terminal::EnterAlternateScreen,
+        crossterm::cursor::MoveTo(0, screen_height.saturating_sub(1)),
         crossterm::cursor::Hide,
-        crossterm::event::EnableBracketedPaste,
-        // Without mouse capture the terminal never delivers wheel events, so
-        // the transcript could only be scrolled from the keyboard. Capture
-        // routes ScrollUp/ScrollDown into `App::handle_mouse`.
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableBracketedPaste
     )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let backend = InlineBackend {
+        inner: CrosstermBackend::new(stdout),
+        cursor: Position::new(0, screen_height.saturating_sub(1)),
+    };
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?;
     terminal::enable_raw_mode()?;
 
     let (tx_event, mut rx_event) = mpsc::channel::<AppEvent>(128);
@@ -2802,6 +2988,8 @@ async fn run_inner(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     // First paint before waiting on input.
     terminal.draw(|f| app.draw(f))?;
+    app.flush_header(&mut terminal)?;
+    terminal.draw(|f| app.draw(f))?;
 
     'ui: loop {
         // Wait for the next event or animation tick, then drain anything else
@@ -2842,6 +3030,7 @@ async fn run_inner(
             }
         }
 
+        app.flush_committed_history(&mut terminal)?;
         if app.dirty {
             terminal.draw(|f| app.draw(f))?;
         }
@@ -2856,12 +3045,11 @@ async fn run_inner(
     }
 
     let summary = app.exit_summary();
+    terminal.clear()?;
     terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
-        terminal::LeaveAlternateScreen,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     print_exit_summary(&summary);

@@ -27,7 +27,7 @@ openai-api-rs = { version = "10.0.1", default-features = false, features = ["rus
 # `ratatui-markdown` 0.3 and `tui-textarea` 0.7 currently share the 0.29
 # Ratatui API. Keeping the direct dependency aligned prevents two incompatible
 # widget/type families from entering the TUI build.
-ratatui = "0.29.0"
+ratatui = { version = "0.29.0", features = ["scrolling-regions"] }
 crossterm = "0.29"
 tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
 # Keep XA's markdown renderer and supported syntax highlighters, but omit
