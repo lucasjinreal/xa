@@ -125,6 +125,11 @@ Tip: type `/` for commands or `@` for workspace paths, or just start chatting.
      `/login [name]` to add a provider · `/models` to switch · `/help` for all commands.
 "#;
 
+const HEADER_TOP_PADDING: u16 = 2;
+const HEADER_HEIGHT: u16 = 7;
+const TIP_HEIGHT: u16 = 2;
+const WELCOME_HEIGHT: u16 = HEADER_TOP_PADDING + HEADER_HEIGHT + TIP_HEIGHT;
+
 /// Safety net: if `streaming` stays `true` with no stream event for this long,
 /// the turn is considered wedged and is force-recovered so the user can send
 /// again. Generous — the agent pipeline already bounds every request/stream, so
@@ -282,6 +287,10 @@ pub struct App {
     cells: Vec<Box<dyn crate::tui::cells::HistoryCell>>,
     /// Cells already written into the terminal's native scrollback.
     committed_cells: usize,
+    /// Leading rendered rows of the first uncommitted cell already written to
+    /// native scrollback. This lets a single long streaming reply push the
+    /// terminal continuously without waiting for the whole cell to finish.
+    committed_prefix_rows: u16,
     /// Initial branded header captured from the first frame so it can be
     /// inserted into native scrollback with the first committed messages.
     header_rows: Option<Vec<Vec<Cell>>>,
@@ -293,6 +302,10 @@ pub struct App {
     /// events arrive before the next layout pass, so this lets a downward
     /// scroll re-enable follow mode precisely when it reaches that bottom.
     scroll_max: u16,
+    /// Rows available to the transcript once transient activity UI disappears.
+    /// History is committed against this settled capacity so completing a
+    /// reply cannot expose blank rows beneath the composer.
+    live_transcript_capacity: u16,
     streaming: bool,
     should_quit: bool,
     /// Footer / transient messages (queue, ctrl-c hint). Activity labels live
@@ -370,12 +383,14 @@ impl App {
             provider,
             cells: Vec::new(),
             committed_cells: 0,
+            committed_prefix_rows: 0,
             header_rows: None,
             header_committed: false,
             input: TextArea::default(),
             scroll: 0,
             auto_scroll: true,
             scroll_max: 0,
+            live_transcript_capacity: 1,
             streaming: false,
             should_quit: false,
             status: String::new(),
@@ -966,6 +981,9 @@ impl App {
             "/exit" | "/quit" | "/q" => self.should_quit = true,
             "/clear" => {
                 self.cells.clear();
+                self.committed_cells = 0;
+                self.committed_prefix_rows = 0;
+                self.heights_cache = None;
                 self.system_msg(WELCOME_TEXT);
             }
             "/help" | "/?" => self.system_msg(HELP_TEXT),
@@ -1640,6 +1658,9 @@ impl App {
     fn new_session(&mut self) {
         self.session = Session::new(&self.provider.name, &self.provider.model);
         self.cells.clear();
+        self.committed_cells = 0;
+        self.committed_prefix_rows = 0;
+        self.heights_cache = None;
         self.agent_history.lock().unwrap().clear();
         self.system_msg(WELCOME_TEXT);
         self.system_msg(format!("started a new session `{}`", self.session.id));
@@ -1918,14 +1939,22 @@ impl App {
     fn cell_heights(&mut self, width: u16) -> Vec<u16> {
         if let Some((cached_w, cached_n, ref heights)) = self.heights_cache {
             if cached_w == width && cached_n == self.cells.len() {
-                return heights.clone();
+                let mut heights = heights.clone();
+                if let Some(first) = heights.first_mut() {
+                    *first = first.saturating_sub(self.committed_prefix_rows);
+                }
+                return heights;
             }
         }
-        let heights: Vec<u16> = self.cells[self.committed_cells..]
+        let raw_heights: Vec<u16> = self.cells[self.committed_cells..]
             .iter()
             .map(|c| c.desired_height(width))
             .collect();
-        self.heights_cache = Some((width, self.cells.len(), heights.clone()));
+        self.heights_cache = Some((width, self.cells.len(), raw_heights.clone()));
+        let mut heights = raw_heights;
+        if let Some(first) = heights.first_mut() {
+            *first = first.saturating_sub(self.committed_prefix_rows);
+        }
         heights
     }
 
@@ -1971,46 +2000,84 @@ impl App {
         }
         let stable_end = self.active_think.unwrap_or(self.cells.len());
         let width = terminal.size()?.width;
-        let viewport_height = terminal.size()?.height;
-        // Keep a screenful of recent history in the live viewport. Only move
-        // the oldest stable cells into native scrollback once the transcript
-        // would otherwise crowd the composer off screen.
-        let live_budget = viewport_height.saturating_sub(6).max(1);
-        let mut live_height: u16 = self.cells[self.committed_cells..]
-            .iter()
-            .map(|cell| cell.desired_height(width))
-            .sum();
+        // Let the continuous message stream grow downward until it fills the
+        // rows above the composer. Only then move the oldest stable cells into
+        // native scrollback, which pushes the whole terminal upward.
+        let live_heights = self.cell_heights(width);
+        let mut live_height = live_heights.iter().copied().fold(0u16, u16::saturating_add);
         let mut end = self.committed_cells;
-        while end < stable_end && live_height > live_budget {
-            live_height = live_height.saturating_sub(self.cells[end].desired_height(width));
+        while end < stable_end && live_height > self.live_transcript_capacity {
+            let oldest_height = live_heights[end - self.committed_cells];
+            // Keep enough following content to fill the transcript after this
+            // cell is committed. Otherwise committing a whole tall cell would
+            // open a visible hole between native history and the composer.
+            if live_height.saturating_sub(oldest_height) < self.live_transcript_capacity {
+                break;
+            }
+            live_height = live_height.saturating_sub(oldest_height);
             end += 1;
         }
-        if end <= self.committed_cells {
-            return Ok(());
+        let ctx = RenderContext { shimmer_phase: 0.0 };
+        let mut changed = false;
+        if end > self.committed_cells {
+            let start = self.committed_cells;
+            let cells = &self.cells[start..end];
+            let heights = &live_heights[..end - start];
+            let total: u16 = heights.iter().copied().sum();
+            let first_skip = self.committed_prefix_rows;
+            terminal.insert_before(total, |buffer| {
+                let mut y = buffer.area.top();
+                for (offset, (cell, height)) in
+                    cells.iter().zip(heights.iter().copied()).enumerate()
+                {
+                    let area = Rect {
+                        x: buffer.area.left(),
+                        y,
+                        width: buffer.area.width,
+                        height,
+                    };
+                    if let Some(bg) = cell.bg() {
+                        buffer.set_style(area, Style::default().bg(bg));
+                    }
+                    cell.render(area, if offset == 0 { first_skip } else { 0 }, buffer, &ctx);
+                    y = y.saturating_add(height);
+                }
+            })?;
+            self.committed_cells = end;
+            self.committed_prefix_rows = 0;
+            self.heights_cache = None;
+            changed = true;
         }
 
-        let cells = &self.cells[self.committed_cells..end];
-        let heights: Vec<u16> = cells.iter().map(|cell| cell.desired_height(width)).collect();
-        let total: u16 = heights.iter().copied().sum();
-        let ctx = RenderContext { shimmer_phase: 0.0 };
-        terminal.insert_before(total, |buffer| {
-            let mut y = buffer.area.top();
-            for (cell, height) in cells.iter().zip(heights.iter().copied()) {
-                let area = Rect {
-                    x: buffer.area.left(),
-                    y,
-                    width: buffer.area.width,
-                    height,
-                };
-                if let Some(bg) = cell.bg() {
-                    buffer.set_style(area, Style::default().bg(bg));
-                }
-                cell.render(area, 0, buffer, &ctx);
-                y = y.saturating_add(height);
+        // A single active assistant cell can itself grow beyond the viewport.
+        // Commit only its newly-overflowing leading rows and keep the mutable
+        // tail live, so streaming text pushes the entire terminal continuously.
+        if self.active_think == Some(self.committed_cells) {
+            let full_height = self.cells[self.committed_cells].desired_height(width);
+            let remaining = full_height.saturating_sub(self.committed_prefix_rows);
+            if remaining > self.live_transcript_capacity {
+                let rows = remaining - self.live_transcript_capacity;
+                let skip = self.committed_prefix_rows;
+                let cell = &self.cells[self.committed_cells];
+                terminal.insert_before(rows, |buffer| {
+                    let area = buffer.area;
+                    if let Some(bg) = cell.bg() {
+                        buffer.set_style(area, Style::default().bg(bg));
+                    }
+                    cell.render(area, skip, buffer, &ctx);
+                })?;
+                self.committed_prefix_rows = self.committed_prefix_rows.saturating_add(rows);
+                changed = true;
             }
-        })?;
-        self.committed_cells = end;
-        self.heights_cache = None;
+        }
+
+        if !changed {
+            return Ok(());
+        }
+        // `insert_before` moves terminal rows outside ratatui's normal diff
+        // pass. Invalidate and clear only the live inline viewport so the next
+        // draw cannot leave stale cells behind after a partial scroll.
+        terminal.clear()?;
         self.scroll = 0;
         self.scroll_max = 0;
         self.auto_scroll = true;
@@ -2026,6 +2093,7 @@ impl App {
         // Thinking / Responding. Footer under the input keeps model meta.
         let show_activity = self.stream_phase.is_active() || self.streaming || !self.status.is_empty();
         let activity_h: u16 = if show_activity { 1 } else { 0 };
+        let activity_pad_h: u16 = if show_activity { 1 } else { 0 };
         // Unlike the slash menu, path suggestions reserve real layout space
         // *below* the composer. This keeps the text being typed unobscured.
         let path_matches = if self.path_completion_open {
@@ -2048,16 +2116,41 @@ impl App {
         let paste_block_rows = self.paste_blocks.len() as u16;
         let input_h = (input_lines + paste_block_rows + 2).clamp(3, 14);
 
+        // Size the live transcript to its content. Any unused terminal space
+        // goes after the composer, so logo → messages → composer form one
+        // continuous stream that grows naturally toward the bottom.
+        let show_header = !self.header_committed;
+        let heights = self.cell_heights(area.width);
+        let total_cells: u16 = heights.iter().sum();
+        let transcript_wanted = total_cells
+            .saturating_add(if show_header { WELCOME_HEIGHT } else { 0 });
+        let settled_chrome_h = input_h
+            .saturating_add(path_popup_h)
+            .saturating_add(1);
+        let chrome_h = activity_pad_h
+            .saturating_add(activity_h)
+            .saturating_add(activity_pad_h)
+            .saturating_add(settled_chrome_h);
+        self.live_transcript_capacity = area
+            .height
+            .saturating_sub(settled_chrome_h)
+            .max(1);
+        let visible_transcript_capacity = area.height.saturating_sub(chrome_h).max(1);
+        // Before overflow the composer follows the stream downward; once the
+        // transcript reaches capacity it stays at the physical bottom.
+        let transcript_h = transcript_wanted.min(visible_transcript_capacity);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(1),  // padding above activity
+                Constraint::Length(transcript_h),
+                Constraint::Length(activity_pad_h), // padding above activity
                 Constraint::Length(activity_h),
-                Constraint::Length(1),  // padding below activity
+                Constraint::Length(activity_pad_h), // padding below activity
                 Constraint::Length(input_h),
                 Constraint::Length(path_popup_h),
                 Constraint::Length(1),
+                Constraint::Min(0),     // unused terminal space follows the flow
             ])
             .split(area);
         self.input_area_width = chunks[4].width;
@@ -2075,44 +2168,27 @@ impl App {
         // while the view is pinned to the very top they are shown, but once the
         // user scrolls down into the transcript they scroll away and the full
         // height is handed to the conversation.
-        const HEADER_H: u16 = 7;
-        const TIP_H: u16 = 2;
-        const PRE: u16 = HEADER_H + TIP_H;
-
-        // One layout pass for all cells at this width (cache fills here).
-        let heights = self.cell_heights(view.width);
-        let total_cells: u16 = heights.iter().sum();
-
-        // First pass assumes the banner is shown to decide whether we're at the
-        // top, then recompute the true scroll range for the chosen layout.
-        let usable_with_header = view.height.saturating_sub(PRE);
-        let max_with_header = total_cells.saturating_sub(usable_with_header);
-        let scroll_candidate = if self.auto_scroll {
-            max_with_header
-        } else {
-            self.scroll.min(max_with_header)
-        };
-        let show_header = !self.header_committed && scroll_candidate == 0;
+        let usable_with_header = view.height.saturating_sub(WELCOME_HEIGHT);
 
         let (transcript, header_area, tip_area) = if show_header {
             (
                 Rect {
                     x: view.left(),
-                    y: view.top() + PRE,
+                    y: view.top() + WELCOME_HEIGHT,
                     width: view.width,
                     height: usable_with_header,
                 },
                 Rect {
                     x: view.left(),
-                    y: view.top(),
+                    y: view.top() + HEADER_TOP_PADDING,
                     width: view.width,
-                    height: HEADER_H,
+                    height: HEADER_HEIGHT,
                 },
                 Rect {
                     x: view.left(),
-                    y: view.top() + HEADER_H,
+                    y: view.top() + HEADER_TOP_PADDING + HEADER_HEIGHT,
                     width: view.width,
-                    height: TIP_H,
+                    height: TIP_HEIGHT,
                 },
             )
         } else {
@@ -2125,7 +2201,7 @@ impl App {
             if self.header_rows.is_none() {
                 let buffer = f.buffer_mut();
                 self.header_rows = Some(
-                    (header_area.top()..tip_area.bottom())
+                    (view.top()..tip_area.bottom())
                         .map(|y| {
                             (area.left()..area.right())
                                 .map(|x| buffer.get(x, y).clone())
@@ -2140,26 +2216,23 @@ impl App {
         let total = total_cells;
         let view_h = transcript.height;
         let max_scroll = total.saturating_sub(view_h);
-        // One blank row of breathing room between the last line (thinking
-        // indicator, streaming output, …) and the input composer, so content
-        // never butts right up against the input bar at the bottom (DESIGN §4).
-        const BOTTOM_PAD: u16 = 1;
-        // When the transcript actually scrolls, allow scrolling one extra row
-        // past the end so that blank row is always reserved at the bottom.
-        let pad = if max_scroll > 0 { BOTTOM_PAD } else { 0 };
         // Auto-scroll keeps the newest content pinned to the bottom, so the
         // streaming output stays visible as it grows. Any manual scroll turns
         // it off (below) and we then respect the explicit offset.
         let scroll = if self.auto_scroll {
-            max_scroll + pad
+            max_scroll
         } else {
-            self.scroll.min(max_scroll + pad)
+            self.scroll.min(max_scroll)
         };
         self.scroll = scroll; // reconcile
-        self.scroll_max = max_scroll + pad;
+        self.scroll_max = max_scroll;
 
         let mut y: i32 = -(scroll as i32);
-        for (c, &h_u) in self.cells[self.committed_cells..].iter().zip(heights.iter()) {
+        for (cell_offset, (c, &h_u)) in self.cells[self.committed_cells..]
+            .iter()
+            .zip(heights.iter())
+            .enumerate()
+        {
             let h = h_u as i32;
             if y + h > 0 && y < view_h as i32 {
                 let top = y.max(0) as u16;
@@ -2175,7 +2248,11 @@ impl App {
                     // viewport. Passing `skip` keeps scrolling unified: the
                     // visible slice continues seamlessly from the cell above
                     // instead of each cell restarting at its own first row.
-                    let skip = (-y).max(0) as u16;
+                    let skip = ((-y).max(0) as u16).saturating_add(if cell_offset == 0 {
+                        self.committed_prefix_rows
+                    } else {
+                        0
+                    });
                     if let Some(bg) = c.bg() {
                         f.buffer_mut().set_style(cell_area, Style::default().bg(bg));
                     }
@@ -2736,7 +2813,10 @@ async fn run_inner(
 
     let mut stdout = io::stdout();
     let (_, screen_height) = terminal::size()?;
-    let viewport_height = screen_height.min(14).max(1);
+    // The welcome rows are committed immediately above the inline viewport.
+    // Fill every remaining terminal row so there is no hidden headroom: each
+    // completed message then pushes the whole terminal upward right away.
+    let viewport_height = screen_height.saturating_sub(WELCOME_HEIGHT).max(1);
     crossterm::execute!(
         stdout,
         crossterm::cursor::MoveTo(0, screen_height.saturating_sub(1)),
