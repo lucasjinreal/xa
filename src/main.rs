@@ -249,9 +249,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         None => {
-            // No subcommand provided -> launch the interactive agent TUI directly.
-            if cli.input.is_some() {
-                eprintln!("Error: No command provided");
+            // No subcommand provided -> try legacy prompt commands first
+            if let Some(input) = &cli.input {
+                let prompt_config = load_prompt_config().await?;
+                if let Some(matched) = find_command(input, &prompt_config.prompts) {
+                    // For legacy commands: cli.input is the command name, cli.args has the real content.
+                    // Build the corrected (input, args) pair for process_command_with_args.
+                    let (real_input, real_args) = if !cli.args.is_empty() {
+                        (Some(cli.args[0].clone()), cli.args[1..].to_vec())
+                    } else {
+                        (Some(cli.input.clone().unwrap()), vec![])
+                    };
+                    let tmp_cli = Cli {
+                        command: None,
+                        no_stream: cli.no_stream,
+                        debug: cli.debug,
+                        theme: cli.theme.clone(),
+                        input: real_input,
+                        args: real_args,
+                    };
+                    process_command_with_args(&tmp_cli, &matched).await?;
+                    return Ok(());
+                }
+                eprintln!("Error: Command '{}' not found. Use 'xa ls' to see available commands.", input);
                 std::process::exit(1);
             } else {
                 let provider = agent::load_active_provider().await;
@@ -266,13 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn process_command_with_args(cli: &Cli, command_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let input = cli.input.as_ref().unwrap();
 
-    // First check if config exists
-    let config = load_config().await?;
-
-    if config.api_key.is_empty() {
-        eprintln!("Error: API key not configured. Please run 'xa set openai' first.");
-        std::process::exit(1);
-    }
+    // Use the active provider from agent config (same as TUI/chat)
+    let provider = agent::load_active_provider().await;
 
     // Get prompt configuration
     let prompt_config = load_prompt_config().await?;
@@ -320,8 +335,8 @@ async fn process_command_with_args(cli: &Cli, command_name: &str) -> Result<(), 
                 eprintln!("[DEBUG] End of filled prompt\n");
             }
 
-            // Call the LLM API with streaming option
-            let result = process_with_llm(&config, &filled_prompt, !cli.no_stream).await?;
+            // Call the LLM API with streaming option using the active provider
+            let result = llm::process_with_provider(&provider, &filled_prompt, !cli.no_stream).await?;
 
             // Copy result to clipboard
             if let Err(e) = copy_to_clipboard(&result) {

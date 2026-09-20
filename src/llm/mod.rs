@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::agent::Provider;
 use openai_api_rs::v1::api::OpenAIClient;
 use openai_api_rs::v1::chat_completion::{self, Content, MessageRole};
 use openai_api_rs::v1::chat_completion::chat_completion::ChatCompletionRequest;
@@ -196,4 +197,69 @@ where
 
     // Should not reach here, but just in case
     Err(Box::new(last_err.unwrap()))
+}
+
+pub async fn process_with_provider(provider: &Provider, prompt: &str, stream: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let mut client = OpenAIClient::builder()
+        .with_api_key(&provider.api_key)
+        .with_endpoint(&provider.endpoint)
+        .build()?;
+
+    if stream {
+        let req = ChatCompletionStreamRequest::new(
+            provider.model.clone(),
+            vec![chat_completion::ChatCompletionMessage {
+                role: MessageRole::user,
+                content: Content::Text(prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+        );
+        let mut stream = retry_with_backoff("stream", || {
+            let client = &client;
+            let req = req.clone();
+            async { client.chat_completion_stream(req).await }
+        }).await?;
+
+        let mut full_response = String::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                ChatCompletionStreamResponse::Content(c) => {
+                    if !c.is_empty() {
+                        print!("{}", c);
+                        std::io::stdout().flush()?;
+                        full_response.push_str(&c);
+                    }
+                }
+                ChatCompletionStreamResponse::Reasoning(_) => {}
+                ChatCompletionStreamResponse::ToolCall(_) => {
+                    eprintln!("[warn] unexpected tool call in non-chat mode");
+                }
+                ChatCompletionStreamResponse::Done => break,
+            }
+        }
+        Ok(full_response)
+    } else {
+        let req = ChatCompletionRequest::new(
+            provider.model.clone(),
+            vec![chat_completion::ChatCompletionMessage {
+                role: MessageRole::user,
+                content: Content::Text(prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+        );
+        let resp = retry_with_backoff("req", || {
+            let client = &client;
+            let req = req.clone();
+            async { client.chat_completion(req).await }
+        }).await?;
+        if resp.inner.choices.is_empty() {
+            return Err("empty response".into());
+        }
+        let c = resp.inner.choices[0].message.content.as_ref().ok_or("empty response")?;
+        Ok(c.clone())
+    }
 }
