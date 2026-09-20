@@ -180,6 +180,36 @@ fn convert_h456_to_bold(text: &str) -> String {
         .replace("#### ", "**")
 }
 
+/// Models often use `**1. Title**` instead of a Markdown heading. Promote a
+/// standalone numbered bold line to h3 so it receives the same visual weight
+/// and color as a real section heading. Fenced code is left untouched.
+fn convert_numbered_bold_titles(text: &str) -> String {
+    let mut in_fence = false;
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                in_fence = !in_fence;
+                return line.to_string();
+            }
+            if in_fence
+                || !trimmed.starts_with("**")
+                || !trimmed.ends_with("**")
+                || trimmed.len() <= 4
+            {
+                return line.to_string();
+            }
+            let title = trimmed[2..trimmed.len() - 2].trim();
+            let digits = title.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || !title[digits..].starts_with('.') {
+                return line.to_string();
+            }
+            format!("### {title}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Normalize raw model text before markdown parse.
 ///
 /// - `\r\n` / bare `\r` → `\n`
@@ -190,7 +220,8 @@ fn normalize_md_source(text: &str) -> String {
     while s.contains("\n\n\n") {
         s = s.replace("\n\n\n", "\n\n");
     }
-    convert_h456_to_bold(&s)
+    s = convert_h456_to_bold(&s);
+    convert_numbered_bold_titles(&s)
 }
 
 /// True when `s` is non-empty and only ASCII punctuation (e.g. `"?"`, `"..."`).
@@ -764,6 +795,13 @@ impl ratatui_markdown::markdown::RenderHooks for XaRenderHooks {
 
     fn heading3(&self, text: &str) -> Option<Line<'static>> {
         Some(styled_heading(text, theme::t().md_heading3, Modifier::BOLD))
+    }
+
+    fn horizontal_rule(&self) -> Option<Line<'static>> {
+        Some(Line::from(Span::styled(
+            "─".repeat(self.max_width),
+            Style::default().fg(theme::t().text_dim),
+        )))
     }
 
     fn table(&self, headers: &[String], rows: &[Vec<String>]) -> Option<Vec<Line<'static>>> {
@@ -2269,6 +2307,15 @@ impl ThinkingCell {
                 code_buf.push(line);
             } else {
                 flush_code(&mut code_buf, &mut rows);
+                if is_horizontal_rule(&line) {
+                    let style = line.spans.first().map(|span| span.style).unwrap_or_default();
+                    rows.push(Row::new(
+                        0,
+                        width,
+                        Line::from(Span::styled("─".repeat(width as usize), style)),
+                    ));
+                    continue;
+                }
                 // Collapse a blank that would double the post-code margin.
                 if line_is_blank(&line)
                     && rows.last().is_some_and(|r| line_is_blank(&r.line))
@@ -2488,6 +2535,11 @@ impl ThinkingCell {
             self.build(width, None)
         })
     }
+}
+
+fn is_horizontal_rule(line: &Line<'_>) -> bool {
+    let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    !text.is_empty() && text.chars().all(|c| c == '─')
 }
 
 impl HistoryCell for ThinkingCell {
@@ -2825,6 +2877,25 @@ mod markdown_layout_tests {
             line_text(&lines[0]),
             "Hi! I'm xa, a coding agent. How can I help you today?"
         );
+    }
+
+    #[test]
+    fn numbered_bold_line_renders_as_a_section_heading() {
+        let lines = render_markdown("   **1. 原始数据格式（以 Banking77 为例）**", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "1. 原始数据格式（以 Banking77 为例）");
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::t().md_heading3));
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn horizontal_rule_uses_the_full_thinking_cell_width() {
+        let tc = ThinkingCell::new();
+        let rows = tc.render_text_block("---", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].x, 0);
+        assert_eq!(rows[0].w, 80);
+        assert_eq!(line_text(&rows[0].line).chars().count(), 80);
     }
 
     #[test]
