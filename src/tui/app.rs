@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
     Terminal, TerminalOptions, Viewport,
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
@@ -2106,6 +2106,28 @@ impl App {
         } else {
             0
         };
+        // Commands are part of the composer flow too.  Reserving their rows
+        // here (rather than painting an overlay over the transcript/footer)
+        // keeps every slash result visible in an inline terminal viewport.
+        let slash_matches = if self.slash_mode {
+            self.filtered_slash()
+        } else {
+            Vec::new()
+        };
+        let slash_popup_h = if self.slash_mode {
+            slash_menu_height(slash_matches.len())
+        } else {
+            0
+        };
+        // The settings wizard is also a normal part of the bottom flow.  It
+        // used to be painted over the already-rendered transcript, which made
+        // provider, API-key and model screens clip unpredictably in inline
+        // terminal viewports.
+        let wizard_h = self
+            .wizard
+            .as_ref()
+            .map(Wizard::layout_height)
+            .unwrap_or(0);
 
         // Single layout pass: compute input_h from a provisional width, then
         // use it for the final split. We need the width to wrap the composer
@@ -2126,6 +2148,8 @@ impl App {
             .saturating_add(if show_header { WELCOME_HEIGHT } else { 0 });
         let settled_chrome_h = input_h
             .saturating_add(path_popup_h)
+            .saturating_add(slash_popup_h)
+            .saturating_add(wizard_h)
             .saturating_add(1);
         let chrome_h = activity_pad_h
             .saturating_add(activity_h)
@@ -2144,22 +2168,26 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(transcript_h),
+                Constraint::Length(wizard_h),
                 Constraint::Length(activity_pad_h), // padding above activity
                 Constraint::Length(activity_h),
                 Constraint::Length(activity_pad_h), // padding below activity
                 Constraint::Length(input_h),
                 Constraint::Length(path_popup_h),
+                Constraint::Length(slash_popup_h),
                 Constraint::Length(1),
                 Constraint::Min(0),     // unused terminal space follows the flow
             ])
             .split(area);
-        self.input_area_width = chunks[4].width;
+        self.input_area_width = chunks[5].width;
 
         let view = chunks[0];
-        let activity_area = chunks[2];
-        let input_area = chunks[4];
-        let path_popup_area = chunks[5];
-        let footer_area = chunks[6];
+        let wizard_area = chunks[1];
+        let activity_area = chunks[3];
+        let input_area = chunks[5];
+        let path_popup_area = chunks[6];
+        let slash_popup_area = chunks[7];
+        let footer_area = chunks[8];
         let ctx = RenderContext {
             shimmer_phase: shimmer_phase(self.shimmer_start, 1.8),
         };
@@ -2455,28 +2483,33 @@ impl App {
         }
         f.render_widget(Paragraph::new(Line::from(footer_spans)), footer_area);
 
-        // Slash popup overlay (DESIGN §5).
-        if self.slash_mode {
-            let filtered = self.filtered_slash();
-            let popup_h = (filtered.len() as u16 + 2).clamp(3, 12);
-            let popup_w = 46.min(input_area.width);
-            let popup_area = Rect {
-                x: input_area.left(),
-                y: (input_area.top().saturating_sub(popup_h)).max(0),
-                width: popup_w,
-                height: popup_h,
-            };
-            let block = Block::default()
-                .borders(Borders::NONE)
-                .border_style(Style::default().fg(theme::t().accent))
-                .title(Span::styled(
-                    format!(" /{:<1$} ", self.slash_query, 10),
+        // Slash commands follow the composer just like path completion.  A
+        // floating menu is unsafe in inline mode: its physical screen origin
+        // can differ from ratatui's frame and it may cover later menu rows.
+        if slash_popup_h > 0 {
+            f.render_widget(Clear, slash_popup_area);
+            f.buffer_mut()
+                .set_style(slash_popup_area, Style::default().bg(theme::t().bg));
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" /{}  commands", self.slash_query),
                     Style::default().fg(theme::t().accent),
-                ));
-            let inner = block.inner(popup_area);
-            f.render_widget(block, popup_area);
-            let mut y = inner.top();
-            for (i, cmd) in filtered.iter().enumerate() {
+                ))),
+                Rect {
+                    x: slash_popup_area.x,
+                    y: slash_popup_area.y,
+                    width: slash_popup_area.width,
+                    height: 1.min(slash_popup_area.height),
+                },
+            );
+            let inner = Rect {
+                x: slash_popup_area.x,
+                y: slash_popup_area.y.saturating_add(1),
+                width: slash_popup_area.width,
+                height: slash_popup_area.height.saturating_sub(1),
+            };
+            for (i, cmd) in slash_matches.iter().enumerate() {
+                let y = inner.top().saturating_add(i as u16);
                 if y >= inner.bottom() {
                     break;
                 }
@@ -2502,22 +2535,25 @@ impl App {
                         height: 1,
                     },
                 );
-                y += 1;
             }
         }
 
-        // Provider/model settings occupy the space directly above the composer
-        // (like Codex's model picker), never a centered screen modal.
-        if let Some(wizard) = &self.wizard {
-            let settings_area = Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: input_area.y.saturating_sub(area.y),
-            };
-            wizard.draw(f, settings_area);
+        // Provider/model settings are a reserved section directly above the
+        // composer, not an overlay.  This keeps every provider/model row and
+        // API-key field inside the ratatui frame.
+        if let Some(wizard) = &mut self.wizard {
+            wizard.draw(f, wizard_area);
         }
     }
+}
+
+/// Header plus one row per filtered slash command.  This is a regular layout
+/// region, so no item is silently hidden behind the footer or transcript.
+fn slash_menu_height(item_count: usize) -> u16 {
+    u16::try_from(item_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(1)
+        .clamp(2, 12)
 }
 
 /// Extract the file `path` and optional read `offset`/`limit` from a tool's
@@ -3298,6 +3334,13 @@ mod resume_bench {
 #[cfg(test)]
 mod composer_history_tests {
     use super::*;
+
+    #[test]
+    fn slash_menu_reserves_a_title_and_each_command_row() {
+        assert_eq!(slash_menu_height(0), 2);
+        assert_eq!(slash_menu_height(3), 4);
+        assert_eq!(slash_menu_height(9), 10);
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())

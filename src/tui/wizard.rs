@@ -37,10 +37,6 @@ fn dim() -> Color {
 fn plain() -> Color {
     theme::t().text
 }
-#[inline]
-fn select_bg() -> Color {
-    theme::t().select_bg
-}
 /// Settings surface matches the composer.
 #[inline]
 fn panel_bg() -> Color {
@@ -54,6 +50,7 @@ fn field_bg() -> Color {
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MODEL_WINDOW: usize = 10;
+const PROVIDER_WINDOW: usize = 10;
 
 /// Where the wizard collects its source list from.
 #[derive(Clone)]
@@ -100,6 +97,10 @@ pub struct Wizard {
     step: Step,
     sources: Vec<Source>,
     source_idx: usize,
+    /// First provider visible in the picker window.
+    source_scroll: usize,
+    /// Number of provider rows that fit in the last rendered panel.
+    provider_visible_rows: usize,
     /// Draft provider being built up across steps.
     draft: Provider,
     /// True when the chosen source came through the custom name/url path.
@@ -112,6 +113,8 @@ pub struct Wizard {
     model_err: Option<String>,
     model_idx: usize,
     model_scroll: usize,
+    /// Number of model rows that fit in the last rendered panel.
+    model_visible_rows: usize,
     fetching: bool,
     created: Instant,
     message: Option<String>,
@@ -155,6 +158,8 @@ impl Wizard {
             step: Step::Provider,
             sources,
             source_idx: 0,
+            source_scroll: 0,
+            provider_visible_rows: PROVIDER_WINDOW,
             draft: Provider::default(),
             came_from_custom: false,
             text: String::new(),
@@ -163,6 +168,7 @@ impl Wizard {
             model_err: None,
             model_idx: 0,
             model_scroll: 0,
+            model_visible_rows: MODEL_WINDOW,
             fetching: false,
             created: Instant::now(),
             message: None,
@@ -172,6 +178,7 @@ impl Wizard {
                 w.source_idx = i;
             }
         }
+        w.keep_selected_provider_visible();
         w
     }
 
@@ -186,6 +193,19 @@ impl Wizard {
     /// True while the async model fetch is in flight (drives the spinner).
     pub fn is_fetching(&self) -> bool {
         self.fetching
+    }
+
+    /// Number of terminal rows the in-app wizard needs.  `App` reserves these
+    /// rows in its normal vertical layout; the wizard must never be painted as
+    /// an overlay over the transcript or composer.
+    pub fn layout_height(&self) -> u16 {
+        let wanted_height = match self.step {
+            Step::Provider => self.sources.len().min(PROVIDER_WINDOW) as u16 + 5,
+            Step::Model => self.models.len().min(MODEL_WINDOW) as u16 + 7,
+            _ => 9,
+        };
+        // One blank row lives inside the panel above and below its content.
+        wanted_height.saturating_add(2)
     }
 
     /// Run the wizard as a standalone interactive terminal (used by the
@@ -419,12 +439,24 @@ impl Wizard {
                 if self.source_idx > 0 {
                     self.source_idx -= 1;
                 }
+                self.keep_selected_provider_visible();
                 WizardAction::None
             }
             KeyCode::Down => {
                 if self.source_idx + 1 < self.sources.len() {
                     self.source_idx += 1;
                 }
+                self.keep_selected_provider_visible();
+                WizardAction::None
+            }
+            KeyCode::Home => {
+                self.source_idx = 0;
+                self.keep_selected_provider_visible();
+                WizardAction::None
+            }
+            KeyCode::End => {
+                self.source_idx = self.sources.len().saturating_sub(1);
+                self.keep_selected_provider_visible();
                 WizardAction::None
             }
             KeyCode::Enter => {
@@ -583,11 +615,7 @@ impl Wizard {
     }
 
     fn keep_selected_model_visible(&mut self) {
-        let window = if self.model_err.is_some() {
-            MODEL_WINDOW.saturating_sub(2)
-        } else {
-            MODEL_WINDOW
-        };
+        let window = self.model_visible_rows.max(1);
         if self.model_idx < self.model_scroll {
             self.model_scroll = self.model_idx;
         } else if self.model_idx >= self.model_scroll + window {
@@ -595,17 +623,20 @@ impl Wizard {
         }
     }
 
+    fn keep_selected_provider_visible(&mut self) {
+        let window = self.provider_visible_rows.max(1);
+        if self.source_idx < self.source_scroll {
+            self.source_scroll = self.source_idx;
+        } else if self.source_idx >= self.source_scroll + window {
+            self.source_scroll = self.source_idx + 1 - window;
+        }
+    }
+
     /// Draw a Codex-like settings panel anchored immediately above `area`'s
     /// bottom edge. It is sized to its content plus one padding row above and
     /// below, so the remaining transcript area stays visible.
-    pub fn draw(&self, f: &mut Frame, area: Rect) {
-        let wanted_height = match self.step {
-            Step::Provider => self.sources.len() as u16 + 5,
-            Step::Model => self.models.len().min(10) as u16 + 7,
-            _ => 9,
-        };
-        // One blank row lives inside the panel above and below its content.
-        let height = wanted_height.saturating_add(2).min(area.height);
+    pub fn draw(&mut self, f: &mut Frame, area: Rect) {
+        let height = self.layout_height().min(area.height);
         let panel = Rect {
             x: area.x,
             y: area.bottom().saturating_sub(height),
@@ -629,6 +660,25 @@ impl Wizard {
             height: panel.height.saturating_sub(2),
         };
 
+        // The inline TUI may have fewer rows than the wizard requested. Keep
+        // the highlighted item inside the *actual* visible window rather than
+        // assuming the nominal 10-row picker always fits.
+        match self.step {
+            Step::Provider => {
+                self.provider_visible_rows = body.height.saturating_sub(5).max(1) as usize;
+                self.keep_selected_provider_visible();
+            }
+            Step::Model => {
+                let fixed_rows = 1 + if self.model_err.is_some() { 2 } else { 0 };
+                self.model_visible_rows = body
+                    .height
+                    .saturating_sub(fixed_rows)
+                    .max(1) as usize;
+                self.keep_selected_model_visible();
+            }
+            _ => {}
+        }
+
         match self.step {
             Step::Provider => self.draw_provider(f, body),
             Step::CustomName | Step::CustomUrl | Step::ApiKey | Step::CustomModel => {
@@ -641,7 +691,13 @@ impl Wizard {
 
     fn row_style(selected: bool) -> Style {
         if selected {
-            Style::default().bg(select_bg()).fg(plain())
+            // A real terminal-menu selection: the full row gets the accent
+            // background, so it remains obvious even in terminals where the
+            // subtle panel selection color is hard to distinguish.
+            Style::default()
+                .bg(accent())
+                .fg(theme::t().bg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().bg(panel_bg()).fg(plain())
         }
@@ -651,29 +707,47 @@ impl Wizard {
         if area.height < 3 {
             return;
         }
-        self.draw_line(f, area, area.top(), Line::from(Span::styled(
-            "Select Provider",
-            Style::default().fg(plain()).bg(panel_bg()).add_modifier(Modifier::BOLD),
-        )));
+        self.draw_line(f, area, area.top(), Line::from(vec![
+            Span::styled(
+                "Select Provider",
+                Style::default().fg(plain()).bg(panel_bg()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {}/{}{}{}",
+                    self.source_idx + 1,
+                    self.sources.len(),
+                    if self.source_scroll > 0 { "  ↑" } else { "" },
+                    if self.source_scroll + self.provider_visible_rows < self.sources.len() {
+                        " ↓"
+                    } else {
+                        ""
+                    },
+                ),
+                Style::default().fg(dim()).bg(panel_bg()),
+            ),
+        ]));
         self.draw_line(f, area, area.top() + 1, Line::from(Span::styled(
             "Connect using a built-in provider or custom OpenAI-compatible endpoint",
             Style::default().fg(dim()).bg(panel_bg()),
         )));
 
         let mut y = area.top() + 3;
-        for (i, src) in self.sources.iter().enumerate() {
+        for (i, src) in self.sources.iter().enumerate().skip(self.source_scroll) {
             // Keep the key hint visible.
             if y + 2 >= area.bottom() {
                 break;
             }
             let sel = i == self.source_idx;
+            let bg = if sel { accent() } else { panel_bg() };
+            let fg = if sel { theme::t().bg } else { plain() };
             let mut spans = Vec::new();
             if sel {
                 spans.push(Span::styled(
-                    " › ",
+                    " ❯ ",
                     Style::default()
-                        .fg(accent())
-                        .bg(select_bg())
+                        .fg(theme::t().bg)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
@@ -683,8 +757,8 @@ impl Wizard {
             spans.push(Span::styled(
                 format!("{:<12}", label),
                 Style::default()
-                    .fg(if sel { accent() } else { plain() })
-                    .bg(if sel { select_bg() } else { panel_bg() })
+                    .fg(fg)
+                    .bg(bg)
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
             let detail = match src {
@@ -695,8 +769,8 @@ impl Wizard {
             spans.push(Span::styled(
                 detail,
                 Style::default()
-                    .fg(if sel { plain() } else { dim() })
-                    .bg(if sel { select_bg() } else { panel_bg() }),
+                    .fg(if sel { theme::t().bg } else { dim() })
+                    .bg(bg),
             ));
             let note = match src {
                 Source::Existing(p) if p.endpoint.contains("localhost") || p.endpoint.contains("127.0.0.1") => Some("local"),
@@ -706,7 +780,9 @@ impl Wizard {
             if let Some(note) = note {
                 spans.push(Span::styled(
                     format!("   {note}"),
-                    Style::default().fg(dim()).bg(if sel { select_bg() } else { panel_bg() }),
+                    Style::default()
+                        .fg(if sel { theme::t().bg } else { dim() })
+                        .bg(bg),
                 ));
             }
             f.render_widget(
@@ -737,7 +813,12 @@ impl Wizard {
     fn key_hint(&self) -> Line<'static> {
         Line::from(vec![
             Span::styled("Press enter", Style::default().fg(plain()).bg(panel_bg())),
-            Span::styled(" to confirm or ", Style::default().fg(dim()).bg(panel_bg())),
+            Span::styled(
+                format!(" to confirm · {}/{} · ", self.source_idx + 1, self.sources.len()),
+                Style::default().fg(dim()).bg(panel_bg()),
+            ),
+            Span::styled("↑↓", Style::default().fg(plain()).bg(panel_bg())),
+            Span::styled(" navigate or ", Style::default().fg(dim()).bg(panel_bg())),
             Span::styled("esc", Style::default().fg(plain()).bg(panel_bg())),
             Span::styled(" to go back", Style::default().fg(dim()).bg(panel_bg())),
         ])
@@ -849,6 +930,29 @@ impl Wizard {
 
     fn draw_model_panel(&self, f: &mut Frame, area: Rect) {
         let mut y = area.top();
+        let total = self.models.len() + 1; // + custom entry
+        self.draw_line(
+            f,
+            area,
+            y,
+            Line::from(vec![
+                Span::styled(
+                    "Select Model",
+                    Style::default().fg(plain()).bg(panel_bg()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}/{}{}{}",
+                        self.model_idx + 1,
+                        total,
+                        if self.model_scroll > 0 { "  ↑" } else { "" },
+                        if self.model_scroll + self.model_visible_rows < total { " ↓" } else { "" },
+                    ),
+                    Style::default().fg(dim()).bg(panel_bg()),
+                ),
+            ]),
+        );
+        y += 1;
         if let Some(err) = &self.model_err {
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
@@ -879,18 +983,17 @@ impl Wizard {
             );
             y += 1;
         }
-        let total = self.models.len() + 1; // + custom entry
         for i in self.model_scroll..total {
             if y >= area.bottom() {
                 break;
             }
             let sel = i == self.model_idx;
-            let bg = if sel { select_bg() } else { panel_bg() };
+            let bg = if sel { accent() } else { panel_bg() };
             let mut spans = Vec::new();
             spans.push(Span::styled(
-                if sel { " › " } else { "   " },
+                if sel { " ❯ " } else { "   " },
                 Style::default()
-                    .fg(if sel { accent() } else { dim() })
+                    .fg(if sel { theme::t().bg } else { dim() })
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -902,7 +1005,7 @@ impl Wizard {
             spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(if sel { plain() } else { dim() })
+                    .fg(if sel { theme::t().bg } else { dim() })
                     .bg(bg)
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
             ));
@@ -935,4 +1038,30 @@ fn endpoint_label(endpoint: &str) -> String {
         .next()
         .unwrap_or(endpoint)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_selection_advances_the_visible_window() {
+        let mut wizard = Wizard::new_models(None);
+        wizard.provider_visible_rows = 2;
+        wizard.source_idx = 2;
+        wizard.keep_selected_provider_visible();
+
+        assert_eq!(wizard.source_scroll, 1);
+    }
+
+    #[test]
+    fn model_selection_advances_the_visible_window() {
+        let mut wizard = Wizard::new_models(None);
+        wizard.models = (0..4).map(|i| format!("model-{i}")).collect();
+        wizard.model_visible_rows = 2;
+        wizard.model_idx = 2;
+        wizard.keep_selected_model_visible();
+
+        assert_eq!(wizard.model_scroll, 1);
+    }
 }
